@@ -30,7 +30,7 @@ Media Framework is a playback engine. It is split into two parts:
 - A **portable core** in C++17 with no platform headers. It holds the state machine, the pipeline stages, the master clock, A/V sync, seek and scrub, and the metrics.
 - **Platform adapters** that wrap each OS's hardware-accelerated media APIs behind small interfaces: demuxer, video decoder, audio decoder, speaker, display and scheduler.
 
-The core never calls a platform API directly. To port the player, you write the adapters and reuse the core unchanged. This repo ships the macOS adapters and a demo app. iOS, Android, Web, Windows and Linux are planned; see [mvp_spec_claude.md §7](mvp_spec_claude.md#7-next-steps-deferred-requirements).
+The core never calls a platform API directly. To port the player, you write the adapters and reuse the core unchanged. This repo ships the macOS adapters and a demo app. iOS, Android, Web, Windows and Linux are planned.
 
 ### Supported features (MVP)
 
@@ -74,6 +74,8 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
 scripts/make_clips.sh --with-4k                                # generate test clips into clips/
 ./build/platform/macos/macos_adapter_tests clips/1080p30.mp4   # real demuxer and decoders, no window
 ```
+
+
 
 ### Run the demo
 
@@ -465,6 +467,8 @@ Metrics use the **actual present time** that Metal's presented handler reports, 
 Histograms use fixed 1 ms bins (2001 bins), and a 16-entry ring stores the planned slots. Metrics memory is therefore constant however long playback runs. `Player::metrics()` returns a `MetricsReport`, and `shutdown()` logs it.
 
 ---
+
+
 
 ## 5. License
 
