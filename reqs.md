@@ -36,7 +36,7 @@ file/stream reader -> demuxer
     - native (Android, iOS, Mac OS, Windows, Linux): one thread per stage, and mutex/cv to synchronize access to the queues.
     - Browser: a worker event loop for the stages, plus an AudioWorklet for audio output.
 every scheduler shall guarantee:
-    1. decode, render, and I/O never run on the caller thread.
+    1. decode, render, and I/O never run on the caller thread on Android, iOS, Mac OS, Windows and Linux
     2. a slow stage does not block rendering of frames already decoded.
     3. the real-time audio path never takes locks or allocates memory.
     4. queue memory is bounded.
