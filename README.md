@@ -1,4 +1,4 @@
-![Media Framework logo](docs/images/logo.svg)
+<img src="docs/images/logo.svg" alt="Media Framework logo" width="85">
 
 # Media Framework
 
@@ -162,7 +162,7 @@ The table shows the **worst value across the three runs** for each metric.
 - **Build:** Release.
 - **Clips:** 10 s long, made by [scripts/make_clips.sh](scripts/make_clips.sh): x264 `veryfast`, 2 B-frames, 1 s GOP unless noted, AAC 128 kb/s at 48 kHz.
 
-| Clip                                      | Dropped  | Rate-capped    | Jank     | A/V |offset| p95 | TTFF         | Seek p50 / p95   | Scrub: last target shown | Scrub: max frame gap | Peak memory    |
+| Clip                                      | Dropped  | Rate-capped    | Jank     | A/V offset p95 (abs) | TTFF         | Seek p50 / p95   | Scrub: last target shown | Scrub: max frame gap | Peak memory    |
 | ----------------------------------------- | -------- | -------------- | -------- | ---------------- | ------------ | ---------------- | ------------------------ | -------------------- | -------------- |
 | 720p24                                    | 0.00%    | 0              | 0.00%    | ≤ 14 ms          | 176 ms       | ≤ 6 / 20 ms      | 4 ms                     | 61 ms                | 174 MB         |
 | 1080p30                                   | 0.00%    | 0              | 0.84%    | ≤ 3 ms           | 155 ms       | ≤ 11 / 21 ms     | 5 ms                     | 66 ms                | 182 MB         |
