@@ -1,13 +1,9 @@
-<img src="docs/images/logo.svg" alt="Media Framework logo" width="85">
+![Media Framework logo](docs/images/logo.svg)
 
 # Media Framework
 
-A portable C++17 media playback core with native platform adapters.
+This is a portable C++ media playback core with native platform adapters.  
 The first target is macOS on Apple silicon, with frame-accurate A/V sync and exact seek.
-
-![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)  
-![C++17](https://img.shields.io/badge/C%2B%2B-17-00599C.svg)  
-![macOS 13+](https://img.shields.io/badge/platform-macOS%2013%2B-lightgrey.svg)
 
 ---
 
@@ -21,8 +17,6 @@ The first target is macOS on Apple silicon, with frame-accurate A/V sync and exa
 
 ---
 
-
-
 ## 1. Introduction
 
 Media Framework is a playback engine. It is split into two parts:
@@ -31,6 +25,17 @@ Media Framework is a playback engine. It is split into two parts:
 - **Platform adapters** that wrap each OS's hardware-accelerated media APIs behind small interfaces: demuxer, video decoder, audio decoder, speaker, display and scheduler.
 
 The core never calls a platform API directly. To port the player, you write the adapters and reuse the core unchanged. This repo ships the macOS adapters and a demo app. iOS, Android, Web, Windows and Linux are planned.
+
+### Key features
+
+- **Hardware-accelerated playback:** H.264 decodes through VideoToolbox and goes to Metal with zero copy. AAC plays through CoreAudio.
+- **Frame-accurate A/V sync:** the audio master clock includes output latency, and frames are paced on the display's vsync grid.
+- **Exact seek and smooth scrub:** seeks land on the exact timestamp, not the nearest keyframe. Rapid scrubs are coalesced so the latest one wins.
+- **Resilient to bad input:** corrupt frames are skipped without stopping playback, and invalidated decoder sessions are recovered.
+- **Real-time safe and bounded:** the audio path is lock-free and does not allocate. Every queue is capped by count, bytes and duration.
+- **Built-in metrics:** dropped frames, jank, A/V offset, time to first frame and seek latency, all measured from actual present times.
+
+
 
 ### Supported features (MVP)
 
@@ -162,19 +167,23 @@ The table shows the **worst value across the three runs** for each metric.
 - **Build:** Release.
 - **Clips:** 10 s long, made by [scripts/make_clips.sh](scripts/make_clips.sh): x264 `veryfast`, 2 B-frames, 1 s GOP unless noted, AAC 128 kb/s at 48 kHz.
 
+
 | Clip                                      | Dropped  | Rate-capped    | Jank     | A/V offset p95 (abs) | TTFF         | Seek p50 / p95   | Scrub: last target shown | Scrub: max frame gap | Peak memory    |
-| ----------------------------------------- | -------- | -------------- | -------- | ---------------- | ------------ | ---------------- | ------------------------ | -------------------- | -------------- |
-| 720p24                                    | 0.00%    | 0              | 0.00%    | ≤ 14 ms          | 176 ms       | ≤ 6 / 20 ms      | 4 ms                     | 61 ms                | 174 MB         |
-| 1080p30                                   | 0.00%    | 0              | 0.84%    | ≤ 3 ms           | 155 ms       | ≤ 11 / 21 ms     | 5 ms                     | 66 ms                | 182 MB         |
-| 1080p60                                   | 0.83%    | 0              | 0.42%    | ≤ 28 ms          | 161 ms       | ≤ 16 / 36 ms     | 7 ms                     | 74 ms                | 190 MB         |
-| 1080p60, 1000 Hz timescale (jittered PTS) | 0.21%    | 0              | 0.21%    | ≤ 21 ms          | 171 ms       | ≤ 17 / 31 ms     | 7 ms                     | 77 ms                | 190 MB         |
-| 720p120 on 60 Hz                          | 0.62%    | ~490 (50%)     | 0.21%    | ≤ 27 ms          | 185 ms       | ≤ 14 / 33 ms     | 6 ms                     | 76 ms                | 180 MB         |
-| 4K30                                      | 0.00%    | 0              | 1.26%    | ≤ 15 ms          | 171 ms       | ≤ 40 / 60 ms     | 21 ms                    | 106 ms               | 226 MB         |
-| 1080p30, 4 s GOP                          | 0.00%    | 0              | 0.42%    | ≤ 2 ms           | 156 ms       | ≤ 24 / 42 ms     | 5 ms                     | 82 ms                | 197 MB         |
-| Video only                                | 0.41%    | 0              | 0.41%    | n/a              | 120 ms       | ≤ 11 / 20 ms     | 5 ms                     | 68 ms                | 182 MB         |
-| Audio ends 5 s early                      | 0.00%    | 0              | 0.42%    | ≤ 22 ms          | 180 ms       | ≤ 11 / 22 ms     | 6 ms                     | 71 ms                | 184 MB         |
-| Flash/beep sync clip                      | 0.00%    | 0              | 0.42%    | ≤ 4 ms           | 154 ms       | ≤ 10 / 19 ms     | 5 ms                     | 59 ms                | 159 MB         |
-| **Target**                                | **< 1%** | *(not a drop)* | **< 1%** | **< 40 ms**      | **< 500 ms** | **p95 < 100 ms** | **≤ 150 ms**             | **≤ 200 ms**         | budget + 50 MB |
+| ----------------------------------------- | -------- | -------------- | -------- | -------------------- | ------------ | ---------------- | ------------------------ | -------------------- | -------------- |
+| 720p24                                    | 0.00%    | 0              | 0.00%    | ≤ 14 ms              | 176 ms       | ≤ 6 / 20 ms      | 4 ms                     | 61 ms                | 174 MB         |
+| 1080p30                                   | 0.00%    | 0              | 0.84%    | ≤ 3 ms               | 155 ms       | ≤ 11 / 21 ms     | 5 ms                     | 66 ms                | 182 MB         |
+| 1080p60                                   | 0.83%    | 0              | 0.42%    | ≤ 28 ms              | 161 ms       | ≤ 16 / 36 ms     | 7 ms                     | 74 ms                | 190 MB         |
+| 1080p60, 1000 Hz timescale (jittered PTS) | 0.21%    | 0              | 0.21%    | ≤ 21 ms              | 171 ms       | ≤ 17 / 31 ms     | 7 ms                     | 77 ms                | 190 MB         |
+| 720p120 on 60 Hz                          | 0.62%    | ~490 (50%)     | 0.21%    | ≤ 27 ms              | 185 ms       | ≤ 14 / 33 ms     | 6 ms                     | 76 ms                | 180 MB         |
+| 4K30                                      | 0.00%    | 0              | 1.26%    | ≤ 15 ms              | 171 ms       | ≤ 40 / 60 ms     | 21 ms                    | 106 ms               | 226 MB         |
+| 1080p30, 4 s GOP                          | 0.00%    | 0              | 0.42%    | ≤ 2 ms               | 156 ms       | ≤ 24 / 42 ms     | 5 ms                     | 82 ms                | 197 MB         |
+| Video only                                | 0.41%    | 0              | 0.41%    | n/a                  | 120 ms       | ≤ 11 / 20 ms     | 5 ms                     | 68 ms                | 182 MB         |
+| Audio ends 5 s early                      | 0.00%    | 0              | 0.42%    | ≤ 22 ms              | 180 ms       | ≤ 11 / 22 ms     | 6 ms                     | 71 ms                | 184 MB         |
+| Flash/beep sync clip                      | 0.00%    | 0              | 0.42%    | ≤ 4 ms               | 154 ms       | ≤ 10 / 19 ms     | 5 ms                     | 59 ms                | 159 MB         |
+| **Target**                                | **< 1%** | *(not a drop)* | **< 1%** | **< 40 ms**          | **< 500 ms** | **p95 < 100 ms** | **≤ 150 ms**             | **≤ 200 ms**         | budget + 50 MB |
+
+
+
 
 ### Reading the results
 
@@ -297,7 +306,7 @@ flowchart LR
 | MetalDisplay          | [metal_display.mm](platform/macos/src/metal_display.mm)         | Pending-frame queue drained on each vsync; NV12 → RGB draw                   |
 
 
-**Why C++17.** It is the newest standard that every target toolchain supports fully: Apple Clang, the Android NDK, Emscripten, MSVC and GCC. That lets the core build unchanged on every platform. It also covers what the core needs: `std::optional`, nested namespaces, and `shared_ptr<void>` for opaque platform handles. And the public headers don't force a newer standard on apps that embed the player. C++20 features such as `span`, `jthread` and concepts would be nice but wouldn't change the design. See [mvp_spec.md §2.1](mvp_spec.md#21-core-portable-c17-no-platform-headers).
+**Why C++17.** It is the newest standard that every target toolchain supports fully: Apple Clang, the Android NDK, Emscripten, MSVC and GCC. That lets the core build unchanged on every platform. It also covers what the core needs: `std::optional`, nested namespaces, and `shared_ptr<void>` for opaque platform handles. And the public headers don't force a newer standard on apps that embed the player. C++20 features such as `span`, `jthread` and concepts would be nice but wouldn't change the design. See [mvp_spec_claude.md §2.1](mvp_spec_claude.md#21-core-portable-c17-no-platform-headers).
 
 ### 4.2 Interfaces
 
