@@ -297,7 +297,7 @@ flowchart LR
 | MetalDisplay          | [metal_display.mm](platform/macos/src/metal_display.mm)         | Pending-frame queue drained on each vsync; NV12 → RGB draw                   |
 
 
-**Why C++17.** It is the newest standard that every target toolchain supports fully: Apple Clang, the Android NDK, Emscripten, MSVC and GCC. That lets the core build unchanged on every platform. It also covers what the core needs: `std::optional`, nested namespaces, and `shared_ptr<void>` for opaque platform handles. And the public headers don't force a newer standard on apps that embed the player. C++20 features such as `span`, `jthread` and concepts would be nice but wouldn't change the design. See [mvp_spec_claude.md §2.1](mvp_spec_claude.md#21-core-portable-c17-no-platform-headers).
+**Why C++17.** It is the newest standard that every target toolchain supports fully: Apple Clang, the Android NDK, Emscripten, MSVC and GCC. That lets the core build unchanged on every platform. It also covers what the core needs: `std::optional`, nested namespaces, and `shared_ptr<void>` for opaque platform handles. And the public headers don't force a newer standard on apps that embed the player. C++20 features such as `span`, `jthread` and concepts would be nice but wouldn't change the design. See [mvp_spec.md §2.1](mvp_spec.md#21-core-portable-c17-no-platform-headers).
 
 ### 4.2 Interfaces
 
