@@ -47,6 +47,24 @@ Source: [reqs.md](reqs.md). This spec defines the smallest version that works en
 - `AvSync`: decides for each frame whether to present or drop, and when to present it (§4).
 - `Metrics`: counters and histograms, fed with actual present times from the display. Dumped to the log on `shutdown` and exposed through a query.
 
+**Why C++17.** reqs.md asks for the common logic in C++. The standard is set to C++17 because:
+
+- **It's the newest standard that every target toolchain supports fully.** The core must build unchanged with Apple Clang (Mac OS, iOS), the Android NDK's Clang (API 26+), Emscripten (Web), MSVC (Windows) and GCC/Clang (Linux). C++20 support still differs between these compilers and their standard libraries, and older Apple and NDK targets lag behind.
+- **It covers what the core needs:**
+  - `std::optional` for the audio track, per-frame A/V samples and the pending seek.
+  - Nested namespaces (`mf::macos`).
+  - `std::shared_ptr<void>` with custom deleters, which passes platform handles through the core without exposing their types.
+- **C++20 would be nice, not needed.**
+  - `std::span` would suit PCM buffers.
+  - `std::jthread`/`stop_token` would suit the scheduler.
+  - Concepts would suit the adapter interfaces.
+  - `std::atomic::wait` would suit some waits, but not on the real-time audio thread, which must never block anyway.
+
+  None of these changes the design.
+- **It doesn't push a standard onto embedders.** The public headers (`player.h`, `adapters.h`) need only C++17, so an app that embeds the player isn't forced onto a newer standard.
+
+Revisit when the oldest supported NDK and Xcode versions ship complete C++20 libraries.
+
 **Buffer caps (reqs guarantee 4):**
 
 | Buffer                                  | Cap                                           |

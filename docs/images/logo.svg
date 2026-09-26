@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-label="Media Framework logo">
+  <title>Media Framework</title>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1B2447"/>
+      <stop offset="1" stop-color="#2E3F8F"/>
+    </linearGradient>
+    <!-- A play triangle cut into three lanes: video, clock, audio. -->
+    <mask id="lanes">
+      <polygon points="78,52 206,128 78,204" fill="#fff" stroke="#fff" stroke-width="10" stroke-linejoin="round"/>
+      <rect x="0" y="99" width="256" height="9" fill="#000"/>
+      <rect x="0" y="148" width="256" height="9" fill="#000"/>
+    </mask>
+  </defs>
+  <rect width="256" height="256" rx="56" fill="url(#bg)"/>
+  <g mask="url(#lanes)">
+    <rect x="0" y="0" width="256" height="99" fill="#FF6B6B"/>
+    <rect x="0" y="108" width="256" height="40" fill="#FFD166"/>
+    <rect x="0" y="157" width="256" height="99" fill="#4ECDC4"/>
+  </g>
+  <!-- Sync line: the frame on screen lines up with the audio heard. -->
+  <line x1="150" y1="34" x2="150" y2="222" stroke="#FFFFFF" stroke-width="5" stroke-linecap="round" stroke-dasharray="2 12"/>
+  <circle cx="150" cy="128" r="7" fill="#FFFFFF"/>
+</svg>
