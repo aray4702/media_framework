@@ -20,6 +20,7 @@ class MacPlatform : public PlatformFactory {
   std::unique_ptr<IAudioDecoder> createAudioDecoder() override { return macos::createAudioDecoder(); }
   std::unique_ptr<ISpeaker> createSpeaker() override { return macos::createSpeaker(); }
   std::unique_ptr<IDisplay> createDisplay() override { return macos::createDisplay(); }
+  std::unique_ptr<IExportSink> createExportSink() override { return macos::createExportSink(); }
   std::unique_ptr<IScheduler> createScheduler() override {
     return std::make_unique<ThreadScheduler>(clock_, [](StageId id) {
       static const char* names[] = {"mf.source", "mf.video-decode", "mf.composition", "mf.video-render", "mf.audio"};
@@ -46,5 +47,10 @@ MediaSource sourceFromPath(const std::string& path) {
 }
 
 RenderTarget targetFromView(void* nsView) { return RenderTarget{nsView}; }
+
+ExportTarget exportTargetFromPath(const std::string& path) {
+  NSURL* url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:path.c_str()]];
+  return ExportTarget{std::shared_ptr<void>(const_cast<void*>(CFBridgingRetain(url)), CFRelease)};
+}
 
 }  // namespace mf::macos

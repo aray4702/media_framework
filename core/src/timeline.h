@@ -13,7 +13,9 @@ namespace mf {
 // clip i always plays on lane i % 2.
 class TimelineLayout {
  public:
-  void build(const std::vector<int64_t>& clipDurationsUs, const Transition&);
+  // frameDurationsUs (per clip, optional) decides which clip leads during an overlap.
+  void build(const std::vector<int64_t>& clipDurationsUs, const Transition&,
+             std::vector<int64_t> frameDurationsUs = {});
 
   int clips() const { return static_cast<int>(startUs_.size()); }
   int64_t durationUs() const { return durationUs_; }
@@ -23,7 +25,10 @@ class TimelineLayout {
   bool active(int clip, int64_t t) const { return t >= startUs_[clip] && t < endUs_[clip]; }
 
   int firstActive(int64_t t) const;  // the earliest clip active at t (the last clip past the end)
-  int lastActive(int64_t t) const;   // the latest clip active at t: it leads the output
+  int lastActive(int64_t t) const;   // the latest clip active at t
+  // The clip whose frames set the output times at t for the leading-clip driver: the highest
+  // frame rate among the active clips, the later clip on a tie.
+  int leadClip(int64_t t) const;
 
   // How far clip c's incoming transition has run at t: 0 at its start, 1 once complete.
   float progress(int clip, int64_t t) const;
@@ -33,7 +38,7 @@ class TimelineLayout {
   float gain(int clip, int64_t t) const;
 
  private:
-  std::vector<int64_t> startUs_, endUs_;
+  std::vector<int64_t> startUs_, endUs_, frameUs_;
   int64_t transitionUs_ = 0, durationUs_ = 0;
   TransitionKind kind_ = TransitionKind::Cut;
 };

@@ -49,7 +49,8 @@ Source: [reqs.md](reqs.md). This spec defines the smallest version that works en
 - `MasterClock`: follows the audio clock when an audio track is playing, otherwise `std::chrono::steady_clock` (§4).
 - `AvSync`: decides for each frame whether to present or drop, and when to present it (§4).
 - `Metrics`: counters and histograms, fed with actual present times from the display. Dumped to the log on `shutdown` and exposed through a query.
-- `TimelineLayout`: where each clip starts and ends on the timeline, and the slide offset and audio gain of a clip at a given time (§2.4).
+- `TimelineLayout`: where each clip starts and ends on the timeline, which clip leads, and the slide offset and audio gain of a clip at a given time (§2.4).
+- `Exporter`: the same pipeline with the export driver, writing to an `IExportSink` (§2.5).
 
 **Why C++17.** reqs.md asks for the common logic in C++. The standard is set to C++17 because:
 
@@ -219,6 +220,36 @@ At transition progress `p = (t − start) / T`, slide-left puts the outgoing cli
 **Drawing.** `IDisplay::present` takes the `ComposedFrame` and draws it in one pass, so frames stay zero-copy: each layer from its decoder surface, aspect-fit and offset, with the filter applied in the fragment shader as `rgb' = (rgb − 0.5) · contrast + 0.5 + brightness`. The caption goes on top, centered at the bottom of the leading clip's picture and not sliding. On Mac OS it is rasterized once with Core Text into a texture and reused while the text and size stay the same. T3 stamps the latest filter onto each frame it presents, so a slider change shows on the next frame. While paused, it redraws the frame on screen.
 
 **Audio.** T4 mixes on the timeline in 1024-frame chunks. Before mixing a chunk, every clip with audio in it must be decoded that far or have ended. Each clip is cut to its time on the timeline and scaled by a linear gain that fades in and out over the transitions. The two gains in an overlap sum to 1, so a slide is an equal-gain crossfade. Consecutive packets of a clip within 1 ms of each other are treated as one continuous stream, so timestamp rounding never doubles or drops a sample. The output format is that of the first clip with usable audio. Clips without audio, or with a different sample rate or channel count, play silent (`AudioUnsupported` warning for the latter; resampling is a next step). The master clock is the mixed audio, so it runs across clip boundaries.
+
+### 2.5 Output drivers and export
+
+The composition stage keeps, for each lane, the **latest frame at or before the output time** and composes the output at a time `t` with `composeAt(t)`: every active clip's frame with its offset at `t`, the caption at `t`, the current filter. Only the **driver** differs: it picks the output times and decides what happens when a layer's frame for `t` isn't decoded yet.
+
+| Driver | Output times | A layer's frame isn't ready | Use |
+| --- | --- | --- | --- |
+| **LeadingClip** | Each frame of the leading clip: the highest frame rate among the active clips (the later clip on a tie) | Frames are handled in timeline order, so the other layers are always exact | `Auto` for one clip. Output = source frames, paced by AvSync |
+| **Vsync** | Each display refresh: `t = clock(now) + (vsync − now)`, composed half a frame before the hand-over deadline | Hold its last frame and count a late layer; never wait | `Auto` for several clips. Slides and effects move every refresh |
+| **Export** | Fixed grid `t = n / fps` | Wait until every layer has its exact frame | `Exporter` only |
+
+- **Seek is the same for every driver.** The leading clip's last frame at or before the target (its first frame, if none is), with every other active clip's latest frame at that time. While a newer seek is pending, whatever is decoded is shown instead (scrub).
+- **Vsync details.** The composed frame carries `presentAtNs`, the refresh it was composed for. T3 presents it for that refresh without AvSync, and drops it only if that refresh is more than a frame in the past (e.g. composed just before a pause). A refresh where nothing visible changes (same frames, offsets, caption and filter) produces no frame, so a 30 fps clip on a 60 Hz display presents 30 frames a second, not 60. While the clock holds (audio not heard yet), refreshes don't go back in time. TC composes only while output runs, so it is idle when paused.
+- **Export** runs the same pipeline without a display or speaker. T3 writes composed frames and T4 the mixed audio chunks to an `IExportSink`, which returns `Again` while its encoder is busy (T3 and T4 then poll every 2 ms). Once both have written everything, the sink finishes the file, and `ExportListener::onCompleted` fires.
+
+```cpp
+class IExportSink {   // Mac OS: MetalCompositor into AVAssetWriter's BGRA buffers → H.264; PCM → AAC
+  virtual Result open(const ExportTarget&, const ExportSettings&, int sampleRate, int channels) = 0;
+  virtual Result writeVideo(const ComposedFrame&) = 0;                          // Ok | Again | WriteFailed
+  virtual Result writeAudio(const int16_t* pcm, int frames, int64_t ptsUs) = 0;  // Ok | Again | WriteFailed
+  virtual void finish(std::function<void(Result)> done) = 0;
+};
+class Exporter {       // same pipeline, driver = Export
+  Result start(const Timeline&, const ExportTarget&, const ExportSettings&);  // width/height even, fps 1–240
+  Result shutdown();   // cancels an unfinished file
+  double progress() const;
+};
+```
+
+On Mac OS, the display and the export sink draw with the same `MetalCompositor`, so an exported frame matches what playback shows. The sink encodes on one serial queue per track: `AVAssetWriter` holds one input back until the other catches up, so a single queue could wait on itself.
 
 Callbacks run **on internal threads**. A callback must return quickly and **must never wait on the owner thread**, for example with `dispatch_sync` to the main queue or a lock the owner holds while calling the player. Otherwise `shutdown`, which joins those threads, deadlocks. The listener posts work to its own thread with `dispatch_async` (A11).
 

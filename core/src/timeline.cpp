@@ -4,8 +4,10 @@
 
 namespace mf {
 
-void TimelineLayout::build(const std::vector<int64_t>& durations, const Transition& t) {
+void TimelineLayout::build(const std::vector<int64_t>& durations, const Transition& t,
+                           std::vector<int64_t> frameDurationsUs) {
   kind_ = t.kind;
+  frameUs_ = std::move(frameDurationsUs);
   int64_t shortest = durations.empty() ? 0 : *std::min_element(durations.begin(), durations.end());
   transitionUs_ = durations.size() < 2 || t.kind == TransitionKind::Cut ? 0 : std::clamp<int64_t>(t.durationUs, 0, shortest / 2);
   startUs_.clear();
@@ -31,6 +33,15 @@ int TimelineLayout::lastActive(int64_t t) const {
     if (t >= startUs_[c]) return c;
   }
   return 0;
+}
+
+int TimelineLayout::leadClip(int64_t t) const {
+  int lead = lastActive(t);
+  if (frameUs_.size() != startUs_.size()) return lead;
+  for (int c = firstActive(t); c < lead; ++c) {
+    if (active(c, t) && frameUs_[c] < frameUs_[lead]) lead = c;
+  }
+  return lead;
 }
 
 float TimelineLayout::progress(int c, int64_t t) const {

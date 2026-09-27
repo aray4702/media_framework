@@ -9,6 +9,19 @@
 
 namespace mf {
 
+bool isValid(const VideoFilter& f) {
+  return std::isfinite(f.brightness) && std::isfinite(f.contrast) && f.brightness >= -1 && f.brightness <= 1 &&
+         f.contrast >= 0 && f.contrast <= 2;
+}
+
+bool isValid(const Timeline& t) {
+  if (t.clips.empty() || t.clips.size() > Timeline::kMaxClips || t.transition.durationUs < 0) return false;
+  for (const TextOverlay& o : t.texts) {
+    if (o.startUs < 0 || o.endUs <= o.startUs) return false;
+  }
+  return isValid(t.filter);
+}
+
 struct Player::Impl : PipelineEvents {
   Impl(PlatformFactory& factory, PlayerListener* l) : ctx(factory, *this), listener(l), owner(std::this_thread::get_id()) {
     stages = makeStages(ctx);
@@ -27,21 +40,8 @@ struct Player::Impl : PipelineEvents {
 
   // --- API (owner thread) ---
 
-  static bool valid(const VideoFilter& f) {
-    return std::isfinite(f.brightness) && std::isfinite(f.contrast) && f.brightness >= -1 && f.brightness <= 1 &&
-           f.contrast >= 0 && f.contrast <= 2;
-  }
-
-  static bool valid(const Timeline& t) {
-    if (t.clips.empty() || t.clips.size() > Timeline::kMaxClips || t.transition.durationUs < 0) return false;
-    for (const TextOverlay& o : t.texts) {
-      if (o.startUs < 0 || o.endUs <= o.startUs) return false;
-    }
-    return valid(t.filter);
-  }
-
   Result open(const Timeline& timeline, const RenderTarget& target) {
-    if (!valid(timeline)) return Result::InvalidArgument;
+    if (!isValid(timeline)) return Result::InvalidArgument;
     {
       std::lock_guard<std::mutex> lock(stateMu);
       if (state != State::Start || openCalled) return Result::InvalidState;
@@ -49,6 +49,12 @@ struct Player::Impl : PipelineEvents {
     }
     Result r = ctx.display->attach(target, [this](int64_t pts, int64_t ns) { onPresented(pts, ns); });
     if (r != Result::Ok) return r;
+    bool single = timeline.clips.size() == 1;
+    switch (timeline.driver) {
+      case OutputDriver::Auto: ctx.driver = single ? Driver::LeadingClip : Driver::Vsync; break;
+      case OutputDriver::LeadingClip: ctx.driver = Driver::LeadingClip; break;
+      case OutputDriver::Vsync: ctx.driver = Driver::Vsync; break;
+    }
     ctx.sources = timeline.clips;
     ctx.transition = timeline.transition;
     for (const TextOverlay& o : timeline.texts) {
@@ -101,7 +107,7 @@ struct Player::Impl : PipelineEvents {
   }
 
   Result setFilter(const VideoFilter& filter) {
-    if (!valid(filter)) return Result::InvalidArgument;
+    if (!isValid(filter)) return Result::InvalidArgument;
     if (getState() == State::Shutdown) return Result::InvalidState;
     ctx.setFilter(filter);
     ctx.wake(StageId::VideoRender);

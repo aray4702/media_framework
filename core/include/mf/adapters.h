@@ -73,6 +73,19 @@ class ISpeaker {
   virtual void pause() = 0;
 };
 
+// Export (§2.5): renders composed frames and encodes them with the mixed audio into a file.
+// Writes never block: Again means the encoder is busy, and the caller retries shortly.
+// Destroying the sink cancels an unfinished file, and no callback runs after the destructor.
+class IExportSink {
+ public:
+  virtual ~IExportSink() = default;
+  virtual Result open(const ExportTarget&, const ExportSettings&, int sampleRate, int channels) = 0;  // channels 0: no audio
+  virtual Result writeVideo(const ComposedFrame&) = 0;                                  // Ok | Again | WriteFailed
+  virtual Result writeAudio(const int16_t* pcm, int frames, int64_t ptsUs) = 0;          // Ok | Again | WriteFailed
+  // After the last write; `done` runs on any thread once the file is complete.
+  virtual void finish(std::function<void(Result)> done) = 0;
+};
+
 class Stage {
  public:
   virtual ~Stage() = default;
@@ -96,6 +109,7 @@ class PlatformFactory {
   virtual std::unique_ptr<ISpeaker> createSpeaker() = 0;
   virtual std::unique_ptr<IDisplay> createDisplay() = 0;
   virtual std::unique_ptr<IScheduler> createScheduler() = 0;
+  virtual std::unique_ptr<IExportSink> createExportSink() { return nullptr; }  // null: export unsupported
   virtual IClock& clock() = 0;
 };
 

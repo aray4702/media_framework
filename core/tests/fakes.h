@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "mf/audio_ring.h"
+#include "mf/exporter.h"
 #include "mf/player.h"
 
 namespace fake {
@@ -214,6 +215,41 @@ class Speaker : public ISpeaker {
   int64_t nextNs_ = 0;
 };
 
+// Records what an export writes. With busyEvery = n, every n-th write reports Again.
+class ExportSink : public IExportSink {
+ public:
+  Result open(const ExportTarget&, const ExportSettings& s, int rate, int ch) override {
+    settings = s;
+    sampleRate = rate;
+    channels = ch;
+    return Result::Ok;
+  }
+  Result writeVideo(const ComposedFrame& f) override {
+    if (busyEvery && ++videoCalls % busyEvery == 0) return Result::Again;
+    video.push_back(f);
+    return Result::Ok;
+  }
+  Result writeAudio(const int16_t* pcm, int frames, int64_t ptsUs) override {
+    if (busyEvery && ++audioCalls % busyEvery == 0) return Result::Again;
+    contiguous &= ptsUs == int64_t(audioFrames) * 1000000 / sampleRate;
+    audioFrames += frames;
+    samples.insert(samples.end(), pcm, pcm + size_t(frames) * channels);
+    return Result::Ok;
+  }
+  void finish(std::function<void(Result)> done) override {
+    finished = true;
+    done(Result::Ok);
+  }
+
+  int busyEvery = 0, videoCalls = 0, audioCalls = 0;
+  ExportSettings settings;
+  int sampleRate = 0, channels = 0;
+  std::vector<ComposedFrame> video;
+  int64_t audioFrames = 0;
+  std::vector<int16_t> samples;
+  bool contiguous = true, finished = false;
+};
+
 class ManualScheduler : public IScheduler {
  public:
   void start(std::array<Stage*, kStageCount> s) override { stages_ = s; }
@@ -257,8 +293,18 @@ class Platform : public PlatformFactory {
     scheduler = s.get();
     return s;
   }
+  std::unique_ptr<IExportSink> createExportSink() override {
+    if (!exportSupported) return nullptr;
+    auto s = std::make_unique<ExportSink>();
+    s->busyEvery = sinkBusyEvery;
+    exportSink = s.get();
+    return s;
+  }
   IClock& clock() override { return clock_; }
 
+  bool exportSupported = true;
+  int sinkBusyEvery = 0;
+  ExportSink* exportSink = nullptr;
   std::vector<Clip> clips;
   size_t demuxers = 0;
   Clock& clockRef() { return clock_; }
@@ -311,6 +357,38 @@ struct Harness {
   Platform platform;
   Listener listener;
   std::unique_ptr<Player> player;
+};
+
+struct ExportRecorder : ExportListener {
+  void onCompleted() override { ++completed; }
+  void onError(Result r, const std::string&) override { errors.push_back(r); }
+  int completed = 0;
+  std::vector<Result> errors;
+};
+
+// An exporter on fake adapters, driven 1 ms at a time.
+struct ExportHarness {
+  explicit ExportHarness(std::vector<Clip> clips, bool supported = true, int busyEvery = 0) : platform(std::move(clips)) {
+    platform.exportSupported = supported;
+    platform.sinkBusyEvery = busyEvery;
+    exporter = Exporter::create(platform, &listener);
+  }
+  ~ExportHarness() { exporter->shutdown(); }
+  Result start(Timeline t, ExportSettings s) {
+    t.clips.assign(platform.clips.size(), MediaSource{});
+    return exporter->start(t, ExportTarget{}, s);
+  }
+  // Runs until the export completes or fails, or `ms` of fake time pass.
+  void run(int ms) {
+    for (int i = 0; i < ms && !exporter->done(); ++i) {
+      platform.scheduler->runUntilIdle();
+      platform.clockRef().now += kMs;
+    }
+  }
+
+  Platform platform;
+  ExportRecorder listener;
+  std::unique_ptr<Exporter> exporter;
 };
 
 }  // namespace fake

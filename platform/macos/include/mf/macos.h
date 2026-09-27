@@ -11,6 +11,7 @@ std::unique_ptr<PlatformFactory> createPlatform();
 
 MediaSource sourceFromPath(const std::string& path);
 RenderTarget targetFromView(void* nsView);  // an NSView whose layer is a CAMetalLayer
+ExportTarget exportTargetFromPath(const std::string& path);  // an .mp4 file; replaced if it exists
 
 int64_t hostNowNs();  // mach_absolute_time in ns: the base CoreAudio and Core Animation use
 
@@ -20,5 +21,6 @@ std::unique_ptr<IVideoDecoder> createVideoDecoder();
 std::unique_ptr<IAudioDecoder> createAudioDecoder();
 std::unique_ptr<ISpeaker> createSpeaker();
 std::unique_ptr<IDisplay> createDisplay();
+std::unique_ptr<IExportSink> createExportSink();
 
 }  // namespace mf::macos

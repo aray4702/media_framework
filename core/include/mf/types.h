@@ -21,6 +21,8 @@ enum class Result {
   MalformedMedia,
   DecoderFailed,
   AudioDeviceFailed,
+  Unsupported,  // the platform has no implementation (e.g. no export sink)
+  WriteFailed,  // export: encoding or writing the output file failed
   // Adapter-to-core only; the Player never returns these.
   Again,         // try again later (input full / no output yet)
   Eos,           // end of track
@@ -98,6 +100,26 @@ struct TextOverlay {
   int64_t endUs = std::numeric_limits<int64_t>::max();
 };
 
+// What sets the output times while playing (§2.5). Export always uses a fixed frame grid.
+enum class OutputDriver {
+  Auto,         // LeadingClip for a single clip, Vsync for several
+  LeadingClip,  // one output frame per frame of the highest-fps active clip, paced by AvSync
+  Vsync,        // one output frame per display refresh, at the clock time it will be seen
+};
+
+// Export output (§2.5). Frames are composed at n / fps and written with the platform encoder.
+struct ExportSettings {
+  int width = 1920, height = 1080;  // even, at most 8192; each clip is aspect-fit into it
+  int fps = 30;                      // 1 to 240
+  int videoBitrate = 10000000;
+  int audioBitrate = 192000;
+};
+
+// Opaque handle made by the platform layer. Mac OS: NSURL of the output file.
+struct ExportTarget {
+  std::shared_ptr<void> native;
+};
+
 // One output frame as the display should draw it, built by the composition stage.
 struct ComposedFrame {
   struct Layer {
@@ -112,6 +134,7 @@ struct ComposedFrame {
   Layer layers[2];
   std::shared_ptr<const std::string> text;  // bottom caption, or null
   VideoFilter filter;
+  int64_t presentAtNs = 0;  // Vsync driver: the vsync this frame was composed for; 0 = paced by AvSync
   size_t bytes() const { return 0; }
 };
 

@@ -8,6 +8,9 @@
 //   --text "caption"               caption at the bottom for the whole timeline
 //   --transition slide-left|slide-right|cut   (default slide-left)
 //   --transition-ms N              slide length (default 1000)
+//   --driver auto|vsync|leading    what sets the output times while playing (default auto)
+//   --export out.mp4               render the timeline into a file instead of playing it
+//   --size WxH, --fps N            export size (default 1920x1080) and frame rate (default 30)
 
 #import <AppKit/AppKit.h>
 #import <QuartzCore/QuartzCore.h>
@@ -15,8 +18,10 @@
 
 #include <mach/mach.h>
 
+#include <atomic>
 #include <random>
 
+#include "mf/exporter.h"
 #include "mf/macos.h"
 #include "mf/player.h"
 
@@ -51,6 +56,9 @@ struct Options {
   NSArray<NSString*>* paths = @[];
   NSString* text = nil;
   mf::Transition transition;
+  mf::OutputDriver driver = mf::OutputDriver::Auto;
+  NSString* exportPath = nil;
+  mf::ExportSettings exportSettings;
   BOOL autotest = NO;
   double playSeconds = 8;
 };
@@ -221,6 +229,7 @@ static int64_t nowNs() { return mf::macos::hostNowNs(); }
   mf::Timeline timeline;
   for (NSString* path in paths) timeline.clips.push_back(mf::macos::sourceFromPath(path.UTF8String));
   timeline.transition = _options.transition;
+  timeline.driver = _options.driver;
   if (_options.text) timeline.texts.push_back({_options.text.UTF8String});
   timeline.filter = [self currentFilter];
   mf::Result r = _player->open(timeline, mf::macos::targetFromView((__bridge void*)_video));
@@ -367,6 +376,42 @@ static int64_t nowNs() { return mf::macos::hostNowNs(); }
 }
 @end
 
+// Headless export: prints progress, exits 0 once the file is written.
+static int exportTimeline(const Options& o) {
+  struct Waiter : mf::ExportListener {
+    dispatch_semaphore_t done = dispatch_semaphore_create(0);
+    std::atomic<bool> ok{false};
+    void onWarning(mf::Warning, const std::string& reason) override { std::printf("WARNING %s\n", reason.c_str()); }
+    void onCompleted() override {
+      ok = true;
+      dispatch_semaphore_signal(done);
+    }
+    void onError(mf::Result r, const std::string& reason) override {
+      std::printf("ERROR %s: %s\n", mf::toString(r), reason.c_str());
+      dispatch_semaphore_signal(done);
+    }
+  } waiter;
+  auto platform = mf::macos::createPlatform();
+  auto exporter = mf::Exporter::create(*platform, &waiter);
+  mf::Timeline timeline;
+  for (NSString* path in o.paths) timeline.clips.push_back(mf::macos::sourceFromPath(path.UTF8String));
+  timeline.transition = o.transition;
+  if (o.text) timeline.texts.push_back({o.text.UTF8String});
+  int64_t startNs = mf::macos::hostNowNs();
+  mf::Result r = exporter->start(timeline, mf::macos::exportTargetFromPath(o.exportPath.UTF8String), o.exportSettings);
+  if (r != mf::Result::Ok) {
+    std::printf("ERROR %s\n", mf::toString(r));
+    return 1;
+  }
+  while (dispatch_semaphore_wait(waiter.done, dispatch_time(DISPATCH_TIME_NOW, 500 * NSEC_PER_MSEC)) != 0) {
+    std::printf("export %3.0f%%\n", exporter->progress() * 100);
+  }
+  exporter->shutdown();
+  std::printf("%s %s in %.1f s\n", waiter.ok ? "wrote" : "failed", o.exportPath.UTF8String,
+              (mf::macos::hostNowNs() - startNs) / 1e9);
+  return waiter.ok ? 0 : 1;
+}
+
 int main(int argc, const char** argv) {
   setvbuf(stdout, nullptr, _IOLBF, 0);
   @autoreleasepool {
@@ -386,6 +431,21 @@ int main(int argc, const char** argv) {
                                   : [value isEqualToString:@"slide-right"] ? mf::TransitionKind::SlideRight
                                                                            : mf::TransitionKind::SlideLeft;
         ++i;
+      } else if ([arg isEqualToString:@"--driver"] && value) {
+        options.driver = [value isEqualToString:@"vsync"]     ? mf::OutputDriver::Vsync
+                         : [value isEqualToString:@"leading"] ? mf::OutputDriver::LeadingClip
+                                                              : mf::OutputDriver::Auto;
+        ++i;
+      } else if ([arg isEqualToString:@"--export"] && value) {
+        options.exportPath = value;
+        ++i;
+      } else if ([arg isEqualToString:@"--size"] && value) {
+        NSArray<NSString*>* wh = [value componentsSeparatedByString:@"x"];
+        if (wh.count == 2) options.exportSettings = {wh[0].intValue, wh[1].intValue, options.exportSettings.fps};
+        ++i;
+      } else if ([arg isEqualToString:@"--fps"] && value) {
+        options.exportSettings.fps = value.intValue;
+        ++i;
       } else if ([arg isEqualToString:@"--transition-ms"] && value) {
         options.transition.durationUs = static_cast<int64_t>(value.doubleValue * 1000);
         ++i;
@@ -397,6 +457,7 @@ int main(int argc, const char** argv) {
       }
     }
     options.paths = paths;
+    if (options.exportPath) return exportTimeline(options);
     NSApplication* app = [NSApplication sharedApplication];
     app.activationPolicy = NSApplicationActivationPolicyRegular;
     Controller* controller = [[Controller alloc] initWithOptions:options];

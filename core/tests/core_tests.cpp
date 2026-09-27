@@ -586,6 +586,119 @@ TEST(composition_rejects_bad_timelines) {
   CHECK(h.open(Timeline{}) == Result::Ok);  // nothing was opened by the failed calls
 }
 
+// --- Output drivers -----------------------------------------------------------------------
+
+// Plays a two-clip timeline (1 s slide) to the end and counts the frames shown mid-slide.
+static int transitionFramesShown(std::vector<fake::Clip> c, OutputDriver driver, fake::Harness** keep = nullptr) {
+  static std::unique_ptr<fake::Harness> h;
+  h = std::make_unique<fake::Harness>(std::move(c));
+  Timeline t;
+  t.transition = {TransitionKind::SlideLeft, 1000000};
+  t.driver = driver;
+  h->open(t);
+  h->run(20);
+  h->player->play();
+  h->run(3500);
+  CHECK_EQ(h->listener.ended, 1);
+  CHECK_EQ(h->player->metrics().lateDrops, 0);
+  int n = 0;
+  for (const ComposedFrame& f : h->platform.display->composed) n += f.layerCount == 2;
+  if (keep) *keep = h.get();
+  return n;
+}
+
+TEST(driver_leading_clip_follows_the_highest_frame_rate) {
+  std::vector<fake::Clip> c = clips(2, 2000000);
+  CHECK(transitionFramesShown(c, OutputDriver::LeadingClip) <= 31);  // 30 fps both: one per frame
+  c[0].fps = 60;  // the outgoing clip is faster: it leads the slide
+  CHECK(transitionFramesShown(c, OutputDriver::LeadingClip) >= 57);
+}
+
+TEST(driver_vsync_moves_the_slide_every_refresh) {
+  fake::Harness* h = nullptr;
+  CHECK(transitionFramesShown(clips(2, 2000000), OutputDriver::Vsync, &h) >= 57);  // 60 Hz, 30 fps clips
+  for (const ComposedFrame& f : h->platform.display->composed) {
+    CHECK(f.presentAtNs == 0 || f.layerCount < 2 || std::abs(f.layers[1].offsetX - (1.0 - (f.ptsUs - 1000000) / 1e6)) < 1e-3);
+  }
+}
+
+TEST(driver_vsync_skips_refreshes_with_nothing_new) {
+  fake::Harness h(clips(1, 1000000));
+  Timeline t;
+  t.driver = OutputDriver::Vsync;
+  h.open(t);
+  h.run(20);
+  h.player->play();
+  h.run(1500);
+  CHECK_EQ(h.listener.ended, 1);
+  MetricsReport m = h.player->metrics();
+  CHECK(m.presented >= 28 && m.presented <= 31);  // one per source frame, not one per refresh
+  CHECK_EQ(m.janks, 0);
+  CHECK(m.avP95AbsMs <= 10);
+}
+
+// --- Export -------------------------------------------------------------------------------
+
+// The latest fake frame (i * 1 s / fps) at or before a clip's local time.
+static int64_t latestFrameAt(int64_t localUs, int fps) {
+  int64_t i = 0;
+  while ((i + 1) * 1000000 / fps <= localUs) ++i;
+  return i * 1000000 / fps;
+}
+
+TEST(export_writes_every_grid_frame_with_exact_layers) {
+  fake::ExportHarness h(clips(2, 2000000));
+  Timeline t;
+  t.transition = {TransitionKind::SlideLeft, 1000000};
+  t.texts = {{"caption", 0, 500000}};
+  ExportSettings s;
+  s.fps = 24;  // not the clips' 30 fps: each output frame samples the clips
+  CHECK(h.start(t, s) == Result::Ok);
+  h.run(20000);
+  CHECK_EQ(h.listener.completed, 1);
+  CHECK(h.exporter->progress() == 1.0);
+  fake::ExportSink& sink = *h.platform.exportSink;
+  CHECK(sink.finished);
+  CHECK_EQ(sink.video.size(), size_t(72));  // 3 s at 24 fps
+  int transition = 0;
+  for (size_t n = 0; n < sink.video.size(); ++n) {
+    const ComposedFrame& f = sink.video[n];
+    CHECK_EQ(f.ptsUs, int64_t(n) * 1000000 / 24);
+    transition += f.layerCount == 2;
+    for (int i = 0; i < f.layerCount; ++i) {
+      int64_t start = f.layers[i].frame.clip == 0 ? 0 : 1000000;
+      CHECK_EQ(f.layers[i].frame.ptsUs, latestFrameAt(f.ptsUs - start, 30));
+    }
+    CHECK_EQ(bool(f.text), f.ptsUs < 500000);
+  }
+  CHECK_EQ(transition, 24);
+  CHECK_EQ(sink.audioFrames, int64_t{3 * 48000});
+  CHECK(sink.contiguous);
+  auto loud = [](int16_t v) { return v < 99 || v > 101; };
+  CHECK(std::none_of(sink.samples.begin(), sink.samples.end(), loud));  // the crossfade is level
+}
+
+TEST(export_keeps_going_when_the_encoder_is_busy) {
+  fake::ExportHarness h(clips(2, 1000000), true, 3);
+  CHECK(h.start(Timeline{}, ExportSettings{}) == Result::Ok);
+  h.run(20000);
+  CHECK_EQ(h.listener.completed, 1);
+  CHECK_EQ(h.platform.exportSink->video.size(), size_t(45));  // 1.5 s (slide capped at 0.5 s) at 30 fps
+  CHECK_EQ(h.platform.exportSink->audioFrames, int64_t{72000});
+}
+
+TEST(export_rejects_bad_settings_and_missing_support) {
+  fake::ExportHarness h(clips(1, 1000000));
+  ExportSettings odd;
+  odd.width = 1279;
+  CHECK(h.start(Timeline{}, odd) == Result::InvalidArgument);
+  ExportSettings slow;
+  slow.fps = 0;
+  CHECK(h.start(Timeline{}, slow) == Result::InvalidArgument);
+  fake::ExportHarness none(clips(1, 1000000), false);
+  CHECK(none.start(Timeline{}, ExportSettings{}) == Result::Unsupported);
+}
+
 int main() {
   for (const test::Case& c : test::cases()) {
     int before = test::failures();

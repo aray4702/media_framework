@@ -50,9 +50,13 @@ struct Caption {
   std::shared_ptr<const std::string> text;
 };
 
-// State shared by the Player and the five stages.
+// What sets the output times inside the pipeline (§2.5).
+enum class Driver { LeadingClip, Vsync, Export };
+
+// State shared by the Player (or Exporter) and the five stages.
 struct Context {
-  Context(PlatformFactory& factory, PipelineEvents& events);
+  // An export context makes an export sink instead of a display and a speaker.
+  Context(PlatformFactory& factory, PipelineEvents& events, bool forExport = false);
 
   void wake(StageId id) { scheduler->wake(id); }
   void wakeAll();
@@ -76,11 +80,15 @@ struct Context {
   PipelineEvents& events;
   std::vector<std::unique_ptr<IDemuxer>> demuxers;  // one per clip, made by T1 while probing
   Lane lanes[kLanes];
-  std::unique_ptr<ISpeaker> speaker;
-  std::unique_ptr<IDisplay> display;
+  std::unique_ptr<ISpeaker> speaker;       // playback only
+  std::unique_ptr<IDisplay> display;       // playback only
+  std::unique_ptr<IExportSink> exportSink;  // export only
   std::unique_ptr<IScheduler> scheduler;
 
-  // Set by open() before T1 is woken.
+  // Set by open() (or Exporter::start) before T1 is woken.
+  Driver driver = Driver::LeadingClip;
+  ExportTarget exportTarget;
+  ExportSettings exportSettings;
   std::vector<MediaSource> sources;
   Transition transition;
   std::vector<Caption> captions;
@@ -106,6 +114,10 @@ struct Context {
   std::atomic<int64_t> shownPtsUs{0};
   std::atomic<bool> halted{false};       // fatal error or shutdown: stages go idle
   std::atomic<uint32_t> filterVersion{0};  // bumped by setFilter, so T3 can redraw a paused frame
+
+  // Export progress.
+  std::atomic<bool> audioWritten{false};  // T4 has written the last audio
+  std::atomic<int64_t> writtenUs{0};      // timeline time of the last video frame written
 
   // Playback. `playing` is written under playMu; `outputRunning` is only touched under playMu.
   std::mutex playMu;

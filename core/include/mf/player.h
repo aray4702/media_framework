@@ -10,6 +10,7 @@ namespace mf {
 
 struct MetricsReport {
   int64_t presented = 0, lateDrops = 0, rateCapDrops = 0, hiddenDrops = 0;
+  int64_t lateLayers = 0;  // Vsync driver: a layer showed an older frame because its decode was behind
   int64_t decodeOnly = 0, corruptSkips = 0;
   int64_t intervals = 0, janks = 0;
   double droppedRate = 0, jankRate = 0;
@@ -29,7 +30,11 @@ struct Timeline {
   Transition transition;           // between each pair of clips
   std::vector<TextOverlay> texts;  // timeline time; the first one covering a frame is shown
   VideoFilter filter;
+  OutputDriver driver = OutputDriver::Auto;  // playback only; export ignores it
 };
+
+bool isValid(const Timeline&);
+bool isValid(const VideoFilter&);
 
 // Callbacks run on internal threads. They must return quickly and must never wait on the
 // owner thread (e.g. dispatch_sync to it), or shutdown() deadlocks. Post work instead.

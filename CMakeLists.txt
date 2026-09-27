@@ -15,6 +15,7 @@ add_compile_options(-Wall -Wextra -Wno-unused-parameter)
 add_library(mf_core STATIC
   core/src/audio_ring.cpp
   core/src/av_sync.cpp
+  core/src/exporter.cpp
   core/src/master_clock.cpp
   core/src/metrics.cpp
   core/src/pipeline.cpp
