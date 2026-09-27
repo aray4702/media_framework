@@ -1,6 +1,7 @@
 #include "mf/player.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <thread>
 
@@ -11,7 +12,9 @@ namespace mf {
 struct Player::Impl : PipelineEvents {
   Impl(PlatformFactory& factory, PlayerListener* l) : ctx(factory, *this), listener(l), owner(std::this_thread::get_id()) {
     stages = makeStages(ctx);
-    ctx.scheduler->start({stages[0].get(), stages[1].get(), stages[2].get(), stages[3].get()});
+    std::array<Stage*, kStageCount> raw;
+    for (int i = 0; i < kStageCount; ++i) raw[i] = stages[i].get();
+    ctx.scheduler->start(raw);
   }
   ~Impl() override { shutdown(); }
 
@@ -24,7 +27,21 @@ struct Player::Impl : PipelineEvents {
 
   // --- API (owner thread) ---
 
-  Result open(const MediaSource& source, const RenderTarget& target) {
+  static bool valid(const VideoFilter& f) {
+    return std::isfinite(f.brightness) && std::isfinite(f.contrast) && f.brightness >= -1 && f.brightness <= 1 &&
+           f.contrast >= 0 && f.contrast <= 2;
+  }
+
+  static bool valid(const Timeline& t) {
+    if (t.clips.empty() || t.clips.size() > Timeline::kMaxClips || t.transition.durationUs < 0) return false;
+    for (const TextOverlay& o : t.texts) {
+      if (o.startUs < 0 || o.endUs <= o.startUs) return false;
+    }
+    return valid(t.filter);
+  }
+
+  Result open(const Timeline& timeline, const RenderTarget& target) {
+    if (!valid(timeline)) return Result::InvalidArgument;
     {
       std::lock_guard<std::mutex> lock(stateMu);
       if (state != State::Start || openCalled) return Result::InvalidState;
@@ -32,7 +49,12 @@ struct Player::Impl : PipelineEvents {
     }
     Result r = ctx.display->attach(target, [this](int64_t pts, int64_t ns) { onPresented(pts, ns); });
     if (r != Result::Ok) return r;
-    ctx.source = source;
+    ctx.sources = timeline.clips;
+    ctx.transition = timeline.transition;
+    for (const TextOverlay& o : timeline.texts) {
+      ctx.captions.push_back({o.startUs, o.endUs, std::make_shared<const std::string>(o.text)});
+    }
+    ctx.setFilter(timeline.filter);
     ctx.metrics.startTtff(ctx.hostClock.nowNs());
     ctx.openRequested = true;
     ctx.wake(StageId::Source);
@@ -78,6 +100,14 @@ struct Player::Impl : PipelineEvents {
     return Result::Ok;
   }
 
+  Result setFilter(const VideoFilter& filter) {
+    if (!valid(filter)) return Result::InvalidArgument;
+    if (getState() == State::Shutdown) return Result::InvalidState;
+    ctx.setFilter(filter);
+    ctx.wake(StageId::VideoRender);
+    return Result::Ok;
+  }
+
   Result shutdown() {
     {
       std::lock_guard<std::mutex> lock(stateMu);
@@ -95,9 +125,11 @@ struct Player::Impl : PipelineEvents {
     // Release adapters before the buffers they call back into (ring, metrics, scheduler).
     ctx.speaker.reset();
     ctx.display.reset();
-    ctx.videoDecoder.reset();
-    ctx.audioDecoder.reset();
-    ctx.demuxer.reset();
+    for (Lane& lane : ctx.lanes) {
+      lane.videoDecoder.reset();
+      lane.audioDecoder.reset();
+    }
+    ctx.demuxers.clear();
     std::fprintf(stderr, "[mf] metrics: %s\n", ctx.metrics.report().toString().c_str());
     return Result::Ok;
   }
@@ -205,9 +237,15 @@ std::unique_ptr<Player> Player::create(PlatformFactory& factory, PlayerListener*
 Player::Player(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
 Player::~Player() = default;
 
-Result Player::open(const MediaSource& s, const RenderTarget& t) {
-  return impl_->onOwner() ? impl_->open(s, t) : Result::WrongThread;
+Result Player::open(const Timeline& tl, const RenderTarget& t) {
+  return impl_->onOwner() ? impl_->open(tl, t) : Result::WrongThread;
 }
+Result Player::open(const MediaSource& s, const RenderTarget& t) {
+  Timeline tl;
+  tl.clips = {s};
+  return open(tl, t);
+}
+Result Player::setFilter(const VideoFilter& f) { return impl_->onOwner() ? impl_->setFilter(f) : Result::WrongThread; }
 Result Player::play() { return impl_->onOwner() ? impl_->play() : Result::WrongThread; }
 Result Player::pause() { return impl_->onOwner() ? impl_->pause() : Result::WrongThread; }
 Result Player::seek(int64_t us) { return impl_->onOwner() ? impl_->seek(us) : Result::WrongThread; }

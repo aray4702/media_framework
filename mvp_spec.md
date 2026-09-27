@@ -19,6 +19,7 @@ Source: [reqs.md](reqs.md). This spec defines the smallest version that works en
 | Seek to the exact timestamp; scrub coalescing                                                                                               | Seek while in PLAY (A4)                                                  |
 | Metrics: dropped-frame rate, jank rate, A/V offset, TTFF, seek latency, peak memory                                                         | Telemetry upload, dashboards                                             |
 | Minimal demo app: `NSWindow` with a `CAMetalLayer`-backed view, open file, play/pause, seek bar                                             | Production UI                                                            |
+| Composition (§2.4): up to 16 clips back to back, joined by a horizontal slide or a cut; one caption at the bottom; brightness and contrast  | Other transitions, per-clip effects, caption styling and positioning, picture-in-picture |
 
 **Why Mac OS first:** most of the pipeline runs on C APIs that C++ calls directly (`VideoToolbox`, `CoreMedia`, `AudioToolbox`/`AudioUnit`), and only the demuxer and display need a thin Objective-C++ layer (`AVAssetReader`, `CAMetalLayer`). There's no device to deploy to, Instruments gives good profiling, and the adapters carry over almost unchanged to iOS. That keeps the MVP close to one language while the adapter boundaries stay real. The cost is that a Mac is not one of reqs.md's main device types and is far from constrained. §5 adds a constrained run, and A22 covers what the MVP can't prove.
 
@@ -32,8 +33,10 @@ Source: [reqs.md](reqs.md). This spec defines the smallest version that works en
                  ▼
         ┌──────── Player (C++ core: state machine, clock, queues) ────────┐
         │                                                                 │
- T1 Source:  IDemuxer ─(video)─► [video pkt Q] ──► T2 VideoDecode: IVideoDecoder ──► [frame Q] ──► T3 VideoRender: IDisplay ──► presenter
-             (per track) ─(audio)─► [audio pkt Q] ──► T4 Audio: IAudioDecoder ──► ISpeaker ring (non-blocking write) ──► RT render callback
+ T1 Source:  IDemuxer ─(video)─► [video pkt Q] ──► T2 VideoDecode: IVideoDecoder ──► [frame Q] ─┐
+  (per clip,  (per track) ─(audio)─► [audio pkt Q] ─┐                                              ├─► TC Composition ──► [composed Q] ──► T3 VideoRender: IDisplay ──► presenter
+   2 lanes)                                        └─► T4 Audio: IAudioDecoder ×2, mixer ──► ISpeaker ring ──► RT render callback
+             each lane (clip i on lane i % 2) has its own packet queues, decoders and frame queue ─┘
         │                                                                 │
         └──────────── MasterClock = audio frames consumed | steady_clock ─┘
 ```
@@ -41,11 +44,12 @@ Source: [reqs.md](reqs.md). This spec defines the smallest version that works en
 ### 2.1 Core (portable C++17, no platform headers)
 
 - `Player`: public API, state machine, owner-thread check, seek coalescing, and a serial number for each seek.
-- **Stages** (`SourceStage`, `VideoDecodeStage`, `VideoRenderStage`, `AudioStage`): each one is a **non-blocking** `pump()` step. It tries to pop, does its work, tries to push, and returns a `Progress` value. Stages never sleep or wait, and no adapter call they make may block. Waiting belongs to the scheduler (§2.3), so the same stage code runs on native threads and on the browser's event loop.
+- **Stages** (`SourceStage`, `VideoDecodeStage`, `CompositionStage`, `VideoRenderStage`, `AudioStage`): each one is a **non-blocking** `pump()` step. It tries to pop, does its work, tries to push, and returns a `Progress` value. Stages never sleep or wait, and no adapter call they make may block. Waiting belongs to the scheduler (§2.3), so the same stage code runs on native threads and on the browser's event loop.
 - `BoundedQueue<T>`: non-blocking `tryPush`/`tryPop`, `flush()`, and a hook that notifies the scheduler when an item or a free slot becomes available. The native thread scheduler guards it with a mutex. Each queue is capped by **count, bytes and duration**, whichever is reached first (A23; caps below).
 - `MasterClock`: follows the audio clock when an audio track is playing, otherwise `std::chrono::steady_clock` (§4).
 - `AvSync`: decides for each frame whether to present or drop, and when to present it (§4).
 - `Metrics`: counters and histograms, fed with actual present times from the display. Dumped to the log on `shutdown` and exposed through a query.
+- `TimelineLayout`: where each clip starts and ends on the timeline, and the slide offset and audio gain of a clip at a given time (§2.4).
 
 **Why C++17.** reqs.md asks for the common logic in C++. The standard is set to C++17 because:
 
@@ -69,15 +73,16 @@ Revisit when the oldest supported NDK and Xcode versions ship complete C++20 lib
 
 | Buffer                                  | Cap                                           |
 | --------------------------------------- | --------------------------------------------- |
-| Video packet queue                      | 60 packets, 32 MB, or 2 s                     |
-| Audio packet queue                      | 120 packets, 1 MB, or 2 s                     |
-| Decoded frame queue                     | 4 frames                                      |
-| Decoder frames in flight                | 4                                             |
+| Video packet queue (per lane)           | 60 packets, 32 MB, or 2 s                     |
+| Audio packet queue (per lane)           | 120 packets, 1 MB, or 2 s                     |
+| Decoded frame queue (per lane)          | 4 frames                                      |
+| Composed frame queue                    | 4 frames (each holds 1 or 2 decoded frames)   |
+| Decoder frames in flight (per lane)     | 4                                             |
 | Reorder buffer (in the decoder adapter) | DPB size from the SPS (≤ 16; about 5 at 4K)   |
 | Presenter + GPU                         | 1 waiting frame + 2 in use by command buffers |
 | Audio PCM ring                          | 200 ms                                        |
 
-Worst case this is about 80 MB at 1080p and about 230 MB at 4K. The decoder's pixel-buffer pool is sized to match, and each `CVPixelBuffer` is released when the command buffer that samples it completes.
+Worst case this is about 80 MB at 1080p and about 230 MB at 4K for one lane. The second lane only fills during a transition or ahead of the next clip, and adds up to the same again. The decoder's pixel-buffer pool is sized to match, and each `CVPixelBuffer` is released when the command buffer that samples it completes.
 
 ### 2.2 Adapter interfaces (MVP implementations are Mac OS-only)
 
@@ -158,9 +163,10 @@ Threading is part of the platform scheduler, not the core contract. The MVP's Ma
 | --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | Caller          | API calls only. Every call returns without doing I/O or decoding. Only `shutdown` waits, to join the threads.                                                                                                                                                                                                                                    |
 | T1 Source       | Probes and configures on `open`, handles pending seeks, and demuxes. Among the tracks whose queue has room, it reads from the one with the lowest next decode time. A full video queue therefore never stops audio from being read, so a badly interleaved file can't deadlock the pipeline. The parser stage is a pass-through in the MVP (A3). |
-| T2 Video decode | Takes a packet, queues it into the decoder, dequeues output in PTS order, and pushes it to the frame queue.                                                                                                                                                                                                                                      |
-| T3 Video render | Takes a frame, runs `AvSync`, then hands it to the presenter or drops it.                                                                                                                                                                                                                                                                        |
-| T4 Audio        | Takes a packet, decodes it, and writes to the `ISpeaker` ring buffer. When the ring is full, the thread waits a few ms. The frames the render callback consumes drive the master clock.                                                                                                                                                          |
+| T2 Video decode | For each lane: takes a packet, queues it into the lane's decoder, dequeues output in PTS order, and pushes it to the lane's frame queue.                                                                                                                                                                                                           |
+| TC Composition  | Merges the two lanes' frames in timeline order and builds each `ComposedFrame`: layers, slide offsets, caption, filter. Picks the frame to show for an exact seek (§4).                                                                                                                                                                           |
+| T3 Video render | Takes a composed frame, runs `AvSync`, then hands it to the presenter or drops it.                                                                                                                                                                                                                                                              |
+| T4 Audio        | Takes packets from both lanes, decodes them, mixes them on the timeline (§2.4), and writes to the `ISpeaker` ring buffer. When the ring is full, the thread waits a few ms. The frames the render callback consumes drive the master clock.                                                                                                        |
 
 On Mac OS, T2 is thin: VideoToolbox already decodes asynchronously, so T2 mostly moves packets in and frames out. reqs.md asks for one thread per stage, so it stays. Merging it into T1 is an option if reqs.md relaxes that rule.
 
@@ -173,6 +179,47 @@ On Mac OS, T2 is thin: VideoToolbox already decodes asynchronously, so T2 mostly
 
 Host unit tests use a **single-threaded manual scheduler** that calls `pump()` in a fixed order with a fake clock. This makes the tests for sync, seek and the state machine deterministic.
 
+### 2.4 Composition: timeline, lanes and the composition stage
+
+The player plays a **timeline**: up to 16 clips in order, a transition between each pair, captions and a filter.
+
+```cpp
+struct Timeline {
+  std::vector<MediaSource> clips;   // 1 to 16, played in order
+  Transition transition;            // Cut, SlideLeft or SlideRight, with durationUs (default 1 s)
+  std::vector<TextOverlay> texts;   // {text, startUs, endUs} on the timeline; the first match is shown
+  VideoFilter filter;               // brightness -1..1 (0 = none), contrast 0..2 (1 = none); live via setFilter
+};
+```
+
+**Layout.** Clip `i+1` starts `T` before clip `i` ends, so the two overlap for the transition, and the timeline is `sum(durations) − (n−1)·T` long. `T` is capped at half the shortest clip. So at most two clips are active at any time, and clip `i+2` starts only after clip `i` ends. A cut is `T = 0`.
+
+**Lanes.** Clip `i` always plays on **lane `i % 2`**. Each lane has its own packet queues, video and audio decoders and frame queue, so the incoming clip decodes alongside the outgoing one. T1 probes every clip on `open` (one demuxer each, for the durations and to fail early on unsupported media), then:
+
+- **Seek to `t`:** the lane of the first clip active at `t` seeks into it, and the other lane seeks the next clip to `max(0, t − start)`.
+- **End of a clip:** once a lane has read both tracks of clip `i` to the end, it moves on to clip `i+2` from 0.
+- Packets carry their clip index. When a lane's next clip arrives, T2 waits for the previous clip to drain (its Eos), then reconfigures the decoder. VideoToolbox keeps the session when `VTDecompressionSessionCanAcceptFormatDescription` accepts the new format.
+
+**Composition stage (TC).** It takes frames from both lanes in timeline order (`start[clip] + pts`). It moves on only when the other lane can't still deliver an earlier frame: that lane has a frame waiting, or it is still before its clip's start, or it has finished. For each frame:
+
+- A frame past its clip's end is dropped: the next clip cuts it.
+- A frame of the **outgoing** clip is kept as that lane's latest frame. It is shown under the leading clip's next frame.
+- A frame of the **leading** clip (the latest one active at its time) becomes a `ComposedFrame`: the outgoing clip's latest frame and this one, each with its horizontal offset, plus the caption and the filter.
+
+```cpp
+struct ComposedFrame {
+  int64_t ptsUs;  uint32_t serial;  bool eos;  int64_t frameDurationUs;   // of the leading clip
+  int layerCount; struct { VideoFrame frame; float offsetX; } layers[2];  // outgoing first; offset in output widths
+  std::shared_ptr<const std::string> text;  VideoFilter filter;
+};
+```
+
+At transition progress `p = (t − start) / T`, slide-left puts the outgoing clip at `−p` and the incoming one at `1 − p`; slide-right mirrors this. Output frames follow the leading clip's frame rate, and AvSync paces them with its frame duration.
+
+**Drawing.** `IDisplay::present` takes the `ComposedFrame` and draws it in one pass, so frames stay zero-copy: each layer from its decoder surface, aspect-fit and offset, with the filter applied in the fragment shader as `rgb' = (rgb − 0.5) · contrast + 0.5 + brightness`. The caption goes on top, centered at the bottom of the leading clip's picture and not sliding. On Mac OS it is rasterized once with Core Text into a texture and reused while the text and size stay the same. T3 stamps the latest filter onto each frame it presents, so a slider change shows on the next frame. While paused, it redraws the frame on screen.
+
+**Audio.** T4 mixes on the timeline in 1024-frame chunks. Before mixing a chunk, every clip with audio in it must be decoded that far or have ended. Each clip is cut to its time on the timeline and scaled by a linear gain that fades in and out over the transitions. The two gains in an overlap sum to 1, so a slide is an equal-gain crossfade. Consecutive packets of a clip within 1 ms of each other are treated as one continuous stream, so timestamp rounding never doubles or drops a sample. The output format is that of the first clip with usable audio. Clips without audio, or with a different sample rate or channel count, play silent (`AudioUnsupported` warning for the latter; resampling is a next step). The master clock is the mixed audio, so it runs across clip boundaries.
+
 Callbacks run **on internal threads**. A callback must return quickly and **must never wait on the owner thread**, for example with `dispatch_sync` to the main queue or a lock the owner holds while calling the player. Otherwise `shutdown`, which joins those threads, deadlocks. The listener posts work to its own thread with `dispatch_async` (A11).
 
 ---
@@ -183,11 +230,13 @@ Callbacks run **on internal threads**. A callback must return quickly and **must
 class Player {
  public:
   static std::unique_ptr<Player> create(PlatformFactory&, PlayerListener*);  // binds owner thread
-  Result open(MediaSource, RenderTarget);   // validates and returns; probe, configure and preroll run on T1
+  Result open(const Timeline&, RenderTarget);  // validates and returns; probe, configure and preroll run on T1 (§2.4)
+  Result open(MediaSource, RenderTarget);      // a timeline of one clip
   Result play();
   Result pause();
   Result seek(int64_t positionUs);    // sync validation; completion via onSeekCompleted
   Result shutdown();                  // sync: stops callbacks, wakes and joins threads, releases adapters
+  Result setFilter(VideoFilter);      // any state before SHUTDOWN; InvalidArgument out of range
   State   state() const;
   int64_t durationUs() const;
   int64_t positionUs() const;         // = master clock in PLAY, else the PTS of the frame on screen
@@ -202,7 +251,7 @@ struct PlayerListener {
 };
 ```
 
-`Result` codes: `Ok, InvalidState, WrongThread, InvalidArgument, FileOpenFailed, UnsupportedFormat, NoDecoder, MalformedMedia, DecoderFailed, AudioDeviceFailed`. `open` itself returns only `Ok`, `InvalidState`, `WrongThread` or `InvalidArgument`. Probe and decode failures arrive through `onError`.
+`Result` codes: `Ok, InvalidState, WrongThread, InvalidArgument, FileOpenFailed, UnsupportedFormat, NoDecoder, MalformedMedia, DecoderFailed, AudioDeviceFailed`. `open` itself returns only `Ok`, `InvalidState`, `WrongThread` or `InvalidArgument` (no clips or more than 16, a negative transition, a caption with `endUs <= startUs`, or a filter out of range). Probe and decode failures arrive through `onError`.
 
 `Warning` codes: `AudioUnsupported` (video plays alone, A17), `RotationIgnored` (non-identity track matrix, A21).
 
@@ -265,12 +314,12 @@ Seek in PLAY is **rejected** in the MVP, following reqs.md literally. To scrub, 
 2. A seek is *in flight* while `shownSerial != serial`. T1 starts a pending seek only when none is in flight. It then:
    1. does `++serial`;
    2. flushes the packet queues;
-   3. signals T2, T3 and T4, which flush their decoders, the frame queue and the speaker on their own threads without waiting;
-   4. calls `demuxer.seekTo(t)`, which lands on keyframe `k ≤ t`;
+   3. signals T2, TC, T3 and T4, which flush their decoders, the frame queues and the speaker on their own threads without waiting;
+   4. calls `seekTo` on the demuxers of the clips around `t` (§2.4), which land on keyframes `k ≤ t`;
    5. pushes packets tagged with the new serial and `targetPts = t`.
 3. Downstream threads drop any item with a stale serial.
-4. **Exact seek.** Frames with `pts < t` are decoded but not shown, and are counted as decode-only. T3 keeps the latest frame with `pts ≤ t` and shows it once the next frame's PTS is past `t`, or at end of stream. T4 discards audio samples before `t`, trimming inside the first packet.
-5. **Scrub.** If a newer seek is already pending when T3 receives the in-flight seek's keyframe, T3 shows the keyframe right away and completes that seek without decoding on to `t`. During a fast scrub, a new frame therefore appears about once per keyframe-seek latency. The last seek always runs as an exact seek, so the final position is exact, and only the latest request is honored.
+4. **Exact seek.** Frames with `pts < t` are decoded but not shown, and are counted as decode-only. TC keeps the latest composed frame with timeline `pts ≤ t` and passes it on once the next one is past `t`, or at end of stream. T3 shows the first frame of the new serial. T4 starts mixing at `t`, trimming inside the first packet.
+5. **Scrub.** If a newer seek is already pending when TC composes the in-flight seek's keyframe, TC passes it on right away and T3 completes that seek without decoding on to `t`. During a fast scrub, a new frame therefore appears about once per keyframe-seek latency. The last seek always runs as an exact seek, so the final position is exact, and only the latest request is honored.
 6. On completion, T3 sets `shownSerial = serial`, fires `onSeekCompleted(shownPts)`, and wakes T1.
 
 **Errors**

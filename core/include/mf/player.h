@@ -2,6 +2,7 @@
 
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "mf/adapters.h"
 
@@ -19,6 +20,15 @@ struct MetricsReport {
   int64_t seeks = 0;
   double seekP50Ms = 0, seekP95Ms = 0;
   std::string toString() const;
+};
+
+// What open() plays: clips back to back, joined by a transition, with captions and a filter.
+struct Timeline {
+  static constexpr size_t kMaxClips = 16;
+  std::vector<MediaSource> clips;  // 1 to kMaxClips, played in order
+  Transition transition;           // between each pair of clips
+  std::vector<TextOverlay> texts;  // timeline time; the first one covering a frame is shown
+  VideoFilter filter;
 };
 
 // Callbacks run on internal threads. They must return quickly and must never wait on the
@@ -40,14 +50,16 @@ class Player {
   static std::unique_ptr<Player> create(PlatformFactory&, PlayerListener*);
   ~Player();
 
-  Result open(const MediaSource&, const RenderTarget&);  // returns at once; probing runs on T1
+  Result open(const Timeline&, const RenderTarget&);     // returns at once; probing runs on T1
+  Result open(const MediaSource&, const RenderTarget&);  // a timeline of one clip
   Result play();
   Result pause();
   Result seek(int64_t positionUs);  // completes via onSeekCompleted
   Result shutdown();                // joins the threads; idempotent
+  Result setFilter(const VideoFilter&);  // any time before shutdown; a paused frame is redrawn
 
   State state() const;
-  int64_t durationUs() const;
+  int64_t durationUs() const;  // of the whole timeline
   int64_t positionUs() const;
   MetricsReport metrics() const;
 

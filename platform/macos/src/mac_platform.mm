@@ -22,7 +22,7 @@ class MacPlatform : public PlatformFactory {
   std::unique_ptr<IDisplay> createDisplay() override { return macos::createDisplay(); }
   std::unique_ptr<IScheduler> createScheduler() override {
     return std::make_unique<ThreadScheduler>(clock_, [](StageId id) {
-      static const char* names[] = {"mf.source", "mf.video-decode", "mf.video-render", "mf.audio"};
+      static const char* names[] = {"mf.source", "mf.video-decode", "mf.composition", "mf.video-render", "mf.audio"};
       pthread_setname_np(names[static_cast<int>(id)]);
       bool realtime = id == StageId::VideoRender || id == StageId::Audio;
       pthread_set_qos_class_self_np(realtime ? QOS_CLASS_USER_INTERACTIVE : QOS_CLASS_USER_INITIATED, 0);

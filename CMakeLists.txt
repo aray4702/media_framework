@@ -20,6 +20,7 @@ add_library(mf_core STATIC
   core/src/pipeline.cpp
   core/src/player.cpp
   core/src/thread_scheduler.cpp
+  core/src/timeline.cpp
   core/src/types.cpp)
 target_include_directories(mf_core PUBLIC core/include)
 find_package(Threads REQUIRED)

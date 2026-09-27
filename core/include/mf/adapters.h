@@ -31,6 +31,7 @@ class IVideoDecoder {
  public:
   virtual ~IVideoDecoder() = default;
   // onOutput is called from any thread when output may be ready; it must not block.
+  // Called again for the next clip once the previous one has drained (Eos) or been flushed.
   virtual Result configure(const TrackInfo&, std::function<void()> onOutput) = 0;
   virtual Result queue(const Packet&) = 0;      // Ok | Again | CorruptFrame | DecoderFailed
   virtual void signalEos() = 0;                 // no more input until flush()
@@ -41,7 +42,7 @@ class IVideoDecoder {
 class IAudioDecoder {
  public:
   virtual ~IAudioDecoder() = default;
-  virtual Result configure(const TrackInfo&) = 0;
+  virtual Result configure(const TrackInfo&) = 0;  // may be called again for the next clip
   // Synchronous. On CorruptFrame `out` holds silence for the packet's duration.
   virtual Result decode(const Packet&, PcmBuffer* out) = 0;
   virtual void flush() = 0;
@@ -53,7 +54,8 @@ class IDisplay {
   using PresentedFn = std::function<void(int64_t ptsUs, int64_t presentedNs)>;
   virtual ~IDisplay() = default;
   virtual Result attach(const RenderTarget&, PresentedFn) = 0;  // on the owner thread, before playback
-  virtual void present(const VideoFrame&, int64_t hostTimeNs) = 0;  // never blocks; shows the frame at that time
+  // Never blocks; draws the layers, caption and filter at that time. Reports composed.ptsUs.
+  virtual void present(const ComposedFrame&, int64_t hostTimeNs) = 0;
   virtual bool visible() const = 0;
   virtual int64_t vsyncPeriodNs() const = 0;  // can change at run time
   // How long before its target time a frame must be handed over to be on screen at that time.

@@ -109,6 +109,8 @@ class VideoDecoder : public IVideoDecoder {
   explicit VideoDecoder(const Clip& c) : clip_(c) {}
   Result configure(const TrackInfo&, std::function<void()> onOutput) override {
     onOutput_ = std::move(onOutput);
+    out_.clear();
+    eos_ = false;
     return Result::Ok;
   }
   Result queue(const Packet& p) override {
@@ -162,13 +164,15 @@ class Display : public IDisplay {
     presentedFn_ = std::move(fn);
     return Result::Ok;
   }
-  void present(const VideoFrame& f, int64_t hostTimeNs) override {
+  void present(const ComposedFrame& f, int64_t hostTimeNs) override {
     shown.push_back(f.ptsUs);
+    composed.push_back(f);
     presentedFn_(f.ptsUs, std::max(hostTimeNs, clock_.now));
   }
   bool visible() const override { return true; }
   int64_t vsyncPeriodNs() const override { return 16666667; }
   std::vector<int64_t> shown;
+  std::vector<ComposedFrame> composed;
 
  private:
   Clock& clock_;
@@ -197,9 +201,11 @@ class Speaker : public ISpeaker {
     }
     while (nextNs_ <= now) {
       ring_->consume(buf_.data(), 480, nextNs_ + 20 * kMs);
+      heard.insert(heard.end(), buf_.begin(), buf_.end());
       nextNs_ += 10 * kMs;
     }
   }
+  std::vector<int16_t> heard;  // every sample played, interleaved
 
  private:
   AudioRing* ring_ = nullptr;
@@ -227,11 +233,14 @@ class ManualScheduler : public IScheduler {
   bool stopped_ = false;
 };
 
+// Demuxers are made per clip, in timeline order; decoders per lane, with the first clip's faults.
 class Platform : public PlatformFactory {
  public:
-  explicit Platform(Clip c = {}) : clip(c) {}
-  std::unique_ptr<IDemuxer> createDemuxer() override { return std::make_unique<Demuxer>(clip); }
-  std::unique_ptr<IVideoDecoder> createVideoDecoder() override { return std::make_unique<VideoDecoder>(clip); }
+  explicit Platform(std::vector<Clip> c = {Clip{}}) : clips(std::move(c)) {}
+  std::unique_ptr<IDemuxer> createDemuxer() override {
+    return std::make_unique<Demuxer>(clips[demuxers++ % clips.size()]);
+  }
+  std::unique_ptr<IVideoDecoder> createVideoDecoder() override { return std::make_unique<VideoDecoder>(clips[0]); }
   std::unique_ptr<IAudioDecoder> createAudioDecoder() override { return std::make_unique<AudioDecoder>(); }
   std::unique_ptr<ISpeaker> createSpeaker() override {
     auto s = std::make_unique<Speaker>();
@@ -250,7 +259,8 @@ class Platform : public PlatformFactory {
   }
   IClock& clock() override { return clock_; }
 
-  Clip clip;
+  std::vector<Clip> clips;
+  size_t demuxers = 0;
   Clock& clockRef() { return clock_; }
   Display* display = nullptr;
   Speaker* speaker = nullptr;
@@ -276,7 +286,8 @@ struct Listener : PlayerListener {
 
 // A player on fake adapters, driven 1 ms at a time.
 struct Harness {
-  explicit Harness(Clip c = {}) : platform(c) { player = Player::create(platform, &listener); }
+  explicit Harness(Clip c = {}) : Harness(std::vector<Clip>{c}) {}
+  explicit Harness(std::vector<Clip> clips) : platform(std::move(clips)) { player = Player::create(platform, &listener); }
   ~Harness() {
     if (player) player->shutdown();
   }
@@ -289,6 +300,12 @@ struct Harness {
     for (int i = 0; i < ms; ++i) step();
   }
   Result open() { return player->open(MediaSource{}, RenderTarget{}); }
+  // Opens every clip, with the given timeline settings.
+  Result open(Timeline t) {
+    t.clips.assign(platform.clips.size(), MediaSource{});
+    return player->open(t, RenderTarget{});
+  }
+  const ComposedFrame& lastComposed() const { return platform.display->composed.back(); }
   int64_t lastShown() const { return platform.display->shown.empty() ? -1 : platform.display->shown.back(); }
 
   Platform platform;

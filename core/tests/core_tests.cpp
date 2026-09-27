@@ -3,6 +3,7 @@
 #include "../src/av_sync.h"
 #include "../src/bounded_queue.h"
 #include "../src/master_clock.h"
+#include "../src/timeline.h"
 #include "fakes.h"
 #include "test.h"
 
@@ -382,6 +383,207 @@ TEST(player_decoder_failure_during_seek_goes_to_error) {
   h.run(20);
   CHECK(h.player->state() == State::Error);
   CHECK(h.listener.errors.size() == 1 && h.listener.errors[0] == Result::DecoderFailed);
+}
+
+// --- Composition --------------------------------------------------------------------------
+
+TEST(timeline_layout_overlaps_clips_by_the_transition) {
+  TimelineLayout l;
+  l.build({2000000, 3000000, 2000000}, {TransitionKind::SlideLeft, 1000000});
+  CHECK_EQ(l.transitionUs(), 1000000);
+  CHECK_EQ(l.startUs(1), 1000000);
+  CHECK_EQ(l.startUs(2), 3000000);
+  CHECK_EQ(l.durationUs(), 5000000);
+  CHECK_EQ(l.firstActive(1500000), 0);
+  CHECK_EQ(l.lastActive(1500000), 1);
+  CHECK_EQ(l.firstActive(2000000), 1);
+  CHECK_EQ(l.firstActive(9000000), 2);
+  // Mid-transition, sliding left: the outgoing clip is half out, the incoming one half in.
+  CHECK(l.offsetX(0, 1500000) == -0.5f);
+  CHECK(l.offsetX(1, 1500000) == 0.5f);
+  CHECK(l.offsetX(1, 2500000) == 0.0f);
+  CHECK(l.gain(0, 1250000) == 0.75f);
+  CHECK(l.gain(1, 1250000) == 0.25f);
+  CHECK(l.gain(1, 2500000) == 1.0f);
+  CHECK(l.gain(0, 2000000) == 0.0f);
+
+  l.build({2000000, 600000}, {TransitionKind::SlideRight, 1000000});
+  CHECK_EQ(l.transitionUs(), 300000);  // at most half the shortest clip
+  CHECK_EQ(l.durationUs(), 2300000);
+  CHECK(l.offsetX(0, 1850000) == 0.5f);
+  CHECK(l.offsetX(1, 1850000) == -0.5f);
+
+  l.build({1000000, 1000000}, {TransitionKind::Cut, 1000000});
+  CHECK_EQ(l.transitionUs(), 0);
+  CHECK_EQ(l.durationUs(), 2000000);
+  CHECK(l.offsetX(1, 1000000) == 0.0f);
+}
+
+static std::vector<fake::Clip> clips(int n, int64_t durationUs, bool audio = true) {
+  fake::Clip c;
+  c.durationUs = durationUs;
+  c.audio = audio;
+  return std::vector<fake::Clip>(n, c);
+}
+
+TEST(composition_seek_into_a_transition_shows_both_clips) {
+  fake::Harness h(clips(2, 2000000));
+  Timeline t;
+  t.transition = {TransitionKind::SlideLeft, 1000000};
+  CHECK(h.open(t) == Result::Ok);
+  h.run(20);
+  CHECK_EQ(h.player->durationUs(), 3000000);
+  CHECK_EQ(h.lastComposed().layerCount, 1);
+
+  h.player->seek(1500000);
+  h.run(50);
+  CHECK_EQ(h.listener.seeks.back(), 1500000);
+  const ComposedFrame& f = h.lastComposed();
+  CHECK_EQ(f.ptsUs, 1500000);
+  CHECK_EQ(f.layerCount, 2);
+  CHECK_EQ(f.layers[0].frame.clip, 0);  // outgoing, at 1.5 s of its own time
+  CHECK_EQ(f.layers[0].frame.ptsUs, 1500000);
+  CHECK(f.layers[0].offsetX == -0.5f);
+  CHECK_EQ(f.layers[1].frame.clip, 1);  // incoming, 0.5 s into it
+  CHECK_EQ(f.layers[1].frame.ptsUs, 500000);
+  CHECK(f.layers[1].offsetX == 0.5f);
+}
+
+TEST(composition_plays_through_a_transition_with_an_audio_crossfade) {
+  fake::Harness h(clips(2, 2000000));
+  Timeline t;
+  t.transition = {TransitionKind::SlideLeft, 1000000};
+  h.open(t);
+  h.run(20);
+  h.player->play();
+  h.run(3500);
+  CHECK_EQ(h.listener.ended, 1);
+  CHECK_EQ(h.player->positionUs(), 3000000);
+  MetricsReport m = h.player->metrics();
+  CHECK(m.presented >= 85);
+  CHECK_EQ(m.lateDrops, 0);
+  CHECK_EQ(m.janks, 0);
+  CHECK(m.avP95AbsMs <= 10);
+
+  int transitionFrames = 0;
+  int64_t prev = -1;
+  bool ordered = true;
+  for (const ComposedFrame& f : h.platform.display->composed) {
+    if (f.layerCount == 2) ++transitionFrames;
+    ordered &= f.ptsUs > prev;
+    prev = f.ptsUs;
+  }
+  CHECK(ordered);
+  CHECK(transitionFrames >= 28);  // 1 s at 30 fps
+  CHECK_EQ(h.lastComposed().layers[0].frame.clip, 1);
+
+  // Both clips play a constant level, and their gains sum to 1: the crossfade is seamless.
+  const std::vector<int16_t>& heard = h.platform.speaker->heard;
+  auto first = std::find_if(heard.begin(), heard.end(), [](int16_t s) { return s != 0; });
+  auto last = std::find_if(heard.rbegin(), heard.rend(), [](int16_t s) { return s != 0; }).base();
+  CHECK(last - first >= 2 * 48000 * 29 / 10);  // about 3 s of stereo
+  CHECK(std::all_of(first, last, [](int16_t s) { return s >= 99 && s <= 101; }));
+}
+
+TEST(composition_fades_to_a_clip_without_audio) {
+  std::vector<fake::Clip> c = clips(2, 2000000);
+  c[1].audio = false;
+  fake::Harness h(c);
+  Timeline t;
+  t.transition = {TransitionKind::SlideRight, 1000000};
+  h.open(t);
+  h.run(20);
+  h.player->play();
+  h.run(3500);
+  CHECK_EQ(h.listener.ended, 1);
+  CHECK(h.listener.warnings.empty());
+  const std::vector<int16_t>& heard = h.platform.speaker->heard;
+  CHECK(std::count(heard.begin(), heard.end(), int16_t{100}) > 0);
+  CHECK(std::count_if(heard.begin(), heard.end(), [](int16_t s) { return s > 10 && s < 90; }) > 48000);
+}
+
+TEST(composition_reuses_a_lane_for_the_third_clip) {
+  fake::Harness h(clips(3, 1000000));
+  Timeline t;
+  t.transition = {TransitionKind::SlideLeft, 250000};
+  h.open(t);
+  h.run(20);
+  CHECK_EQ(h.player->durationUs(), 2500000);
+  h.player->play();
+  h.run(3000);
+  CHECK_EQ(h.listener.ended, 1);
+  CHECK(h.player->metrics().presented >= 70);
+  CHECK_EQ(h.player->metrics().lateDrops, 0);
+  CHECK_EQ(h.lastComposed().layers[0].frame.clip, 2);
+
+  h.player->seek(2000000);
+  h.run(50);
+  CHECK_EQ(h.listener.seeks.back(), 2000000);
+  CHECK_EQ(h.lastComposed().layerCount, 1);
+  CHECK_EQ(h.lastComposed().layers[0].frame.clip, 2);
+  CHECK_EQ(h.lastComposed().layers[0].frame.ptsUs, 500000);
+}
+
+TEST(composition_cut_has_no_overlap) {
+  fake::Harness h(clips(2, 1000000));
+  Timeline t;
+  t.transition.kind = TransitionKind::Cut;
+  h.open(t);
+  h.run(20);
+  CHECK_EQ(h.player->durationUs(), 2000000);
+  h.player->play();
+  h.run(2500);
+  CHECK_EQ(h.listener.ended, 1);
+  for (const ComposedFrame& f : h.platform.display->composed) CHECK_EQ(f.layerCount, 1);
+}
+
+TEST(composition_shows_captions_in_their_time_range) {
+  fake::Harness h;
+  Timeline t;
+  t.texts = {{"hello", 0, 1000000}};
+  h.open(t);
+  h.run(20);
+  h.player->seek(500000);
+  h.run(50);
+  CHECK(h.lastComposed().text && *h.lastComposed().text == "hello");
+  h.player->seek(1500000);
+  h.run(50);
+  CHECK(!h.lastComposed().text);
+}
+
+TEST(composition_filter_applies_at_once_even_when_paused) {
+  fake::Harness h;
+  Timeline t;
+  t.filter = {-0.1f, 0.9f};
+  h.open(t);
+  h.run(20);
+  CHECK(h.lastComposed().filter == (VideoFilter{-0.1f, 0.9f}));
+
+  size_t shown = h.platform.display->composed.size();
+  CHECK(h.player->setFilter({0.2f, 1.5f}) == Result::Ok);
+  h.run(5);
+  CHECK_EQ(h.platform.display->composed.size(), shown + 1);  // the paused frame is redrawn
+  CHECK(h.lastComposed().filter == (VideoFilter{0.2f, 1.5f}));
+  CHECK_EQ(h.lastComposed().ptsUs, 0);
+
+  h.player->play();
+  h.run(100);
+  CHECK(h.lastComposed().filter == (VideoFilter{0.2f, 1.5f}));
+  CHECK(h.player->setFilter({0, 3}) == Result::InvalidArgument);
+  CHECK(h.player->setFilter({NAN, 1}) == Result::InvalidArgument);
+}
+
+TEST(composition_rejects_bad_timelines) {
+  fake::Harness h;
+  Timeline empty;
+  CHECK(h.player->open(empty, RenderTarget{}) == Result::InvalidArgument);
+  Timeline tooMany;
+  tooMany.clips.resize(Timeline::kMaxClips + 1);
+  CHECK(h.player->open(tooMany, RenderTarget{}) == Result::InvalidArgument);
+  Timeline badText;
+  badText.texts = {{"x", 1000, 1000}};
+  CHECK(h.open(badText) == Result::InvalidArgument);
+  CHECK(h.open(Timeline{}) == Result::Ok);  // nothing was opened by the failed calls
 }
 
 int main() {

@@ -34,6 +34,7 @@ The core never calls a platform API directly. To port the player, you write the 
 - **Resilient to bad input:** corrupt frames are skipped without stopping playback, and invalidated decoder sessions are recovered.
 - **Real-time safe and bounded:** the audio path is lock-free and does not allocate. Every queue is capped by count, bytes and duration.
 - **Built-in metrics:** dropped frames, jank, A/V offset, time to first frame and seek latency, all measured from actual present times.
+- **Composition:** clips play back to back with a horizontal slide (and an audio crossfade) between them, a caption at the bottom, and live brightness and contrast, all drawn in one GPU pass with no extra copy.
 
 
 
@@ -47,7 +48,8 @@ The core never calls a platform API directly. To port the player, you write the 
 | Container    | MP4                                                                                                                                                                          |
 | Video        | H.264, constant frame rate, hardware decode through VideoToolbox, zero-copy to Metal                                                                                         |
 | Audio        | AAC-LC, optional. S16 PCM output through a CoreAudio AudioUnit                                                                                                               |
-| API          | `open`, `play`, `pause`, `seek`, `shutdown`, plus `durationUs`, `positionUs` and `metrics` queries                                                                           |
+| API          | `open` (one file or a `Timeline`), `play`, `pause`, `seek`, `setFilter`, `shutdown`, plus `durationUs`, `positionUs` and `metrics` queries                                 |
+| Composition  | Up to 16 clips joined by a slide (left or right) or a cut, with an equal-gain audio crossfade. Captions at the bottom by time range. Brightness and contrast, live             |
 | States       | `Start`, `Ready`, `Play`, `Error`, `Shutdown`                                                                                                                                |
 | A/V sync     | Audio master clock that includes output latency. Falls back to the system clock when there is no audio track or the audio ends first                                         |
 | Frame pacing | Frame rate capped to the display refresh rate on a vsync grid. Handles refresh-rate changes when the window moves to another display                                         |
@@ -59,7 +61,7 @@ The core never calls a platform API directly. To port the player, you write the 
 | Metrics      | Dropped-frame rate, jank rate, A/V offset, TTFF, seek latency, all measured from actual present times                                                                        |
 
 
-**Not supported yet:** variable frame rate, edit lists, AAC priming trim, track rotation matrix, seeking while in `Play`, streaming sources, DRM, and codecs other than H.264 and AAC.
+**Not supported yet:** other transitions and effects, resampling clips whose audio format differs from the first (they play silent), variable frame rate, edit lists, AAC priming trim, track rotation matrix, seeking while in `Play`, streaming sources, DRM, and codecs other than H.264 and AAC.
 
 ---
 
@@ -87,9 +89,13 @@ scripts/make_clips.sh --with-4k                                # generate test c
 ```sh
 ./build/apps/macos-demo/mf_demo clips/1080p30.mp4                 # interactive player
 ./build/apps/macos-demo/mf_demo --autotest clips/1080p30.mp4 8    # play 8 s, scrub, seek, print metrics, exit
+
+# Three clips with a 1 s slide between each, and a caption
+./build/apps/macos-demo/mf_demo --text "Hello" --transition slide-left --transition-ms 1000 \
+    clips/720p24.mp4 clips/1080p30.mp4 clips/1080p60.mp4
 ```
 
-The demo is an `NSWindow` with a `CAMetalLayer`-backed video view, an **Open…** button, **Play/Pause** and a seek bar. Dragging the seek bar pauses playback, scrubs, then resumes. This is because the MVP accepts `seek` only in `Ready`.
+The demo is an `NSWindow` with a `CAMetalLayer`-backed video view, an **Open…** button, **Play/Pause**, a seek bar, and **Brightness** and **Contrast** sliders. **Open…** accepts several files, which play in the order selected. Dragging the seek bar pauses playback, scrubs, then resumes. This is because the MVP accepts `seek` only in `Ready`. `--transition` takes `slide-left`, `slide-right` or `cut`.
 
 ![The mf_demo window paused at 11.38 s of a 4-minute video, with the Open, Play and seek bar controls along the bottom](docs/images/demo.png)
 
@@ -129,6 +135,21 @@ player->metrics().toString();    // dropped/jank/A-V/TTFF/seek summary
 player->shutdown();              // joins the threads; idempotent. Also run by the destructor
 ```
 
+To play several clips as one timeline, pass a `Timeline` to `open` instead:
+
+```cpp
+mf::Timeline timeline;
+timeline.clips = {mf::macos::sourceFromPath("a.mp4"), mf::macos::sourceFromPath("b.mp4")};
+timeline.transition = {mf::TransitionKind::SlideLeft, 1'000'000};   // 1 s; SlideRight or Cut
+timeline.texts = {{"Chapter one", 0, 5'000'000}};                    // caption for the first 5 s
+timeline.filter = {0.1f, 1.2f};                                       // brightness, contrast
+player->open(timeline, target);
+
+player->setFilter({0.0f, 1.0f});  // any time; takes effect on the next frame, or redraws when paused
+```
+
+Clip `i+1` starts one transition before clip `i` ends, so `durationUs()` is the sum of the clips minus the overlaps. `seek` and `positionUs` use timeline time.
+
 Every API call returns without doing I/O or decoding. Only `shutdown` blocks, while it joins the threads. A call from a thread other than the owner returns `Result::WrongThread`. A call that is not allowed in the current state returns `Result::InvalidState`.
 
 ### Repository layout
@@ -137,7 +158,7 @@ Every API call returns without doing I/O or decoding. Only `shutdown` blocks, wh
 | Path                                           | Contents                                                                                                                                                                                                                               |
 | ---------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | [core/include/mf/](core/include/mf/)           | Public API: [player.h](core/include/mf/player.h), [adapters.h](core/include/mf/adapters.h), [types.h](core/include/mf/types.h), [audio_ring.h](core/include/mf/audio_ring.h), [thread_scheduler.h](core/include/mf/thread_scheduler.h) |
-| [core/src/](core/src/)                         | State machine and stages ([pipeline.cpp](core/src/pipeline.cpp)), [player.cpp](core/src/player.cpp), clock, A/V sync, metrics, bounded queue                                                                                           |
+| [core/src/](core/src/)                         | State machine and stages ([pipeline.cpp](core/src/pipeline.cpp)), [player.cpp](core/src/player.cpp), [timeline.cpp](core/src/timeline.cpp), clock, A/V sync, metrics, bounded queue                                                  |
 | [core/tests/](core/tests/)                     | Host tests with fake adapters and a deterministic single-threaded scheduler                                                                                                                                                            |
 | [platform/macos/](platform/macos/)             | macOS adapters and the platform factory                                                                                                                                                                                                |
 | [apps/macos-demo/](apps/macos-demo/)           | The demo app                                                                                                                                                                                                                           |
@@ -224,7 +245,7 @@ flowchart TB
 
     subgraph core["core — portable C++17"]
         direction LR
-        Player["Player / Impl<br/>API · state machine"] --> Ctx["Context<br/>queues · AudioRing<br/>MasterClock · Metrics"] --> Stages["4 non-blocking Stages<br/>Source · VideoDecode<br/>VideoRender · Audio"]
+        Player["Player / Impl<br/>API · state machine"] --> Ctx["Context<br/>2 lanes of queues · AudioRing<br/>MasterClock · Metrics · Timeline"] --> Stages["5 non-blocking Stages<br/>Source · VideoDecode · Composition<br/>VideoRender · Audio"]
     end
 
     IF[["Adapter interfaces: IDemuxer · IVideoDecoder · IAudioDecoder · ISpeaker · IDisplay · IScheduler · IClock"]]
@@ -241,20 +262,25 @@ flowchart TB
 
 
 
-**Pipeline.** Solid arrows carry media data and dashed arrows carry timing. Each stage runs on its own thread (T1–T4). Bounded queues sit between the stages.
+**Pipeline.** Solid arrows carry media data and dashed arrows carry timing. Each stage runs on its own thread (T1, T2, TC, T3, T4). Bounded queues sit between the stages. Clip `i` of the timeline plays on lane `i % 2`, and each lane has its own packet queues, decoders and frame queue, so the next clip decodes alongside the current one during a transition.
 
 ```mermaid
 flowchart LR
     subgraph T1["T1 Source"]
-        Demux["IDemuxer<br/>AVAssetReader"]
+        Demux["IDemuxer per clip<br/>AVAssetReader"]
     end
-    VQ[/"videoPackets<br/>60 pkt · 32 MB · 2 s"/]
-    AQ[/"audioPackets<br/>120 pkt · 1 MB · 2 s"/]
+    VQ[/"videoPackets ×2 lanes<br/>60 pkt · 32 MB · 2 s"/]
+    AQ[/"audioPackets ×2 lanes<br/>120 pkt · 1 MB · 2 s"/]
 
     subgraph T2["T2 VideoDecode"]
-        VT["IVideoDecoder<br/>VideoToolbox + PTS reorder"]
+        VT["IVideoDecoder ×2<br/>VideoToolbox + PTS reorder"]
     end
-    FQ[/"frames<br/>4"/]
+    FQ[/"frames ×2 lanes<br/>4"/]
+
+    subgraph TC["TC Composition"]
+        Comp["merge lanes in timeline order<br/>layers · slide · caption · filter"]
+    end
+    CQ[/"composed<br/>4"/]
 
     subgraph T3["T3 VideoRender"]
         Sync["AvSync<br/>present · wait · drop"]
@@ -265,7 +291,7 @@ flowchart LR
     end
 
     subgraph T4["T4 Audio"]
-        AD["IAudioDecoder<br/>AudioConverter AAC → S16"]
+        AD["IAudioDecoder ×2 + mixer<br/>AAC → S16 · crossfade"]
     end
     Ring[("AudioRing<br/>lock-free SPSC · 200 ms")]
 
@@ -275,7 +301,7 @@ flowchart LR
 
     Clock{{"MasterClock<br/>audio clock · steady fallback"}}
 
-    Demux --> VQ --> VT --> FQ --> Sync -- "present(frame, hostTime)" --> Disp
+    Demux --> VQ --> VT --> FQ --> Comp --> CQ --> Sync -- "present(composed, hostTime)" --> Disp
     Demux --> AQ --> AD --> Ring --> Spk
     Spk -. "clock snapshot<br/>frames heard + output latency" .-> Clock
     Clock -. "clock.now()" .-> Sync
@@ -289,10 +315,12 @@ flowchart LR
 | --------------------- | --------------------------------------------------------------- | ---------------------------------------------------------------------------- |
 | Player / Impl         | [player.cpp](core/src/player.cpp)                               | Public API, owner-thread check, state machine, pipeline events               |
 | Context               | [pipeline.h](core/src/pipeline.h)                               | Owns adapters, queues, ring, clock and metrics; seek slot; serials           |
-| SourceStage (T1)      | [pipeline.cpp](core/src/pipeline.cpp)                           | Probe, start seeks, demux from the track with the lowest DTS                 |
-| VideoDecodeStage (T2) | [pipeline.cpp](core/src/pipeline.cpp)                           | Packets → decoder → frames in PTS order                                      |
-| VideoRenderStage (T3) | [pipeline.cpp](core/src/pipeline.cpp)                           | Complete seeks, A/V sync, present or drop, start and stop output, detect end |
-| AudioStage (T4)       | [pipeline.cpp](core/src/pipeline.cpp)                           | Decode AAC, trim to the seek target, write to the ring                       |
+| SourceStage (T1)      | [pipeline.cpp](core/src/pipeline.cpp)                           | Probe every clip, start seeks, move lanes to their next clip, demux from the track with the lowest timeline DTS |
+| VideoDecodeStage (T2) | [pipeline.cpp](core/src/pipeline.cpp)                           | Per lane: packets → decoder → frames in PTS order; reconfigure for the next clip |
+| CompositionStage (TC) | [pipeline.cpp](core/src/pipeline.cpp)                           | Merge the lanes in timeline order; build layers, slide offsets, caption, filter; pick the exact-seek frame |
+| VideoRenderStage (T3) | [pipeline.cpp](core/src/pipeline.cpp)                           | Complete seeks, A/V sync, present or drop, start and stop output, detect end, redraw on a filter change |
+| AudioStage (T4)       | [pipeline.cpp](core/src/pipeline.cpp)                           | Decode both lanes' AAC, mix on the timeline with the crossfade, write to the ring |
+| TimelineLayout        | [timeline.cpp](core/src/timeline.cpp)                           | Clip start and end times, slide offsets and audio gains                      |
 | AvSync                | [av_sync.cpp](core/src/av_sync.cpp)                             | Per-frame present, drop or wait decision on the vsync grid                   |
 | MasterClock           | [master_clock.cpp](core/src/master_clock.cpp)                   | Audio clock, or steady clock when there's no audio or it has ended           |
 | AudioRing             | [audio_ring.cpp](core/src/audio_ring.cpp)                       | Lock-free SPSC PCM ring that also publishes the audio clock                  |
@@ -303,7 +331,7 @@ flowchart LR
 | VtVideoDecoder        | [vt_video_decoder.mm](platform/macos/src/vt_video_decoder.mm)   | Async `VTDecompressionSession` plus PTS reorder                              |
 | AtAudioDecoder        | [at_audio_decoder.cpp](platform/macos/src/at_audio_decoder.cpp) | `AudioConverter`, AAC → S16                                                  |
 | AuSpeaker             | [au_speaker.cpp](platform/macos/src/au_speaker.cpp)             | Default-output AudioUnit; the render callback pulls from the ring            |
-| MetalDisplay          | [metal_display.mm](platform/macos/src/metal_display.mm)         | Pending-frame queue drained on each vsync; NV12 → RGB draw                   |
+| MetalDisplay          | [metal_display.mm](platform/macos/src/metal_display.mm)         | Pending-frame queue drained on each vsync; draws the layers (NV12 → RGB, filter), then the Core Text caption |
 
 
 **Why C++17.** It is the newest standard that every target toolchain supports fully: Apple Clang, the Android NDK, Emscripten, MSVC and GCC. That lets the core build unchanged on every platform. It also covers what the core needs: `std::optional`, nested namespaces, and `shared_ptr<void>` for opaque platform handles. And the public headers don't force a newer standard on apps that embed the player. C++20 features such as `span`, `jthread` and concepts would be nice but wouldn't change the design. See [mvp_spec_claude.md §2.1](mvp_spec_claude.md#21-core-portable-c17-no-platform-headers).
@@ -316,7 +344,7 @@ The public API is `Player` [and](core/include/mf/player.h) `PlayerListener` (see
 class IDemuxer      { open(src, &info); peekDtsUs(track, &dts); read(track, &pkt); seekTo(us); };
 class IVideoDecoder { configure(track, onOutput); queue(pkt); signalEos(); dequeue(&frame); flush(); };
 class IAudioDecoder { configure(track); decode(pkt, &pcm); flush(); };
-class IDisplay      { attach(target, onPresented); present(frame, hostTimeNs); visible();
+class IDisplay      { attach(target, onPresented); present(composedFrame, hostTimeNs); visible();
                       vsyncPeriodNs(); latencyNs(); vsyncGridNs(); };
 class ISpeaker      { open(rate, channels, ring); start(); pause(); };
 class Stage         { Progress pump(); };             // Did | Idle | WaitUntil(ns); never blocks
@@ -328,6 +356,7 @@ Rules that every adapter follows:
 
 - **Nothing blocks.** `queue` and `dequeue` return `Again` instead of waiting. `flush()` bumps a generation number instead of waiting for in-flight frames. `present()` only enqueues.
 - **Frames stay opaque.** A video frame is a retained IOSurface-backed `CVPixelBuffer`, mapped straight to Metal textures. There is no RGBA conversion. Audio is S16 interleaved PCM.
+- **Composition is a description.** The composition stage hands the display a `ComposedFrame`: one or two decoded frames with their horizontal offsets, the caption and the filter. The display draws it in one pass, so compositing costs no extra copy or render target.
 - **Media handles are opaque.** `MediaSource` and `RenderTarget` are made by the platform layer, so the core never sees a path, an `NSURL` or an `NSView`.
 
 
@@ -370,9 +399,10 @@ The stages are **non-blocking** `pump()` **steps**. Waiting belongs to the sched
 | ----------------------- | ---------------- | --------------------------------------------------------------------------------------- |
 | Owner (caller)          | —                | API calls only; never I/O or decode                                                     |
 | T1 `mf.source`          | user-initiated   | Probe, start seeks, demux                                                               |
-| T2 `mf.video-decode`    | user-initiated   | Feed VideoToolbox, pull frames in PTS order                                             |
+| T2 `mf.video-decode`    | user-initiated   | Feed each lane's VideoToolbox session, pull frames in PTS order                         |
+| TC `mf.composition`     | user-initiated   | Merge the lanes, build composed frames, pick the exact-seek frame                       |
 | T3 `mf.video-render`    | user-interactive | Seek completion, A/V sync, present or drop, end-of-stream check                         |
-| T4 `mf.audio`           | user-interactive | AAC decode, write PCM to the ring                                                       |
+| T4 `mf.audio`           | user-interactive | AAC decode for both lanes, mix with the crossfade, write PCM to the ring                |
 | VideoToolbox callback   | system           | Reorder map, then wake T2                                                               |
 | CoreAudio render        | real-time        | `ring.consume`: no locks, no allocation, no syscalls                                    |
 | CVDisplayLink           | system           | Pick a pending frame, draw, `presentDrawable` (the only place `nextDrawable` may block) |
@@ -395,10 +425,11 @@ The scheduler guarantees these four things:
 
 | Buffer                           | Cap                              |
 | -------------------------------- | -------------------------------- |
-| Video packet queue               | 60 packets / 32 MB / 2 s         |
-| Audio packet queue               | 120 packets / 1 MB / 2 s         |
-| Frames in flight in VideoToolbox | 4                                |
-| Decoded frame queue              | 4                                |
+| Video packet queue (per lane)    | 60 packets / 32 MB / 2 s         |
+| Audio packet queue (per lane)    | 120 packets / 1 MB / 2 s         |
+| Frames in flight in VideoToolbox | 4 per lane                       |
+| Decoded frame queue (per lane)   | 4                                |
+| Composed frame queue             | 4                                |
 | Display pending frames           | 4 (+ 3 `CAMetalLayer` drawables) |
 | Audio PCM ring                   | 200 ms                           |
 

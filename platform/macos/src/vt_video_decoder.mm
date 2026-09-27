@@ -38,11 +38,23 @@ class VtVideoDecoder : public IVideoDecoder {
  public:
   ~VtVideoDecoder() override { destroySession(); }
 
+  // Called again for each clip on this lane, once the previous one has drained: the session
+  // is kept when it accepts the new format, otherwise replaced.
   Result configure(const TrackInfo& track, std::function<void()> onOutput) override {
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      ++generation_;
+      reorder_.clear();
+      errors_ = 0;
+      eos_ = false;
+    }
     formatHolder_ = track.format;
     format_ = static_cast<CMVideoFormatDescriptionRef>(track.format.get());
     onOutput_ = std::move(onOutput);
     depth_ = static_cast<size_t>(reorderDepth(format_));
+    if (session_ && VTDecompressionSessionCanAcceptFormatDescription(session_, format_)) return Result::Ok;
+    destroySession();
+    recreated_ = false;
     return createSession();
   }
 
@@ -117,7 +129,7 @@ class VtVideoDecoder : public IVideoDecoder {
 
   void destroySession() {
     if (!session_) return;
-    VTDecompressionSessionWaitForAsynchronousFrames(session_);  // shutdown only
+    VTDecompressionSessionWaitForAsynchronousFrames(session_);  // shutdown, or a drained session: returns at once
     VTDecompressionSessionInvalidate(session_);
     CFRelease(session_);
     session_ = nullptr;

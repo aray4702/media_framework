@@ -17,6 +17,10 @@ class AtAudioDecoder : public IAudioDecoder {
   }
 
   Result configure(const TrackInfo& track) override {
+    if (converter_) {  // the next clip on this lane
+      AudioConverterDispose(converter_);
+      converter_ = nullptr;
+    }
     auto fd = static_cast<CMAudioFormatDescriptionRef>(track.format.get());
     const AudioStreamBasicDescription* in = CMAudioFormatDescriptionGetStreamBasicDescription(fd);
     if (!in) return Result::UnsupportedFormat;
@@ -59,7 +63,9 @@ class AtAudioDecoder : public IAudioDecoder {
     return Result::Ok;
   }
 
-  void flush() override { AudioConverterReset(converter_); }
+  void flush() override {
+    if (converter_) AudioConverterReset(converter_);
+  }
 
  private:
   struct Input {

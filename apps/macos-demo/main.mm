@@ -1,7 +1,13 @@
-// Minimal demo player: open a file, play/pause, seek bar (scrubbing pauses while dragging).
+// Minimal demo player: open clips, play/pause, seek bar (scrubbing pauses while dragging),
+// brightness and contrast sliders. Several clips play back to back with a slide between them.
 //
-//   mf_demo [clip.mp4]
-//   mf_demo --autotest clip.mp4 [play-seconds]   plays, scrubs, seeks, prints metrics, exits
+//   mf_demo [options] [clip.mp4 ...]
+//   mf_demo --autotest [options] clip.mp4 [clip.mp4 ...] [play-seconds]
+//                                  plays, scrubs, seeks, prints metrics, exits
+// Options:
+//   --text "caption"               caption at the bottom for the whole timeline
+//   --transition slide-left|slide-right|cut   (default slide-left)
+//   --transition-ms N              slide length (default 1000)
 
 #import <AppKit/AppKit.h>
 #import <QuartzCore/QuartzCore.h>
@@ -40,6 +46,14 @@
   [self updateDrawableSize];
 }
 @end
+
+struct Options {
+  NSArray<NSString*>* paths = @[];
+  NSString* text = nil;
+  mf::Transition transition;
+  BOOL autotest = NO;
+  double playSeconds = 8;
+};
 
 @interface Controller : NSObject <NSApplicationDelegate>
 - (void)stateChanged:(mf::State)state;
@@ -84,12 +98,14 @@ static int64_t nowNs() { return mf::macos::hostNowNs(); }
   NSSlider* _slider;
   NSTextField* _timeLabel;
   NSTextField* _statusLabel;
+  NSSlider* _brightness;
+  NSSlider* _contrast;
   NSTimer* _timer;
   std::unique_ptr<mf::PlatformFactory> _platform;
   std::unique_ptr<Listener> _listener;
   std::unique_ptr<mf::Player> _player;
   BOOL _scrubbing, _resumeAfterScrub;
-  NSString* _initialPath;
+  Options _options;
 
   // --autotest
   BOOL _autotest;
@@ -99,11 +115,11 @@ static int64_t nowNs() { return mf::macos::hostNowNs(); }
   int64_t _lastSeekCallNs, _lastSeekTargetUs, _lastCompletionNs, _maxScrubGapNs, _scrubLatencyNs;
 }
 
-- (instancetype)initWithPath:(NSString*)path autotest:(BOOL)autotest playSeconds:(double)seconds {
+- (instancetype)initWithOptions:(const Options&)options {
   if ((self = [super init])) {
-    _initialPath = path;
-    _autotest = autotest;
-    _playSeconds = seconds;
+    _options = options;
+    _autotest = options.autotest;
+    _playSeconds = options.playSeconds;
     _platform = mf::macos::createPlatform();
     _listener = std::make_unique<Listener>(self);
   }
@@ -113,7 +129,7 @@ static int64_t nowNs() { return mf::macos::hostNowNs(); }
 - (void)applicationDidFinishLaunching:(NSNotification*)note {
   [self buildWindow];
   _timer = [NSTimer scheduledTimerWithTimeInterval:1.0 / 30 target:self selector:@selector(tick) userInfo:nil repeats:YES];
-  if (_initialPath) [self openPath:_initialPath];
+  if (_options.paths.count) [self openPaths:_options.paths];
 }
 
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication*)app {
@@ -134,7 +150,7 @@ static int64_t nowNs() { return mf::macos::hostNowNs(); }
   NSView* content = _window.contentView;
   NSRect bounds = content.bounds;
 
-  _video = [[VideoView alloc] initWithFrame:NSMakeRect(0, 44, bounds.size.width, bounds.size.height - 44)];
+  _video = [[VideoView alloc] initWithFrame:NSMakeRect(0, 76, bounds.size.width, bounds.size.height - 76)];
   _video.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
   [content addSubview:_video];
 
@@ -162,6 +178,25 @@ static int64_t nowNs() { return mf::macos::hostNowNs(); }
   _statusLabel.lineBreakMode = NSLineBreakByTruncatingTail;
   [content addSubview:_statusLabel];
 
+  // Second row: the filter, applied live (a paused frame is redrawn).
+  NSTextField* b = [NSTextField labelWithString:@"Brightness"];
+  b.frame = NSMakeRect(8, 46, 72, 20);
+  [content addSubview:b];
+  _brightness = [NSSlider sliderWithValue:0 minValue:-1 maxValue:1 target:self action:@selector(filterChanged:)];
+  _brightness.frame = NSMakeRect(84, 44, 200, 24);
+  _brightness.continuous = YES;
+  [content addSubview:_brightness];
+  NSTextField* c = [NSTextField labelWithString:@"Contrast"];
+  c.frame = NSMakeRect(300, 46, 60, 20);
+  [content addSubview:c];
+  _contrast = [NSSlider sliderWithValue:1 minValue:0 maxValue:2 target:self action:@selector(filterChanged:)];
+  _contrast.frame = NSMakeRect(364, 44, 200, 24);
+  _contrast.continuous = YES;
+  [content addSubview:_contrast];
+  NSButton* reset = [NSButton buttonWithTitle:@"Reset" target:self action:@selector(resetFilter:)];
+  reset.frame = NSMakeRect(572, 42, 70, 28);
+  [content addSubview:reset];
+
   [_window center];
   [_window makeKeyAndOrderFront:nil];
   [NSApp activateIgnoringOtherApps:YES];
@@ -170,16 +205,40 @@ static int64_t nowNs() { return mf::macos::hostNowNs(); }
 - (void)openFile:(id)sender {
   NSOpenPanel* panel = [NSOpenPanel openPanel];
   panel.allowedContentTypes = @[ UTTypeMovie ];
-  if ([panel runModal] == NSModalResponseOK) [self openPath:panel.URL.path];
+  panel.allowsMultipleSelection = YES;  // played in the order selected, with a slide between
+  if ([panel runModal] != NSModalResponseOK) return;
+  NSMutableArray<NSString*>* paths = [NSMutableArray array];
+  for (NSURL* url in panel.URLs) [paths addObject:url.path];
+  [self openPaths:paths];
 }
 
-- (void)openPath:(NSString*)path {
+- (void)openPaths:(NSArray<NSString*>*)paths {
   if (_player) _player->shutdown();
   _player = mf::Player::create(*_platform, _listener.get());
-  _statusLabel.stringValue = path.lastPathComponent;
+  _statusLabel.stringValue = paths.count == 1 ? paths[0].lastPathComponent
+                                              : [NSString stringWithFormat:@"%lu clips", (unsigned long)paths.count];
   _statusLabel.textColor = NSColor.labelColor;
-  mf::Result r = _player->open(mf::macos::sourceFromPath(path.UTF8String), mf::macos::targetFromView((__bridge void*)_video));
+  mf::Timeline timeline;
+  for (NSString* path in paths) timeline.clips.push_back(mf::macos::sourceFromPath(path.UTF8String));
+  timeline.transition = _options.transition;
+  if (_options.text) timeline.texts.push_back({_options.text.UTF8String});
+  timeline.filter = [self currentFilter];
+  mf::Result r = _player->open(timeline, mf::macos::targetFromView((__bridge void*)_video));
   if (r != mf::Result::Ok) [self failed:[NSString stringWithUTF8String:mf::toString(r)]];
+}
+
+- (mf::VideoFilter)currentFilter {
+  return {float(_brightness.doubleValue), float(_contrast.doubleValue)};
+}
+
+- (void)filterChanged:(id)sender {
+  if (_player) _player->setFilter([self currentFilter]);
+}
+
+- (void)resetFilter:(id)sender {
+  _brightness.doubleValue = 0;
+  _contrast.doubleValue = 1;
+  [self filterChanged:sender];
 }
 
 - (void)togglePlay:(id)sender {
@@ -311,18 +370,36 @@ static int64_t nowNs() { return mf::macos::hostNowNs(); }
 int main(int argc, const char** argv) {
   setvbuf(stdout, nullptr, _IOLBF, 0);
   @autoreleasepool {
-    NSString* path = nil;
-    BOOL autotest = NO;
-    double seconds = 8;
+    Options options;
+    NSMutableArray<NSString*>* paths = [NSMutableArray array];
+    NSCharacterSet* numeric = [NSCharacterSet characterSetWithCharactersInString:@"0123456789."];
     for (int i = 1; i < argc; ++i) {
       NSString* arg = [NSString stringWithUTF8String:argv[i]];
-      if ([arg isEqualToString:@"--autotest"]) autotest = YES;
-      else if (!path) path = arg;
-      else seconds = arg.doubleValue;
+      NSString* value = i + 1 < argc ? [NSString stringWithUTF8String:argv[i + 1]] : nil;
+      if ([arg isEqualToString:@"--autotest"]) {
+        options.autotest = YES;
+      } else if ([arg isEqualToString:@"--text"] && value) {
+        options.text = value;
+        ++i;
+      } else if ([arg isEqualToString:@"--transition"] && value) {
+        options.transition.kind = [value isEqualToString:@"cut"]           ? mf::TransitionKind::Cut
+                                  : [value isEqualToString:@"slide-right"] ? mf::TransitionKind::SlideRight
+                                                                           : mf::TransitionKind::SlideLeft;
+        ++i;
+      } else if ([arg isEqualToString:@"--transition-ms"] && value) {
+        options.transition.durationUs = static_cast<int64_t>(value.doubleValue * 1000);
+        ++i;
+      } else if ([[arg stringByTrimmingCharactersInSet:numeric] length] == 0 &&
+                 ![[NSFileManager defaultManager] fileExistsAtPath:arg]) {
+        options.playSeconds = arg.doubleValue;  // the trailing play-seconds of --autotest
+      } else {
+        [paths addObject:arg];
+      }
     }
+    options.paths = paths;
     NSApplication* app = [NSApplication sharedApplication];
     app.activationPolicy = NSApplicationActivationPolicyRegular;
-    Controller* controller = [[Controller alloc] initWithPath:path autotest:autotest playSeconds:seconds];
+    Controller* controller = [[Controller alloc] initWithOptions:options];
     app.delegate = controller;
     [app run];
   }
