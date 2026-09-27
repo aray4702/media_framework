@@ -2,6 +2,7 @@
 
 #include <array>
 #include <atomic>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -32,6 +33,9 @@ struct PendingSeek {
   int64_t requestedNs;
   int laneClip[2] = {0, 1};  // set by T1 when the seek starts: the clip each lane reads first
 };
+
+constexpr int kNoClip = std::numeric_limits<int>::max();       // a lane with no clip (left)
+constexpr int64_t kNever = std::numeric_limits<int64_t>::max();  // a time that never comes
 
 // Clip i plays on lane i % 2 (§2.4). Each lane has its own decoders and queues, so the
 // incoming clip decodes alongside the outgoing one during a transition.

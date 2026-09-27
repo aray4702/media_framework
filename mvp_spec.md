@@ -223,13 +223,15 @@ At transition progress `p = (t − start) / T`, slide-left puts the outgoing cli
 
 ### 2.5 Output drivers and export
 
-The composition stage keeps, for each lane, the **latest frame at or before the output time** and composes the output at a time `t` with `composeAt(t)`: every active clip's frame with its offset at `t`, the caption at `t`, the current filter. Only the **driver** differs: it picks the output times and decides what happens when a layer's frame for `t` isn't decoded yet.
+The composition stage's `FrameSampler` keeps, for each lane, the **latest frame at or before the output time** and composes the output at a time `t` with `composeAt(t)`: every active clip's frame with its offset at `t`, the caption at `t`, the current filter. Only the **driver** differs: it picks the output times and decides what happens when a layer's frame for `t` isn't decoded yet.
 
 | Driver | Output times | A layer's frame isn't ready | Use |
 | --- | --- | --- | --- |
 | **LeadingClip** | Each frame of the leading clip: the highest frame rate among the active clips (the later clip on a tie) | Frames are handled in timeline order, so the other layers are always exact | `Auto` for one clip. Output = source frames, paced by AvSync |
 | **Vsync** | Each display refresh: `t = clock(now) + (vsync − now)`, composed half a frame before the hand-over deadline | Hold its last frame and count a late layer; never wait | `Auto` for several clips. Slides and effects move every refresh |
 | **Export** | Fixed grid `t = n / fps` | Wait until every layer has its exact frame | `Exporter` only |
+
+Each driver is its own class behind `CompositionDriver` (`LeadingClipDriver`, `VsyncDriver`, `ExportDriver`), with one `step(sampler, output)` method. The stage runs the shared exact seek first, then calls the driver's `step` until the timeline ends.
 
 - **Seek is the same for every driver.** The leading clip's last frame at or before the target (its first frame, if none is), with every other active clip's latest frame at that time. While a newer seek is pending, whatever is decoded is shown instead (scrub).
 - **Vsync details.** The composed frame carries `presentAtNs`, the refresh it was composed for. T3 presents it for that refresh without AvSync, and drops it only if that refresh is more than a frame in the past (e.g. composed just before a pause). A refresh where nothing visible changes (same frames, offsets, caption and filter) produces no frame, so a 30 fps clip on a 60 Hz display presents 30 frames a second, not 60. While the clock holds (audio not heard yet), refreshes don't go back in time. TC composes only while output runs, so it is idle when paused.

@@ -15,14 +15,18 @@ add_compile_options(-Wall -Wextra -Wno-unused-parameter)
 add_library(mf_core STATIC
   core/src/audio_ring.cpp
   core/src/av_sync.cpp
+  core/src/composition.cpp
+  core/src/export_driver.cpp
   core/src/exporter.cpp
+  core/src/leading_clip_driver.cpp
   core/src/master_clock.cpp
   core/src/metrics.cpp
   core/src/pipeline.cpp
   core/src/player.cpp
   core/src/thread_scheduler.cpp
   core/src/timeline.cpp
-  core/src/types.cpp)
+  core/src/types.cpp
+  core/src/vsync_driver.cpp)
 target_include_directories(mf_core PUBLIC core/include)
 find_package(Threads REQUIRED)
 target_link_libraries(mf_core PUBLIC Threads::Threads)
