@@ -27,18 +27,34 @@ struct Exporter::Impl : PipelineEvents {
 
   Result start(const Timeline& timeline, const ExportTarget& target, const ExportSettings& settings) {
     if (!isValid(timeline) || !valid(settings)) return Result::InvalidArgument;
+    return begin(target, settings, [&] {
+      ctx.timeline = timeline;
+      ctx.setFilter(timeline.filter);
+    });
+  }
+
+  Result start(const Scene& scene, const ExportTarget& target, ExportSettings settings, std::string* error) {
+    if (validateScene(scene, error) != Result::Ok) return Result::InvalidArgument;
+    if (scene.output.width <= 0 || scene.output.height <= 0 || scene.output.fpsNum <= 0) {
+      if (error) *error = "output: export needs a size and frame rate";
+      return Result::InvalidArgument;
+    }
+    settings.width = scene.output.width;  // the scene's size and rate, the settings' bitrates
+    settings.height = scene.output.height;
+    settings.fps = std::max(1, int(std::lround(double(scene.output.fpsNum) / scene.output.fpsDen)));
+    if (!valid(settings)) return Result::InvalidArgument;
+    return begin(target, settings, [&] { ctx.scene = scene; });
+  }
+
+  template <typename F>
+  Result begin(const ExportTarget& target, const ExportSettings& settings, F setScene) {
     if (started || stopped) return Result::InvalidState;
     if (!ctx.exportSink) return Result::Unsupported;
     started = true;
     ctx.driver = Driver::Export;
     ctx.exportTarget = target;
     ctx.exportSettings = settings;
-    ctx.sources = timeline.clips;
-    ctx.transition = timeline.transition;
-    for (const TextOverlay& o : timeline.texts) {
-      ctx.captions.push_back({o.startUs, o.endUs, std::make_shared<const std::string>(o.text)});
-    }
-    ctx.setFilter(timeline.filter);
+    setScene();
     ctx.openRequested = true;
     ctx.wake(StageId::Source);
     return Result::Ok;
@@ -51,11 +67,11 @@ struct Exporter::Impl : PipelineEvents {
     ctx.halted = true;
     ctx.scheduler->stop();
     ctx.exportSink.reset();  // cancels an unfinished file; no callback after this returns
-    for (Lane& lane : ctx.lanes) {
-      lane.videoDecoder.reset();
-      lane.audioDecoder.reset();
+    for (auto& lane : ctx.lanes) {
+      lane->videoDecoder.reset();
+      lane->audioDecoder.reset();
     }
-    ctx.demuxers.clear();
+    for (ItemRuntime& item : ctx.items) item.demuxer.reset();
     return Result::Ok;
   }
 
@@ -103,6 +119,9 @@ Exporter::~Exporter() = default;
 
 Result Exporter::start(const Timeline& t, const ExportTarget& target, const ExportSettings& s) {
   return impl_->onOwner() ? impl_->start(t, target, s) : Result::WrongThread;
+}
+Result Exporter::start(const Scene& scene, const ExportTarget& target, const ExportSettings& s, std::string* error) {
+  return impl_->onOwner() ? impl_->start(scene, target, s, error) : Result::WrongThread;
 }
 Result Exporter::shutdown() { return impl_->onOwner() ? impl_->shutdown() : Result::WrongThread; }
 double Exporter::progress() const { return impl_->progress(); }

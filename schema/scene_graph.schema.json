@@ -1,0 +1,979 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/aray4702/media_framework/schema/scene_graph.schema.json",
+  "title": "Media Framework scene graph",
+  "description": "A timeline of tracks for playback and export. Structure only: the rules a schema can't express (item order, transition overlaps, keyframe order) are in scene_graph_spec.md \u00a76.",
+  "type": "object",
+  "required": [
+    "version",
+    "output",
+    "tracks"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "version": {
+      "const": 1
+    },
+    "output": {
+      "$ref": "#/$defs/output"
+    },
+    "tracks": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 16,
+      "items": {
+        "type": "object",
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "enum": [
+              "video",
+              "audio"
+            ]
+          }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "kind": {
+                  "const": "video"
+                }
+              }
+            },
+            "then": {
+              "$ref": "#/$defs/videoTrack"
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "kind": {
+                  "const": "audio"
+                }
+              }
+            },
+            "then": {
+              "$ref": "#/$defs/audioTrack"
+            }
+          }
+        ]
+      }
+    },
+    "metadata": {
+      "$ref": "#/$defs/metadata"
+    }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_.-]{1,64}$"
+    },
+    "metadata": {
+      "type": "object",
+      "description": "Free-form; kept on OTIO round trips."
+    },
+    "time": {
+      "description": "Seconds, as a number or an exact rational \"num/den\" (e.g. \"1001/30000\").",
+      "oneOf": [
+        {
+          "type": "number",
+          "minimum": 0
+        },
+        {
+          "type": "string",
+          "pattern": "^[0-9]+/[1-9][0-9]*$"
+        }
+      ]
+    },
+    "positiveTime": {
+      "oneOf": [
+        {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        {
+          "type": "string",
+          "pattern": "^[1-9][0-9]*/[1-9][0-9]*$"
+        }
+      ]
+    },
+    "rate": {
+      "description": "Frames per second, as a number or an exact rational (\"30000/1001\").",
+      "oneOf": [
+        {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 240
+        },
+        {
+          "type": "string",
+          "pattern": "^[1-9][0-9]*/[1-9][0-9]*$"
+        }
+      ]
+    },
+    "color": {
+      "type": "string",
+      "pattern": "^#([0-9a-fA-F]{6}|[0-9a-fA-F]{8})$",
+      "description": "sRGB, #RRGGBB or #RRGGBBAA (straight alpha)."
+    },
+    "easing": {
+      "type": [
+        "string",
+        "object"
+      ],
+      "if": {
+        "type": "string"
+      },
+      "then": {
+        "enum": [
+          "linear",
+          "hold",
+          "easeIn",
+          "easeOut",
+          "easeInOut"
+        ]
+      },
+      "else": {
+        "type": "object",
+        "required": [
+          "cubicBezier"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "cubicBezier": {
+            "type": "array",
+            "prefixItems": [
+              {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1
+              },
+              {
+                "type": "number"
+              }
+            ],
+            "minItems": 4,
+            "maxItems": 4
+          }
+        }
+      }
+    },
+    "key": {
+      "description": "[time, value] or [time, value, easing]. Time is relative to the item's start; the easing applies from this key to the next.",
+      "type": "array",
+      "prefixItems": [
+        {
+          "$ref": "#/$defs/time"
+        },
+        {
+          "type": "number"
+        },
+        {
+          "$ref": "#/$defs/easing"
+        }
+      ],
+      "minItems": 2,
+      "maxItems": 3
+    },
+    "animatable": {
+      "description": "A constant, or keyframes evaluated at the output time.",
+      "type": [
+        "number",
+        "object"
+      ],
+      "if": {
+        "type": "object"
+      },
+      "then": {
+        "type": "object",
+        "required": [
+          "keys"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "keys": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 1024,
+            "items": {
+              "$ref": "#/$defs/key"
+            }
+          },
+          "easing": {
+            "$ref": "#/$defs/easing",
+            "description": "Default for keys without their own."
+          }
+        }
+      }
+    },
+    "output": {
+      "type": "object",
+      "required": [
+        "width",
+        "height",
+        "fps"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "width": {
+          "type": "integer",
+          "minimum": 2,
+          "maximum": 8192,
+          "multipleOf": 2
+        },
+        "height": {
+          "type": "integer",
+          "minimum": 2,
+          "maximum": 8192,
+          "multipleOf": 2
+        },
+        "fps": {
+          "$ref": "#/$defs/rate"
+        },
+        "sampleRate": {
+          "enum": [
+            44100,
+            48000
+          ],
+          "default": 48000
+        },
+        "channels": {
+          "enum": [
+            1,
+            2
+          ],
+          "default": 2
+        },
+        "background": {
+          "$ref": "#/$defs/color",
+          "default": "#000000"
+        }
+      }
+    },
+    "videoTrack": {
+      "type": "object",
+      "required": [
+        "kind",
+        "items"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "kind": {
+          "const": "video"
+        },
+        "enabled": {
+          "type": "boolean",
+          "default": true
+        },
+        "opacity": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "default": 1
+        },
+        "items": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "type": {
+                "enum": [
+                  "video",
+                  "image",
+                  "text",
+                  "color",
+                  "transition"
+                ]
+              }
+            },
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "type": {
+                      "const": "video"
+                    }
+                  }
+                },
+                "then": {
+                  "$ref": "#/$defs/videoItem"
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "type": {
+                      "const": "image"
+                    }
+                  }
+                },
+                "then": {
+                  "$ref": "#/$defs/imageItem"
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "type": {
+                      "const": "text"
+                    }
+                  }
+                },
+                "then": {
+                  "$ref": "#/$defs/textItem"
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "type": {
+                      "const": "color"
+                    }
+                  }
+                },
+                "then": {
+                  "$ref": "#/$defs/colorItem"
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "type": {
+                      "const": "transition"
+                    }
+                  }
+                },
+                "then": {
+                  "$ref": "#/$defs/transition"
+                }
+              }
+            ]
+          }
+        },
+        "metadata": {
+          "$ref": "#/$defs/metadata"
+        }
+      }
+    },
+    "audioTrack": {
+      "type": "object",
+      "required": [
+        "kind",
+        "items"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "kind": {
+          "const": "audio"
+        },
+        "enabled": {
+          "type": "boolean",
+          "default": true
+        },
+        "gain": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 4,
+          "default": 1
+        },
+        "items": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "type": {
+                "enum": [
+                  "audio",
+                  "transition"
+                ]
+              }
+            },
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "type": {
+                      "const": "audio"
+                    }
+                  }
+                },
+                "then": {
+                  "$ref": "#/$defs/audioItem"
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "type": {
+                      "const": "transition"
+                    }
+                  }
+                },
+                "then": {
+                  "$ref": "#/$defs/transition"
+                }
+              }
+            ]
+          }
+        },
+        "metadata": {
+          "$ref": "#/$defs/metadata"
+        }
+      }
+    },
+    "timing": {
+      "description": "Where an item sits: [start, start + duration) on the timeline.",
+      "type": "object",
+      "required": [
+        "start",
+        "duration"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "start": {
+          "$ref": "#/$defs/time"
+        },
+        "duration": {
+          "$ref": "#/$defs/positiveTime"
+        },
+        "metadata": {
+          "$ref": "#/$defs/metadata"
+        }
+      }
+    },
+    "mediaTiming": {
+      "description": "For items read from a file: media time = in + (t - start) * speed.",
+      "type": "object",
+      "properties": {
+        "src": {
+          "type": "string",
+          "minLength": 1
+        },
+        "in": {
+          "$ref": "#/$defs/time",
+          "default": 0
+        },
+        "speed": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 16,
+          "default": 1
+        }
+      },
+      "required": [
+        "src"
+      ]
+    },
+    "visual": {
+      "type": "object",
+      "properties": {
+        "transform": {
+          "$ref": "#/$defs/transform"
+        },
+        "opacity": {
+          "$ref": "#/$defs/animatable",
+          "description": "0 to 1."
+        },
+        "blend": {
+          "enum": [
+            "normal",
+            "add",
+            "multiply",
+            "screen"
+          ],
+          "default": "normal"
+        },
+        "fit": {
+          "enum": [
+            "contain",
+            "cover",
+            "fill",
+            "none"
+          ],
+          "default": "contain"
+        },
+        "effects": {
+          "type": "array",
+          "maxItems": 4,
+          "items": {
+            "$ref": "#/$defs/effect"
+          },
+          "description": "At most one of each type; applied crop, chromaKey, colorAdjust, blur whatever the order (R12)."
+        }
+      }
+    },
+    "transform": {
+      "description": "Places the item's anchor at (x, y) in the output, both 0 to 1 from the top-left.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "x": {
+          "$ref": "#/$defs/animatable",
+          "default": 0.5
+        },
+        "y": {
+          "$ref": "#/$defs/animatable",
+          "default": 0.5
+        },
+        "anchor": {
+          "type": "array",
+          "prefixItems": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "number"
+            }
+          ],
+          "minItems": 2,
+          "maxItems": 2,
+          "default": [
+            0.5,
+            0.5
+          ],
+          "description": "Point of the item, 0 to 1 of its own fitted box."
+        },
+        "scale": {
+          "$ref": "#/$defs/animatable",
+          "default": 1
+        },
+        "rotation": {
+          "$ref": "#/$defs/animatable",
+          "default": 0,
+          "description": "Degrees, clockwise."
+        }
+      }
+    },
+    "videoItem": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/timing"
+        },
+        {
+          "$ref": "#/$defs/mediaTiming"
+        },
+        {
+          "$ref": "#/$defs/visual"
+        }
+      ],
+      "type": "object",
+      "required": [
+        "type"
+      ],
+      "unevaluatedProperties": false,
+      "properties": {
+        "type": {
+          "const": "video"
+        },
+        "audio": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "The file's own audio track, mixed like an audio item on this track's audio bus.",
+          "properties": {
+            "mute": {
+              "type": "boolean",
+              "default": false
+            },
+            "gain": {
+              "$ref": "#/$defs/animatable",
+              "default": 1
+            }
+          }
+        }
+      }
+    },
+    "imageItem": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/timing"
+        },
+        {
+          "$ref": "#/$defs/visual"
+        }
+      ],
+      "type": "object",
+      "required": [
+        "type",
+        "src"
+      ],
+      "unevaluatedProperties": false,
+      "properties": {
+        "type": {
+          "const": "image"
+        },
+        "src": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "textItem": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/timing"
+        },
+        {
+          "$ref": "#/$defs/visual"
+        }
+      ],
+      "type": "object",
+      "required": [
+        "type",
+        "text"
+      ],
+      "unevaluatedProperties": false,
+      "properties": {
+        "type": {
+          "const": "text"
+        },
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1000
+        },
+        "style": {
+          "$ref": "#/$defs/textStyle"
+        }
+      }
+    },
+    "textStyle": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "font": {
+          "type": "string",
+          "default": "system",
+          "description": "A family name, or system / system-bold."
+        },
+        "size": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 1,
+          "default": 0.05,
+          "description": "Line height as a fraction of the output height."
+        },
+        "color": {
+          "$ref": "#/$defs/color",
+          "default": "#ffffff"
+        },
+        "align": {
+          "enum": [
+            "left",
+            "center",
+            "right"
+          ],
+          "default": "center"
+        },
+        "box": {
+          "$ref": "#/$defs/color",
+          "description": "Background box behind the text; none if absent."
+        },
+        "maxWidth": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 1,
+          "default": 0.9,
+          "description": "Fraction of the output width; longer text wraps."
+        }
+      }
+    },
+    "colorItem": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/timing"
+        },
+        {
+          "$ref": "#/$defs/visual"
+        }
+      ],
+      "type": "object",
+      "required": [
+        "type",
+        "color"
+      ],
+      "unevaluatedProperties": false,
+      "properties": {
+        "type": {
+          "const": "color"
+        },
+        "color": {
+          "$ref": "#/$defs/color"
+        }
+      }
+    },
+    "audioItem": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/timing"
+        },
+        {
+          "$ref": "#/$defs/mediaTiming"
+        }
+      ],
+      "type": "object",
+      "required": [
+        "type"
+      ],
+      "unevaluatedProperties": false,
+      "properties": {
+        "type": {
+          "const": "audio"
+        },
+        "gain": {
+          "$ref": "#/$defs/animatable",
+          "default": 1,
+          "description": "Linear, 0 to 4."
+        },
+        "pan": {
+          "$ref": "#/$defs/animatable",
+          "default": 0,
+          "description": "-1 (left) to 1 (right)."
+        }
+      }
+    },
+    "transition": {
+      "description": "Joins the items before and after it in the same track, which overlap by `duration`.",
+      "type": "object",
+      "required": [
+        "type",
+        "kind",
+        "duration"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "transition"
+        },
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "kind": {
+          "enum": [
+            "cut",
+            "crossfade",
+            "push",
+            "slide",
+            "wipe"
+          ]
+        },
+        "direction": {
+          "enum": [
+            "left",
+            "right",
+            "up",
+            "down"
+          ],
+          "default": "left"
+        },
+        "duration": {
+          "$ref": "#/$defs/time"
+        },
+        "easing": {
+          "$ref": "#/$defs/easing",
+          "default": "linear"
+        },
+        "audio": {
+          "enum": [
+            "equalGain",
+            "equalPower",
+            "cut"
+          ],
+          "default": "equalGain"
+        },
+        "metadata": {
+          "$ref": "#/$defs/metadata"
+        }
+      }
+    },
+    "effect": {
+      "type": "object",
+      "required": [
+        "type"
+      ],
+      "properties": {
+        "type": {
+          "enum": [
+            "colorAdjust",
+            "blur",
+            "crop",
+            "chromaKey"
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "colorAdjust"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/effectKinds/colorAdjust"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "blur"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/effectKinds/blur"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "crop"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/effectKinds/crop"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "chromaKey"
+              }
+            }
+          },
+          "then": {
+            "$ref": "#/$defs/effectKinds/chromaKey"
+          }
+        }
+      ]
+    },
+    "effectKinds": {
+      "colorAdjust": {
+        "type": "object",
+        "required": [
+          "type"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "type": {
+            "const": "colorAdjust"
+          },
+          "brightness": {
+            "$ref": "#/$defs/animatable",
+            "default": 0
+          },
+          "contrast": {
+            "$ref": "#/$defs/animatable",
+            "default": 1
+          },
+          "saturation": {
+            "$ref": "#/$defs/animatable",
+            "default": 1
+          }
+        }
+      },
+      "blur": {
+        "type": "object",
+        "required": [
+          "type",
+          "radius"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "type": {
+            "const": "blur"
+          },
+          "radius": {
+            "$ref": "#/$defs/animatable",
+            "description": "Gaussian sigma, as a fraction of the output height."
+          }
+        }
+      },
+      "crop": {
+        "type": "object",
+        "required": [
+          "type"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "type": {
+            "const": "crop"
+          },
+          "left": {
+            "$ref": "#/$defs/animatable",
+            "default": 0
+          },
+          "top": {
+            "$ref": "#/$defs/animatable",
+            "default": 0
+          },
+          "right": {
+            "$ref": "#/$defs/animatable",
+            "default": 0
+          },
+          "bottom": {
+            "$ref": "#/$defs/animatable",
+            "default": 0
+          }
+        }
+      },
+      "chromaKey": {
+        "type": "object",
+        "required": [
+          "type",
+          "color"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "type": {
+            "const": "chromaKey"
+          },
+          "color": {
+            "$ref": "#/$defs/color"
+          },
+          "tolerance": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "default": 0.15
+          },
+          "softness": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "default": 0.1
+          }
+        }
+      }
+    }
+  }
+}

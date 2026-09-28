@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "mf/adapters.h"
+#include "mf/scene.h"
 
 namespace mf {
 
@@ -55,7 +56,10 @@ class Player {
   static std::unique_ptr<Player> create(PlatformFactory&, PlayerListener*);
   ~Player();
 
-  Result open(const Timeline&, const RenderTarget&);     // returns at once; probing runs on T1
+  // Returns at once; probing runs on T1. The scene is validated here (InvalidArgument, with
+  // `error` saying why); media problems arrive later through onError.
+  Result open(const Scene&, const RenderTarget&, OutputDriver = OutputDriver::Auto, std::string* error = nullptr);
+  Result open(const Timeline&, const RenderTarget&);     // clips back to back, as a scene
   Result open(const MediaSource&, const RenderTarget&);  // a timeline of one clip
   Result play();
   Result pause();

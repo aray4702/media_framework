@@ -1,0 +1,87 @@
+{
+  "version": 1,
+  "output": { "width": 1280, "height": 720, "fps": 30, "background": "#101418" },
+  "tracks": [
+    {
+      "id": "main",
+      "kind": "video",
+      "items": [
+        {
+          "id": "a", "type": "video", "src": "../../clips/720p24.mp4",
+          "start": 0, "in": 1, "duration": 5,
+          "effects": [{ "type": "colorAdjust", "saturation": 1.4 }]
+        },
+        { "type": "transition", "kind": "crossfade", "duration": 1 },
+        {
+          "id": "b", "type": "video", "src": "../../clips/1080p30.mp4",
+          "start": 4, "duration": 5, "fit": "cover",
+          "transform": { "scale": { "keys": [[0, 1], [5, 1.25]] } }
+        },
+        { "type": "transition", "kind": "wipe", "direction": "right", "duration": 1, "easing": "easeInOut" },
+        {
+          "id": "c", "type": "video", "src": "../../clips/1080p60.mp4",
+          "start": 8, "duration": 4,
+          "effects": [{ "type": "blur", "radius": { "keys": [[2, 0], [4, 0.012]] } }]
+        }
+      ]
+    },
+    {
+      "id": "pip",
+      "kind": "video",
+      "items": [
+        {
+          "id": "inset", "type": "video", "src": "../../clips/720p120.mp4",
+          "start": 1, "duration": 6,
+          "transform": { "x": 0.78, "y": 0.26, "scale": 0.32, "rotation": { "keys": [[0, -4], [6, 4]] } },
+          "opacity": { "keys": [[0, 0], [0.5, 1], [5.5, 1], [6, 0]] },
+          "audio": { "mute": true }
+        }
+      ]
+    },
+    {
+      "id": "overlays",
+      "kind": "video",
+      "items": [
+        {
+          "id": "still", "type": "image", "src": "../../docs/images/demo.png",
+          "start": 0, "duration": 3,
+          "transform": { "x": 0.03, "y": 0.97, "anchor": [0, 1], "scale": 0.22 },
+          "opacity": 0.9
+        },
+        { "id": "tint", "type": "color", "color": "#ff3030", "start": 6, "duration": 2, "blend": "multiply",
+          "opacity": { "keys": [[0, 0], [1, 0.6], [2, 0]] } }
+      ]
+    },
+    {
+      "id": "titles",
+      "kind": "video",
+      "items": [
+        {
+          "id": "title", "type": "text", "text": "Scene graph demo: layers, transitions, effects",
+          "start": 0.5, "duration": 3.5,
+          "style": { "font": "system-bold", "size": 0.065, "box": "#000000a0" },
+          "transform": { "x": 0.5, "y": { "keys": [[0, 1.1, "easeOut"], [0.7, 0.9]] }, "anchor": [0.5, 1] },
+          "opacity": { "keys": [[3, 1], [3.5, 0]] }
+        },
+        {
+          "id": "label", "type": "text", "text": "Wipe, then blur",
+          "start": 8, "duration": 3,
+          "style": { "size": 0.05, "align": "left", "color": "#ffe066" },
+          "transform": { "x": 0.04, "y": 0.08, "anchor": [0, 0] }
+        }
+      ]
+    },
+    {
+      "id": "music",
+      "kind": "audio",
+      "items": [
+        {
+          "id": "bed", "type": "audio", "src": "../../clips/sync_flash_beep.mp4",
+          "start": 0, "duration": 12,
+          "gain": { "keys": [[0, 0], [0.5, 0.8], [11, 0.8], [12, 0]] },
+          "pan": { "keys": [[0, -1], [12, 1]] }
+        }
+      ]
+    }
+  ]
+}

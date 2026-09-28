@@ -9,11 +9,13 @@
 #include <vector>
 
 #include "bounded_queue.h"
+#include "layout.h"
 #include "master_clock.h"
 #include "metrics.h"
 #include "mf/adapters.h"
 #include "mf/audio_ring.h"
-#include "timeline.h"
+#include "mf/player.h"
+#include "mf/scene.h"
 
 namespace mf {
 
@@ -28,18 +30,17 @@ class PipelineEvents {
   virtual void onEnd() = 0;
 };
 
-struct PendingSeek {
-  int64_t targetUs;
-  int64_t requestedNs;
-  int laneClip[2] = {0, 1};  // set by T1 when the seek starts: the clip each lane reads first
-};
-
-constexpr int kNoClip = std::numeric_limits<int>::max();       // a lane with no clip (left)
+constexpr int kNoItem = std::numeric_limits<int>::max();          // a lane with no item left
 constexpr int64_t kNever = std::numeric_limits<int64_t>::max();  // a time that never comes
 
-// Clip i plays on lane i % 2 (§2.4). Each lane has its own decoders and queues, so the
-// incoming clip decodes alongside the outgoing one during a transition.
-constexpr int kLanes = 2;
+struct PendingSeek {
+  int64_t targetUs = 0;
+  int64_t requestedNs = 0;
+  // Set by T1 when the seek starts: per lane, the position in layout.laneItems() it reads first.
+  std::vector<int> lanePos;
+};
+
+// Decoders and queues shared by the items of one lane (SceneLayout), which never overlap.
 struct Lane {
   std::unique_ptr<IVideoDecoder> videoDecoder;
   std::unique_ptr<IAudioDecoder> audioDecoder;
@@ -48,10 +49,14 @@ struct Lane {
   BoundedQueue<VideoFrame> frames{{4}};
 };
 
-// A caption with its text shared by every frame that shows it.
-struct Caption {
-  int64_t startUs, endUs;
-  std::shared_ptr<const std::string> text;
+// What an item needs while playing, found by T1 while probing.
+struct ItemRuntime {
+  std::unique_ptr<IDemuxer> demuxer;  // video and audio items
+  MediaInfo info;
+  bool mixAudio = false;  // its audio is decoded and mixed (usable, not muted)
+  VideoFrame image;       // image items: decoded once
+  int imageWidth = 0, imageHeight = 0;
+  std::shared_ptr<const std::string> text;  // text items
 };
 
 // What sets the output times inside the pipeline (§2.5).
@@ -65,8 +70,7 @@ struct Context {
   void wake(StageId id) { scheduler->wake(id); }
   void wakeAll();
   void fatal(Result r, const std::string& reason) { events.onFatal(r, reason); }
-  static int laneOf(int clip) { return clip % kLanes; }
-  std::shared_ptr<const std::string> captionAt(int64_t timelineUs) const;
+  std::string itemName(int item) const;  // for messages: its id, or its position
 
   // Set on the owner thread; T3 applies the latest value to every frame it presents.
   VideoFilter filter() const;
@@ -82,28 +86,28 @@ struct Context {
   PlatformFactory& factory;
   IClock& hostClock;
   PipelineEvents& events;
-  std::vector<std::unique_ptr<IDemuxer>> demuxers;  // one per clip, made by T1 while probing
-  Lane lanes[kLanes];
-  std::unique_ptr<ISpeaker> speaker;       // playback only
-  std::unique_ptr<IDisplay> display;       // playback only
+  std::unique_ptr<ISpeaker> speaker;        // playback only
+  std::unique_ptr<IDisplay> display;        // playback only
   std::unique_ptr<IExportSink> exportSink;  // export only
   std::unique_ptr<IScheduler> scheduler;
 
   // Set by open() (or Exporter::start) before T1 is woken.
   Driver driver = Driver::LeadingClip;
+  bool autoDriver = false;  // pick LeadingClip for a single video item, else Vsync
   ExportTarget exportTarget;
   ExportSettings exportSettings;
-  std::vector<MediaSource> sources;
-  Transition transition;
-  std::vector<Caption> captions;
+  Scene scene;
+  std::optional<Timeline> timeline;  // open(Timeline): turned into `scene` once its clips are probed
   std::atomic<bool> openRequested{false};
 
   // Written by T1 while probing, before any packet exists; read-only once `probed` is set.
-  std::vector<MediaInfo> infos;
-  std::vector<char> clipAudio;  // the clip's audio is decodable and matches the output format
-  TimelineLayout layout;
+  SceneLayout layout;
+  std::vector<ItemRuntime> items;
+  std::vector<std::unique_ptr<Lane>> lanes;
+  int width = 0, height = 0;  // the canvas
+  int fpsNum = 30, fpsDen = 1;
   std::atomic<bool> probed{false};
-  std::atomic<bool> hasAudio{false};  // some clip has usable audio: the ring and speaker run
+  std::atomic<bool> hasAudio{false};  // some item has mixed audio: the ring and speaker run
   std::atomic<int64_t> durationUs{0};
 
   // Buffers, capped per §2.1. The lanes hold the rest.
@@ -133,7 +137,7 @@ struct Context {
   VideoFilter filter_;
   mutable std::mutex seekMu_;
   std::optional<PendingSeek> pending_;
-  PendingSeek target_{0, 0};
+  PendingSeek target_;
   std::atomic<bool> hasPending_{false};
 };
 

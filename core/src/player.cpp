@@ -42,6 +42,24 @@ struct Player::Impl : PipelineEvents {
 
   Result open(const Timeline& timeline, const RenderTarget& target) {
     if (!isValid(timeline)) return Result::InvalidArgument;
+    bool single = timeline.clips.size() == 1;
+    Driver driver = timeline.driver == OutputDriver::LeadingClip || (timeline.driver == OutputDriver::Auto && single)
+                        ? Driver::LeadingClip
+                        : Driver::Vsync;
+    return start(target, driver, false, [&] {
+      ctx.timeline = timeline;
+      ctx.setFilter(timeline.filter);
+    });
+  }
+
+  Result open(const Scene& scene, const RenderTarget& target, OutputDriver driver, std::string* error) {
+    if (validateScene(scene, error) != Result::Ok) return Result::InvalidArgument;
+    Driver d = driver == OutputDriver::LeadingClip ? Driver::LeadingClip : Driver::Vsync;
+    return start(target, d, driver == OutputDriver::Auto, [&] { ctx.scene = scene; });
+  }
+
+  template <typename F>
+  Result start(const RenderTarget& target, Driver driver, bool autoDriver, F setScene) {
     {
       std::lock_guard<std::mutex> lock(stateMu);
       if (state != State::Start || openCalled) return Result::InvalidState;
@@ -49,18 +67,9 @@ struct Player::Impl : PipelineEvents {
     }
     Result r = ctx.display->attach(target, [this](int64_t pts, int64_t ns) { onPresented(pts, ns); });
     if (r != Result::Ok) return r;
-    bool single = timeline.clips.size() == 1;
-    switch (timeline.driver) {
-      case OutputDriver::Auto: ctx.driver = single ? Driver::LeadingClip : Driver::Vsync; break;
-      case OutputDriver::LeadingClip: ctx.driver = Driver::LeadingClip; break;
-      case OutputDriver::Vsync: ctx.driver = Driver::Vsync; break;
-    }
-    ctx.sources = timeline.clips;
-    ctx.transition = timeline.transition;
-    for (const TextOverlay& o : timeline.texts) {
-      ctx.captions.push_back({o.startUs, o.endUs, std::make_shared<const std::string>(o.text)});
-    }
-    ctx.setFilter(timeline.filter);
+    ctx.driver = driver;
+    ctx.autoDriver = autoDriver;
+    setScene();
     ctx.metrics.startTtff(ctx.hostClock.nowNs());
     ctx.openRequested = true;
     ctx.wake(StageId::Source);
@@ -131,11 +140,11 @@ struct Player::Impl : PipelineEvents {
     // Release adapters before the buffers they call back into (ring, metrics, scheduler).
     ctx.speaker.reset();
     ctx.display.reset();
-    for (Lane& lane : ctx.lanes) {
-      lane.videoDecoder.reset();
-      lane.audioDecoder.reset();
+    for (auto& lane : ctx.lanes) {
+      lane->videoDecoder.reset();
+      lane->audioDecoder.reset();
     }
-    ctx.demuxers.clear();
+    for (ItemRuntime& item : ctx.items) item.demuxer.reset();
     std::fprintf(stderr, "[mf] metrics: %s\n", ctx.metrics.report().toString().c_str());
     return Result::Ok;
   }
@@ -243,6 +252,9 @@ std::unique_ptr<Player> Player::create(PlatformFactory& factory, PlayerListener*
 Player::Player(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
 Player::~Player() = default;
 
+Result Player::open(const Scene& s, const RenderTarget& t, OutputDriver d, std::string* error) {
+  return impl_->onOwner() ? impl_->open(s, t, d, error) : Result::WrongThread;
+}
 Result Player::open(const Timeline& tl, const RenderTarget& t) {
   return impl_->onOwner() ? impl_->open(tl, t) : Result::WrongThread;
 }

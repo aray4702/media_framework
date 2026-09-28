@@ -21,6 +21,7 @@ class MacPlatform : public PlatformFactory {
   std::unique_ptr<ISpeaker> createSpeaker() override { return macos::createSpeaker(); }
   std::unique_ptr<IDisplay> createDisplay() override { return macos::createDisplay(); }
   std::unique_ptr<IExportSink> createExportSink() override { return macos::createExportSink(); }
+  std::unique_ptr<IImageLoader> createImageLoader() override { return macos::createImageLoader(); }
   std::unique_ptr<IScheduler> createScheduler() override {
     return std::make_unique<ThreadScheduler>(clock_, [](StageId id) {
       static const char* names[] = {"mf.source", "mf.video-decode", "mf.composition", "mf.video-render", "mf.audio"};
@@ -47,6 +48,24 @@ MediaSource sourceFromPath(const std::string& path) {
 }
 
 RenderTarget targetFromView(void* nsView) { return RenderTarget{nsView}; }
+
+Result loadScene(const std::string& path, Scene* out, std::string* error) {
+  @autoreleasepool {
+    NSString* file = [NSString stringWithUTF8String:path.c_str()];
+    NSData* data = [NSData dataWithContentsOfFile:file];
+    if (!data) {
+      if (error) *error = "cannot read " + path;
+      return Result::FileOpenFailed;
+    }
+    NSString* folder = file.stringByDeletingLastPathComponent;
+    std::string text(static_cast<const char*>(data.bytes), data.length);
+    return parseScene(text, [folder](const std::string& src) {
+      NSString* s = [NSString stringWithUTF8String:src.c_str()];
+      NSString* full = s.isAbsolutePath ? s : [folder stringByAppendingPathComponent:s];
+      return sourceFromPath(full.stringByStandardizingPath.UTF8String);
+    }, out, error);
+  }
+}
 
 ExportTarget exportTargetFromPath(const std::string& path) {
   NSURL* url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:path.c_str()]];

@@ -158,9 +158,7 @@ class MetalDisplay : public IDisplay {
   void draw(const Pending& p) {
     @autoreleasepool {
       const ComposedFrame& c = p.frame;
-      bool any = false;
-      for (int i = 0; i < c.layerCount; ++i) any |= c.layers[i].frame.image != nullptr;
-      id<CAMetalDrawable> drawable = any ? [layer_ nextDrawable] : nil;
+      id<CAMetalDrawable> drawable = [layer_ nextDrawable];
       if (!drawable) {
         sink_->report(c.ptsUs, 0);
         return;

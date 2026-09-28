@@ -30,6 +30,7 @@ struct Clip {
   int gop = 30;
   bool audio = true;
   bool audioSupported = true;
+  int sampleRate = 48000;
   int64_t audioDurationUs = -1;  // -1: same as video
   std::set<int> corruptFrames;   // video frame indices that fail to decode
   int64_t failDecodeAtUs = -1;   // decoder fails fatally at this pts
@@ -40,10 +41,16 @@ constexpr int kAudioFrames = 1024;
 constexpr int kRate = 48000;
 constexpr int64_t kAudioPacketUs = int64_t{kAudioFrames} * 1000000 / kRate;
 
+// A MediaSource naming fake clip `index` (see Platform::clips).
+inline MediaSource clipSource(int index) { return MediaSource{std::make_shared<int>(index)}; }
+
 class Demuxer : public IDemuxer {
  public:
-  explicit Demuxer(const Clip& c) : clip_(c) {}
-  Result open(const MediaSource&, MediaInfo* out) override {
+  // Plays the clip its source names, else `fallback` (demuxers made for a Timeline, in order).
+  Demuxer(const std::vector<Clip>& clips, const Clip& fallback) : clips_(clips), clip_(fallback) {}
+  Result open(const MediaSource& source, MediaInfo* out) override {
+    if (source.native) clip_ = clips_[size_t(*static_cast<int*>(source.native.get())) % clips_.size()];
+    packetUs_ = int64_t{kAudioFrames} * 1000000 / clip_.sampleRate;
     if (clip_.failOpen) return Result::FileOpenFailed;
     int n = static_cast<int>(clip_.durationUs * clip_.fps / 1000000);
     for (int i = 0; i < n; ++i) {
@@ -55,7 +62,7 @@ class Demuxer : public IDemuxer {
       packets_[kVideo].push_back(p);
     }
     int64_t audioEnd = clip_.audioDurationUs < 0 ? clip_.durationUs : clip_.audioDurationUs;
-    for (int64_t pts = 0; clip_.audio && pts < audioEnd; pts += kAudioPacketUs) {
+    for (int64_t pts = 0; clip_.audio && pts < audioEnd; pts += packetUs_) {
       Packet p;
       p.track = kAudio;
       p.ptsUs = p.dtsUs = pts;
@@ -71,7 +78,7 @@ class Demuxer : public IDemuxer {
     if (clip_.audio) {
       TrackInfo a;
       a.supported = clip_.audioSupported;
-      a.sampleRate = kRate;
+      a.sampleRate = clip_.sampleRate;
       a.channels = 2;
       out->audio = a;
     }
@@ -95,12 +102,14 @@ class Demuxer : public IDemuxer {
     }
     next_[kVideo] = v;
     int64_t keyPts = packets_[kVideo].empty() ? 0 : packets_[kVideo][v].ptsUs;
-    next_[kAudio] = static_cast<size_t>(keyPts / kAudioPacketUs);
+    next_[kAudio] = static_cast<size_t>(keyPts / packetUs_);
     return Result::Ok;
   }
 
  private:
+  const std::vector<Clip>& clips_;
   Clip clip_;
+  int64_t packetUs_ = kAudioPacketUs;
   std::vector<Packet> packets_[2];
   size_t next_[2] = {0, 0};
 };
@@ -215,6 +224,17 @@ class Speaker : public ISpeaker {
   int64_t nextNs_ = 0;
 };
 
+// Any source loads as a 400x200 image.
+class ImageLoader : public IImageLoader {
+ public:
+  Result load(const MediaSource&, VideoFrame* out, int* width, int* height) override {
+    out->image = std::make_shared<int>(0);
+    *width = 400;
+    *height = 200;
+    return Result::Ok;
+  }
+};
+
 // Records what an export writes. With busyEvery = n, every n-th write reports Again.
 class ExportSink : public IExportSink {
  public:
@@ -274,8 +294,9 @@ class Platform : public PlatformFactory {
  public:
   explicit Platform(std::vector<Clip> c = {Clip{}}) : clips(std::move(c)) {}
   std::unique_ptr<IDemuxer> createDemuxer() override {
-    return std::make_unique<Demuxer>(clips[demuxers++ % clips.size()]);
+    return std::make_unique<Demuxer>(clips, clips[demuxers++ % clips.size()]);
   }
+  std::unique_ptr<IImageLoader> createImageLoader() override { return std::make_unique<ImageLoader>(); }
   std::unique_ptr<IVideoDecoder> createVideoDecoder() override { return std::make_unique<VideoDecoder>(clips[0]); }
   std::unique_ptr<IAudioDecoder> createAudioDecoder() override { return std::make_unique<AudioDecoder>(); }
   std::unique_ptr<ISpeaker> createSpeaker() override {
@@ -352,6 +373,9 @@ struct Harness {
     return player->open(t, RenderTarget{});
   }
   const ComposedFrame& lastComposed() const { return platform.display->composed.back(); }
+  Result openScene(const Scene& scene, OutputDriver driver = OutputDriver::Auto, std::string* error = nullptr) {
+    return player->open(scene, RenderTarget{}, driver, error);
+  }
   int64_t lastShown() const { return platform.display->shown.empty() ? -1 : platform.display->shown.back(); }
 
   Platform platform;

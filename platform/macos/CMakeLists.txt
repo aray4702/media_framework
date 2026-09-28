@@ -3,6 +3,7 @@ add_library(mf_macos STATIC
   src/au_speaker.cpp
   src/avf_demuxer.mm
   src/avf_export_sink.mm
+  src/image_loader.mm
   src/mac_platform.mm
   src/metal_compositor.mm
   src/metal_display.mm
@@ -12,7 +13,7 @@ target_compile_options(mf_macos PUBLIC $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>)
 target_link_libraries(mf_macos PUBLIC mf_core
   "-framework Foundation" "-framework AppKit" "-framework AVFoundation" "-framework CoreMedia"
   "-framework CoreVideo" "-framework VideoToolbox" "-framework AudioToolbox" "-framework CoreAudio"
-  "-framework Metal" "-framework QuartzCore" "-framework CoreText" "-framework UniformTypeIdentifiers")
+  "-framework Metal" "-framework QuartzCore" "-framework CoreText" "-framework ImageIO" "-framework UniformTypeIdentifiers")
 
 # Runs the real demuxer and decoders on a clip, without a window or audio output.
 add_executable(macos_adapter_tests tests/adapter_tests.mm)

@@ -9,12 +9,30 @@ namespace mf {
 
 // --- FrameSampler ---------------------------------------------------------------------------
 
+void FrameSampler::setup() {
+  lanes_.resize(layout().lanes());
+  seqIndex_.assign(layout().items(), -1);
+  for (int li = 0; li < lanes(); ++li) {
+    const std::vector<int>& list = layout().laneItems(li);
+    for (int k = 0; k < int(list.size()); ++k) {
+      if (layout().item(list[k]).type != ItemType::Video) continue;
+      seqIndex_[list[k]] = int(lanes_[li].seq.size());
+      lanes_[li].seq.push_back(list[k]);
+      lanes_[li].seqPos.push_back(k);
+    }
+  }
+}
+
 void FrameSampler::restart(uint32_t serial, const PendingSeek& target) {
+  if (lanes_.empty()) setup();
   serial_ = serial;
-  for (int li = 0; li < kLanes; ++li) {
-    lanes_[li] = LaneView{};
-    lanes_[li].clip = target.laneClip[li];
-    lanes_[li].done = lanes_[li].clip >= layout().clips();
+  for (int li = 0; li < lanes(); ++li) {
+    LaneView& lane = lanes_[li];
+    lane.head.reset();
+    lane.latest.clear();
+    lane.pos = 0;
+    while (lane.pos < int(lane.seq.size()) && lane.seqPos[lane.pos] < target.lanePos[li]) ++lane.pos;
+    lane.done = lane.pos >= int(lane.seq.size());
   }
 }
 
@@ -22,11 +40,11 @@ bool FrameSampler::pop(int li) {
   LaneView& lane = lanes_[li];
   if (lane.head || lane.done) return false;
   VideoFrame f;
-  if (!ctx_.lanes[li].frames.tryPop(&f)) return false;
+  if (!ctx_.lanes[li]->frames.tryPop(&f)) return false;
   if (f.serial != serial_) return true;
-  if (f.eos) {  // the lane's clip has no more frames; its next clip is two ahead
-    lane.clip = f.clip + kLanes;
-    lane.done = lane.clip >= layout().clips();
+  if (f.eos) {  // the item has no more frames: the lane moves on to its next video item
+    lane.pos = seqIndex_[f.item] + 1;
+    lane.done = lane.pos >= int(lane.seq.size());
     return true;
   }
   lane.head = std::move(f);
@@ -37,9 +55,20 @@ void FrameSampler::take(int li) {
   LaneView& lane = lanes_[li];
   VideoFrame f = std::move(*lane.head);
   lane.head.reset();
-  if (!layout().active(f.clip, timeOf(f))) return;  // past the clip's end: cut by the next clip
-  if (seeking_ && lane.held && lane.held->clip == f.clip) ctx_.metrics.countDecodeOnly();
-  lane.held = std::move(f);
+  int64_t t = timeOf(f);
+  if (t >= layout().item(f.item).endUs()) return;  // past the item's end: never shown
+  // Forget items this lane has finished showing.
+  lane.latest.erase(std::remove_if(lane.latest.begin(), lane.latest.end(),
+                                   [&](const VideoFrame& v) { return v.item != f.item && layout().item(v.item).endUs() <= t; }),
+                    lane.latest.end());
+  for (VideoFrame& v : lane.latest) {
+    if (v.item == f.item) {
+      if (seeking_) ctx_.metrics.countDecodeOnly();
+      v = std::move(f);
+      return;
+    }
+  }
+  lane.latest.push_back(std::move(f));
 }
 
 void FrameSampler::advance(int li, int64_t t) {
@@ -47,60 +76,154 @@ void FrameSampler::advance(int li, int64_t t) {
   for (;;) {
     if (!lane.head && !pop(li)) return;
     if (!lane.head) continue;
-    if (timeOf(*lane.head) > t) return;
+    int64_t time = timeOf(*lane.head);
+    if (time > t && time < layout().item(lane.head->item).endUs()) return;
     take(li);
   }
 }
 
 void FrameSampler::advanceAll(int64_t t) {
-  for (int li = 0; li < kLanes; ++li) advance(li, t);
+  for (int li = 0; li < lanes(); ++li) advance(li, t);
 }
 
-bool FrameSampler::exactAt(int c, int64_t t) const {
-  const LaneView& lane = lanes_[Context::laneOf(c)];
-  if (lane.done || lane.clip > c) return true;
-  return lane.clip == c && lane.head && timeOf(*lane.head) > t;
+bool FrameSampler::exactAt(int item, int64_t t) const {
+  const LaneView& lane = lanes_[layout().laneOf(item)];
+  int k = seqIndex_[item];
+  if (lane.done || lane.pos > k) return true;
+  return lane.pos == k && lane.head && timeOf(*lane.head) > t;
 }
 
 bool FrameSampler::allExactAt(int64_t t) const {
-  for (int c = layout().firstActive(t); c < layout().clips() && layout().active(c, t); ++c) {
-    if (!exactAt(c, t)) return false;
+  for (int i : videoAt(t)) {
+    if (!exactAt(i, t)) return false;
   }
   return true;
 }
 
-bool FrameSampler::mayDeliver(int c) const {
-  const LaneView& lane = lanes_[Context::laneOf(c)];
-  return !lane.done && lane.clip <= c;
+bool FrameSampler::mayDeliver(int item) const {
+  const LaneView& lane = lanes_[layout().laneOf(item)];
+  return !lane.done && lane.pos <= seqIndex_[item];
 }
 
-const VideoFrame* FrameSampler::frameOf(int c) const {
-  const std::optional<VideoFrame>& held = lanes_[Context::laneOf(c)].held;
-  return held && held->clip == c ? &*held : nullptr;
+const VideoFrame* FrameSampler::frameOf(int item) const {
+  if (layout().laneOf(item) < 0) return nullptr;
+  for (const VideoFrame& v : lanes_[layout().laneOf(item)].latest) {
+    if (v.item == item) return &v;
+  }
+  return nullptr;
 }
 
 int64_t FrameSampler::floorOf(int li) const {
   const LaneView& lane = lanes_[li];
   if (lane.done) return kNever;
-  int64_t floor = layout().startUs(lane.clip);
-  if (lane.held && lane.held->clip == lane.clip) floor = std::max(floor, timeOf(*lane.held) + 1);
+  int item = lane.seq[lane.pos];
+  int64_t floor = layout().timelineUs(item, 0);  // media time 0: the earliest a frame can be
+  if (const VideoFrame* f = frameOf(item)) floor = std::max(floor, timeOf(*f) + 1);
   return floor;
 }
 
 bool FrameSampler::done() const {
-  return lanes_[0].done && lanes_[1].done && !lanes_[0].head && !lanes_[1].head;
+  for (const LaneView& lane : lanes_) {
+    if (!lane.done || lane.head) return false;
+  }
+  return true;
+}
+
+std::vector<int> FrameSampler::videoAt(int64_t t) const {
+  std::vector<SceneLayout::Visible> visible;
+  layout().visibleAt(t, &visible);
+  std::vector<int> out;
+  for (const SceneLayout::Visible& v : visible) {
+    if (layout().item(v.item).type == ItemType::Video) out.push_back(v.item);
+  }
+  return out;
+}
+
+int FrameSampler::leadItem(int64_t t) const {
+  int lead = -1;
+  for (int i : videoAt(t)) {
+    if (lead < 0 || ctx_.items[i].info.video.frameDurationUs <= ctx_.items[lead].info.video.frameDurationUs) lead = i;
+  }
+  return lead;
 }
 
 ComposedFrame FrameSampler::composeAt(int64_t t) const {
   ComposedFrame out;
   out.ptsUs = t;
   out.serial = serial_;
-  out.frameDurationUs = ctx_.infos[layout().leadClip(t)].video.frameDurationUs;
-  for (int c = layout().firstActive(t); c < layout().clips() && layout().active(c, t); ++c) {
-    if (const VideoFrame* f = frameOf(c)) out.layers[out.layerCount++] = {*f, layout().offsetX(c, t)};
-  }
-  out.text = ctx_.captionAt(t);
+  out.width = ctx_.width;
+  out.height = ctx_.height;
+  out.background = ctx_.scene.output.background;
   out.filter = ctx_.filter();
+  int lead = leadItem(t);
+  out.frameDurationUs = lead >= 0 ? ctx_.items[lead].info.video.frameDurationUs : int64_t(ctx_.fpsDen) * 1000000 / ctx_.fpsNum;
+
+  std::vector<SceneLayout::Visible> visible;
+  layout().visibleAt(t, &visible);
+  for (const SceneLayout::Visible& v : visible) {
+    const SceneItem& it = layout().item(v.item);
+    const ItemRuntime& rt = ctx_.items[v.item];
+    int64_t local = t - it.startUs;
+    ComposedLayer l;
+    l.item = v.item;
+    switch (it.type) {
+      case ItemType::Video: {
+        const VideoFrame* f = frameOf(v.item);
+        if (!f) continue;  // not decoded yet: nothing to draw
+        l.kind = ComposedLayer::Kind::Video;
+        l.frame = *f;
+        break;
+      }
+      case ItemType::Image:
+        l.kind = ComposedLayer::Kind::Image;
+        l.frame = rt.image;
+        break;
+      case ItemType::Text:
+        l.kind = ComposedLayer::Kind::Text;
+        l.text = rt.text;
+        l.style = it.style;
+        break;
+      case ItemType::Color:
+        l.kind = ComposedLayer::Kind::Color;
+        l.color = it.color;
+        break;
+      case ItemType::Audio:
+        continue;
+    }
+    const SceneTransform& tr = it.transform;
+    l.fit = it.type == ItemType::Text ? Fit::None : it.fit;
+    l.x = float(tr.x.at(local));
+    l.y = float(tr.y.at(local));
+    l.anchorX = tr.anchorX;
+    l.anchorY = tr.anchorY;
+    l.scale = float(tr.scale.at(local));
+    l.rotation = float(tr.rotation.at(local));
+    l.offsetX = v.offsetX;
+    l.offsetY = v.offsetY;
+    std::copy(v.clip, v.clip + 4, l.clip);
+    l.opacity = float(it.opacity.at(local)) * v.fade * layout().trackOf(v.item).opacity;
+    l.blend = it.blend;
+    const SceneEffects& e = it.effects;
+    if (e.crop) {
+      l.crop[0] = float(e.cropLeft.at(local));
+      l.crop[1] = float(e.cropTop.at(local));
+      l.crop[2] = float(e.cropRight.at(local));
+      l.crop[3] = float(e.cropBottom.at(local));
+    }
+    if (e.colorAdjust) {
+      l.brightness = float(e.brightness.at(local));
+      l.contrast = float(e.contrast.at(local));
+      l.saturation = float(e.saturation.at(local));
+    }
+    if (e.blur) l.blur = float(e.blurRadius.at(local));
+    if (e.chromaKey) {
+      l.chromaKey = true;
+      l.keyColor = e.keyColor;
+      l.keyTolerance = e.keyTolerance;
+      l.keySoftness = e.keySoftness;
+    }
+    out.layers.push_back(std::move(l));
+  }
   return out;
 }
 
@@ -133,7 +256,7 @@ class CompositionStage : public Stage, private CompositionOutput {
     switch (ctx_.driver) {
       case Driver::LeadingClip: return std::make_unique<LeadingClipDriver>();
       case Driver::Vsync: return std::make_unique<VsyncDriver>(ctx_);
-      case Driver::Export: return std::make_unique<ExportDriver>(ctx_.exportSettings.fps);
+      case Driver::Export: return std::make_unique<ExportDriver>(ctx_.fpsNum, ctx_.fpsDen);
     }
     return nullptr;
   }
@@ -164,31 +287,36 @@ class CompositionStage : public Stage, private CompositionOutput {
     ended_ = true;
   }
 
-  // Exact seek (§4), for every driver that starts with one: the leading clip's last frame at
-  // or before the target (its first frame, if none is), with every other active clip's latest
-  // frame at that time. While a newer seek is pending (scrubbing), shows whatever is decoded.
+  // Exact seek (§4), for every driver that starts with one: the leading item's last frame at
+  // or before the target (its first frame, if none is), with every other visible item as it is
+  // at that time. While a newer seek is pending (scrubbing), shows whatever is decoded.
   Progress seekStep() {
     FrameSampler& s = sampler_;
     bool scrub = ctx_.hasPendingSeek();
     s.advanceAll(targetUs_);
     if (!s.allExactAt(targetUs_) && !scrub) return Progress::idle();  // the lanes' frame queues wake us
 
-    int lead = s.layout().leadClip(targetUs_);
-    const std::optional<VideoFrame>& head = s.head(Context::laneOf(lead));
+    int lead = s.leadItem(targetUs_);
     std::optional<int64_t> t;
-    if (const VideoFrame* f = s.frameOf(lead)) {
-      t = s.timeOf(*f);
-    } else if (head && head->clip == lead) {
-      t = s.timeOf(*head);  // nothing at or before the target: the first frame after it
-    } else if (s.mayDeliver(lead) && !scrub) {
-      return Progress::idle();
+    if (lead >= 0) {
+      const std::optional<VideoFrame>& head = s.head(ctx_.layout.laneOf(lead));
+      if (const VideoFrame* f = s.frameOf(lead)) {
+        t = s.timeOf(*f);
+      } else if (head && head->item == lead) {
+        t = s.timeOf(*head);  // nothing at or before the target: the first frame after it
+      } else if (s.mayDeliver(lead) && !scrub) {
+        return Progress::idle();
+      }
     }
     if (t && *t > targetUs_) {
       s.advanceAll(*t);
       if (!s.allExactAt(*t) && !scrub) return Progress::idle();
     }
-    ComposedFrame out = s.composeAt(t.value_or(targetUs_));
-    if (out.layerCount == 0) {
+    int64_t at = t.value_or(targetUs_);
+    ComposedFrame out = s.composeAt(at);
+    bool missingVideo = false;
+    for (int i : s.videoAt(at)) missingVideo |= !s.frameOf(i);
+    if (missingVideo && out.layers.empty()) {
       if (!s.done()) return Progress::idle();  // nothing decoded yet, even when scrubbing
       setSeeking(false);
       finish();  // nothing to show: the seek completes without a frame (A5)

@@ -49,7 +49,7 @@ Source: [reqs.md](reqs.md). This spec defines the smallest version that works en
 - `MasterClock`: follows the audio clock when an audio track is playing, otherwise `std::chrono::steady_clock` (§4).
 - `AvSync`: decides for each frame whether to present or drop, and when to present it (§4).
 - `Metrics`: counters and histograms, fed with actual present times from the display. Dumped to the log on `shutdown` and exposed through a query.
-- `TimelineLayout`: where each clip starts and ends on the timeline, which clip leads, and the slide offset and audio gain of a clip at a given time (§2.4).
+- `SceneLayout`: where each item of a scene plays, its lane, and what is visible at a given time with transition offsets and fades (§2.4; scene_graph_spec.md §7). A `Timeline` is turned into a scene of one video track.
 - `Exporter`: the same pipeline with the export driver, writing to an `IExportSink` (§2.5).
 
 **Why C++17.** reqs.md asks for the common logic in C++. The standard is set to C++17 because:

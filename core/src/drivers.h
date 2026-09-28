@@ -6,9 +6,10 @@
 
 namespace mf {
 
-// One output frame per frame of the leading clip (the highest frame rate among the active
-// clips), in timeline order; T3 paces them with AvSync. A frame goes next only once the other
-// lane can't still produce an earlier one, so every other layer is exact at that time.
+// One output frame per frame of the leading video item (the highest frame rate among the
+// visible ones), in timeline order; T3 paces them with AvSync. A frame goes next only once no
+// other lane can still produce an earlier one, so every other layer is exact at that time.
+// Where no video is visible there are no output times, and the last frame stays on screen.
 class LeadingClipDriver : public CompositionDriver {
  public:
   Progress step(FrameSampler&, CompositionOutput&) override;
@@ -37,13 +38,13 @@ class VsyncDriver : public CompositionDriver {
 // Starts at 0 without a seek frame.
 class ExportDriver : public CompositionDriver {
  public:
-  explicit ExportDriver(int fps) : fps_(fps) {}
+  ExportDriver(int fpsNum, int fpsDen) : fpsNum_(fpsNum), fpsDen_(fpsDen) {}
   bool startsWithSeek() const override { return false; }
   void restart() override { index_ = 0; }
   Progress step(FrameSampler&, CompositionOutput&) override;
 
  private:
-  int fps_;
+  int fpsNum_, fpsDen_;
   int64_t index_ = 0;
 };
 

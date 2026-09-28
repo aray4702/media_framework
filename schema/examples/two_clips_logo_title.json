@@ -1,0 +1,62 @@
+{
+  "version": 1,
+  "output": { "width": 1920, "height": 1080, "fps": 30, "sampleRate": 48000, "channels": 2, "background": "#000000" },
+  "tracks": [
+    {
+      "id": "main",
+      "kind": "video",
+      "items": [
+        {
+          "id": "a", "type": "video", "src": "clips/720p24.mp4",
+          "start": 0, "in": 1, "duration": 8,
+          "effects": [{ "type": "colorAdjust", "brightness": 0.05, "contrast": 1.1, "saturation": 1.2 }],
+          "audio": { "gain": { "keys": [[7, 1], [8, 0]] } }
+        },
+        { "type": "transition", "kind": "push", "direction": "left", "duration": 1, "easing": "easeInOut", "audio": "equalPower" },
+        {
+          "id": "b", "type": "video", "src": "clips/1080p30.mp4",
+          "start": 7, "duration": 9,
+          "transform": { "scale": { "keys": [[0, 1], [9, 1.15]] } },
+          "fit": "cover"
+        }
+      ]
+    },
+    {
+      "id": "overlays",
+      "kind": "video",
+      "items": [
+        {
+          "id": "logo", "type": "image", "src": "logo.png",
+          "start": 0, "duration": 16,
+          "transform": { "x": 0.97, "y": 0.04, "anchor": [1, 0], "scale": 0.12 },
+          "opacity": { "keys": [[0, 0], [0.5, 0.9], [15.5, 0.9], [16, 0]] }
+        }
+      ]
+    },
+    {
+      "id": "titles",
+      "kind": "video",
+      "items": [
+        {
+          "id": "title", "type": "text", "text": "Chapter one",
+          "start": 1, "duration": 4,
+          "style": { "font": "system-bold", "size": 0.06, "color": "#ffffff", "box": "#0000008c" },
+          "transform": { "x": 0.5, "y": { "keys": [[0, 1.08, "easeOut"], [0.6, 0.9]] } },
+          "opacity": { "keys": [[3.5, 1], [4, 0]] }
+        }
+      ]
+    },
+    {
+      "id": "music",
+      "kind": "audio",
+      "gain": 0.8,
+      "items": [
+        {
+          "id": "bed", "type": "audio", "src": "music.m4a",
+          "start": 0, "duration": 16,
+          "gain": { "keys": [[0, 0], [1, 0.5], [15, 0.5], [16, 0]], "easing": "easeInOut" }
+        }
+      ]
+    }
+  ]
+}

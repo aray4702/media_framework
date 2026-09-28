@@ -136,6 +136,15 @@ class AvfExportSink : public IExportSink {
     return Result::Ok;
   }
 
+  // Lets the writer stop waiting for audio to interleave with the video still to come.
+  void endAudio() override {
+    if (!audioInput_) return;
+    dispatch_async(audioQueue_, ^{
+      if (!cancelled_ && !failed_) [audioInput_ markAsFinished];
+      audioEnded_ = true;
+    });
+  }
+
   void finish(std::function<void(Result)> done) override {
     finishing_ = true;
     dispatch_async(videoQueue_, ^{
@@ -146,7 +155,7 @@ class AvfExportSink : public IExportSink {
         return;
       }
       [videoInput_ markAsFinished];
-      [audioInput_ markAsFinished];
+      if (!audioEnded_) [audioInput_ markAsFinished];
       [writer_ finishWritingWithCompletionHandler:^{
         if (!cancelled_) {
           if (writer_.status != AVAssetWriterStatusCompleted) NSLog(@"[mf] export failed: %@", writer_.error);
@@ -228,6 +237,7 @@ class AvfExportSink : public IExportSink {
   dispatch_semaphore_t finished_ = dispatch_semaphore_create(0);
   std::atomic<int> queuedVideo_{0}, queuedAudio_{0};
   std::atomic<bool> failed_{false}, cancelled_{false}, finishing_{false};
+  bool audioEnded_ = false;  // audio queue only
 };
 
 }  // namespace

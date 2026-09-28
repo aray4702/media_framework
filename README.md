@@ -35,6 +35,7 @@ The core never calls a platform API directly. To port the player, you write the 
 - **Real-time safe and bounded:** the audio path is lock-free and does not allocate. Every queue is capped by count, bytes and duration.
 - **Built-in metrics:** dropped frames, jank, A/V offset, time to first frame and seek latency, all measured from actual present times.
 - **Composition:** clips play back to back with a horizontal slide (and an audio crossfade) between them, a caption at the bottom, and live brightness and contrast, all drawn in one GPU pass with no extra copy.
+- **Scene graph:** a JSON document of tracks holding video, image, text, color and audio items, with transitions (cut, crossfade, push, slide, wipe), per-item effects (color adjust, chroma key, crop, blur), blend modes, and keyframe animation of any number. See [scene_graph_spec.md](scene_graph_spec.md).
 - **Three output drivers:** leading-clip (one output frame per source frame), vsync (one per display refresh, so slides stay smooth) and export (a fixed frame grid, written to an H.264/AAC MP4 faster than real time).
 
 
@@ -51,6 +52,7 @@ The core never calls a platform API directly. To port the player, you write the 
 | Audio        | AAC-LC, optional. S16 PCM output through a CoreAudio AudioUnit                                                                                                               |
 | API          | `open` (one file or a `Timeline`), `play`, `pause`, `seek`, `setFilter`, `shutdown`, plus `durationUs`, `positionUs` and `metrics` queries                                 |
 | Composition  | Up to 16 clips joined by a slide (left or right) or a cut, with an equal-gain audio crossfade. Captions at the bottom by time range. Brightness and contrast, live             |
+| Scene graph  | Up to 16 tracks and 8 overlapping video/audio items. Video, image, text, color and audio items; keyframes with easing; fit, transform, opacity, blend; effects; audio gain, pan, resampling and `speed` |
 | Drivers      | Leading-clip or vsync while playing (`Auto` picks leading-clip for one clip, vsync for several). Export to MP4 (H.264 + AAC) on a fixed frame grid                             |
 | States       | `Start`, `Ready`, `Play`, `Error`, `Shutdown`                                                                                                                                |
 | A/V sync     | Audio master clock that includes output latency. Falls back to the system clock when there is no audio track or the audio ends first                                         |
@@ -95,6 +97,14 @@ scripts/make_clips.sh --with-4k                                # generate test c
 # Three clips with a 1 s slide between each, and a caption
 ./build/apps/macos-demo/mf_demo --text "Hello" --transition slide-left --transition-ms 1000 \
     clips/720p24.mp4 clips/1080p30.mp4 clips/1080p60.mp4
+```
+
+To play or export a scene document, use `--scene` (the example uses the test clips):
+
+```sh
+./build/apps/macos-demo/mf_demo --scene schema/examples/demo_clips.json                     # play
+./build/apps/macos-demo/mf_demo --scene schema/examples/demo_clips.json --export scene.mp4  # export at its size and rate
+scripts/validate_scene.py schema/examples/demo_clips.json                                   # check a document
 ```
 
 To choose the driver, add `--driver leading` or `--driver vsync`. To export instead of playing, add `--export`:
@@ -159,6 +169,15 @@ player->setFilter({0.0f, 1.0f});  // any time; takes effect on the next frame, o
 
 Clip `i+1` starts one transition before clip `i` ends, so `durationUs()` is the sum of the clips minus the overlaps. `seek` and `positionUs` use timeline time. Set `timeline.driver` to `OutputDriver::LeadingClip` or `OutputDriver::Vsync` to override `Auto`.
 
+For layers, animation and effects, load a scene document instead (scene_graph_spec.md):
+
+```cpp
+mf::Scene scene;
+std::string error;
+if (mf::macos::loadScene("edit.json", &scene, &error) != mf::Result::Ok) { /* error says where and why */ }
+player->open(scene, target);          // or exporter->start(scene, mf::macos::exportTargetFromPath("out.mp4"))
+```
+
 To render a timeline into a file, use an `Exporter` with the same `Timeline`:
 
 ```cpp
@@ -179,11 +198,12 @@ Every API call returns without doing I/O or decoding. Only `shutdown` blocks, wh
 | Path                                           | Contents                                                                                                                                                                                                                               |
 | ---------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | [core/include/mf/](core/include/mf/)           | Public API: [player.h](core/include/mf/player.h), [adapters.h](core/include/mf/adapters.h), [types.h](core/include/mf/types.h), [audio_ring.h](core/include/mf/audio_ring.h), [thread_scheduler.h](core/include/mf/thread_scheduler.h) |
-| [core/src/](core/src/)                         | State machine and stages ([pipeline.cpp](core/src/pipeline.cpp), [composition.cpp](core/src/composition.cpp) and the drivers), [player.cpp](core/src/player.cpp), [exporter.cpp](core/src/exporter.cpp), [timeline.cpp](core/src/timeline.cpp), clock, A/V sync, metrics, bounded queue |
+| [core/src/](core/src/)                         | State machine and stages ([pipeline.cpp](core/src/pipeline.cpp), [composition.cpp](core/src/composition.cpp) and the drivers), [player.cpp](core/src/player.cpp), [exporter.cpp](core/src/exporter.cpp), [scene.cpp](core/src/scene.cpp), [layout.cpp](core/src/layout.cpp), clock, A/V sync, metrics, bounded queue |
 | [core/tests/](core/tests/)                     | Host tests with fake adapters and a deterministic single-threaded scheduler                                                                                                                                                            |
 | [platform/macos/](platform/macos/)             | macOS adapters and the platform factory                                                                                                                                                                                                |
 | [apps/macos-demo/](apps/macos-demo/)           | The demo app                                                                                                                                                                                                                           |
 | [scripts/make_clips.sh](scripts/make_clips.sh) | Generates the test clips                                                                                                                                                                                                               |
+| [scene_graph_spec.md](scene_graph_spec.md), [schema/](schema/) | Scene-graph format (v1): tracks, transitions, effects, keyframes; JSON Schema, example, and the OTIO mapping. [scripts/validate_scene.py](scripts/validate_scene.py) validates a document |
 
 
 ---
@@ -345,7 +365,8 @@ flowchart LR
 | ExportDriver          | [export_driver.cpp](core/src/export_driver.cpp)                 | Fixed `n / fps` grid; waits for every layer's exact frame                    |
 | VideoRenderStage (T3) | [pipeline.cpp](core/src/pipeline.cpp)                           | Complete seeks, A/V sync, present or drop, start and stop output, detect end, redraw on a filter change |
 | AudioStage (T4)       | [pipeline.cpp](core/src/pipeline.cpp)                           | Decode both lanes' AAC, mix on the timeline with the crossfade, write to the ring |
-| TimelineLayout        | [timeline.cpp](core/src/timeline.cpp)                           | Clip start and end times, the leading clip, slide offsets and audio gains    |
+| Scene parser          | [scene.cpp](core/src/scene.cpp), [json.cpp](core/src/json.cpp)   | JSON, the schema's checks and rules R1–R8, R12; keyframes and easing         |
+| SceneLayout           | [layout.cpp](core/src/layout.cpp)                               | Lanes by interval coloring; what's visible at `t` with transition offsets, clips and fades; audio fades |
 | Exporter              | [exporter.cpp](core/src/exporter.cpp)                           | The same pipeline with the export driver, writing to an `IExportSink`        |
 | AvSync                | [av_sync.cpp](core/src/av_sync.cpp)                             | Per-frame present, drop or wait decision on the vsync grid                   |
 | MasterClock           | [master_clock.cpp](core/src/master_clock.cpp)                   | Audio clock, or steady clock when there's no audio or it has ended           |
@@ -359,6 +380,7 @@ flowchart LR
 | AuSpeaker             | [au_speaker.cpp](platform/macos/src/au_speaker.cpp)             | Default-output AudioUnit; the render callback pulls from the ring            |
 | MetalDisplay          | [metal_display.mm](platform/macos/src/metal_display.mm)         | Pending-frame queue drained on each vsync; draws with MetalCompositor        |
 | MetalCompositor       | [metal_compositor.mm](platform/macos/src/metal_compositor.mm)   | One-pass draw of a composed frame: layers (NV12 → RGB, filter), Core Text caption |
+| ImageIoLoader         | [image_loader.mm](platform/macos/src/image_loader.mm)           | Image items: ImageIO into a BGRA `CVPixelBuffer`                             |
 | AvfExportSink         | [avf_export_sink.mm](platform/macos/src/avf_export_sink.mm)     | MetalCompositor into `AVAssetWriter` buffers → H.264; mixed PCM → AAC        |
 
 

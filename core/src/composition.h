@@ -2,14 +2,15 @@
 
 #include <memory>
 #include <optional>
+#include <vector>
 
 #include "pipeline.h"
 
 namespace mf {
 
-// Per-lane view of the decoded frames for the composition stage (§2.4, §2.5): each lane's
-// next frame (`head`) and its latest frame at or before the last output time (`held`).
-// Drivers move the lanes forward to the output times they choose and compose from them.
+// Per-lane view of the decoded frames for the composition stage (§2.5): each lane's next
+// frame (`head`) and each item's latest frame at or before the last output time. Drivers move
+// the lanes forward to the output times they choose, and compose from them.
 class FrameSampler {
  public:
   explicit FrameSampler(Context& ctx) : ctx_(ctx) {}
@@ -18,44 +19,50 @@ class FrameSampler {
   void setSeeking(bool seeking) { seeking_ = seeking; }  // frames replaced while seeking count as decode-only
 
   Context& context() const { return ctx_; }
-  const TimelineLayout& layout() const { return ctx_.layout; }
-  int64_t timeOf(const VideoFrame& f) const { return layout().startUs(f.clip) + f.ptsUs; }
+  const SceneLayout& layout() const { return ctx_.layout; }
+  int lanes() const { return static_cast<int>(lanes_.size()); }
+  int64_t timeOf(const VideoFrame& f) const { return layout().timelineUs(f.item, f.ptsUs); }
 
-  // Takes the lane's next item from its frame queue: a frame into its head, or the end of a clip.
+  // Takes the lane's next item from its frame queue: a frame into its head, or the end of an item.
   bool pop(int lane);
-  // Moves the lane's head to its held frame, unless the frame falls after its clip's end.
+  // Moves the lane's head to its item's latest frame, unless it falls after the item's end.
   void take(int lane);
-  // Consumes every frame the lane has up to t, so its held frame is the latest at or before t.
+  // Consumes every frame the lane has up to t (and any past its item's end).
   void advance(int lane, int64_t t);
   void advanceAll(int64_t t);
 
-  // Whether clip c's frame for t is known: its next frame is later than t, or it has ended.
-  bool exactAt(int clip, int64_t t) const;
-  bool allExactAt(int64_t t) const;
-  // Whether the lane may still deliver frames of clip c (it hasn't moved past it).
-  bool mayDeliver(int clip) const;
+  // Whether video item i's frame for t is known: its next frame is later than t, or it has ended.
+  bool exactAt(int item, int64_t t) const;
+  bool allExactAt(int64_t t) const;  // every video item visible at t
+  bool mayDeliver(int item) const;   // its lane hasn't moved past it
 
-  const VideoFrame* frameOf(int clip) const;  // the clip's held frame, if any
+  const VideoFrame* frameOf(int item) const;
   const std::optional<VideoFrame>& head(int lane) const { return lanes_[lane].head; }
-  // Earliest time the lane's next frame can have: frames come in PTS order per clip.
-  int64_t floorOf(int lane) const;
-  bool done() const;  // every lane has delivered all of its clips
+  int64_t floorOf(int lane) const;  // earliest time the lane's next frame can have
+  bool done() const;                // every lane has delivered all of its items
 
-  // The output frame at t from each active clip's latest frame, outgoing clip first.
+  std::vector<int> videoAt(int64_t t) const;  // video items visible at t, bottom to top
+  int leadItem(int64_t t) const;  // the highest frame rate among them (the upper one on a tie); -1: none
+
+  // The output frame at t: every visible item's layer with its values evaluated at t.
   ComposedFrame composeAt(int64_t t) const;
 
  private:
   struct LaneView {
-    int clip = kNoClip;  // the clip the lane is delivering
-    bool done = true;    // no clips left on this lane
+    std::vector<int> seq;     // the lane's video items, in order
+    std::vector<int> seqPos;  // their positions in layout.laneItems(lane)
+    int pos = 0;              // index into seq of the item being delivered
+    bool done = true;
     std::optional<VideoFrame> head;
-    std::optional<VideoFrame> held;
+    std::vector<VideoFrame> latest;  // per item: its latest taken frame
   };
+  void setup();
 
   Context& ctx_;
   uint32_t serial_ = 0;
   bool seeking_ = false;
-  LaneView lanes_[kLanes];
+  std::vector<LaneView> lanes_;
+  std::vector<int> seqIndex_;  // per item: its index in its lane's seq, or -1
 };
 
 // Where a driver's frames go: to T3, in order.

@@ -46,7 +46,7 @@ struct Packet {
   bool key = false;
   bool eos = false;  // end-of-track marker, carries no data
   uint32_t serial = 0;
-  int clip = 0;  // timeline clip the packet belongs to; ptsUs/dtsUs are in that clip's time
+  int item = 0;  // scene item the packet belongs to; ptsUs/dtsUs are in that item's media time
   std::vector<uint8_t> data;
   size_t bytes() const { return data.size(); }
 };
@@ -70,9 +70,9 @@ struct MediaInfo {
 struct VideoFrame {
   int64_t ptsUs = 0;
   uint32_t serial = 0;
-  int clip = 0;  // ptsUs is in this clip's time
+  int item = 0;  // scene item; ptsUs is in its media time
   bool eos = false;
-  std::shared_ptr<void> image;  // Mac OS: CVPixelBufferRef
+  std::shared_ptr<void> image;  // Mac OS: CVPixelBufferRef (NV12 from the decoder, BGRA for a still image)
   size_t bytes() const { return 0; }
 };
 
@@ -120,20 +120,71 @@ struct ExportTarget {
   std::shared_ptr<void> native;
 };
 
-// One output frame as the display should draw it, built by the composition stage.
+// --- Scene rendering (scene_graph_spec.md §4, §5) ---
+
+struct Color {
+  float r = 0, g = 0, b = 0, a = 1;  // sRGB, straight alpha, 0 to 1
+  bool operator==(const Color& o) const { return r == o.r && g == o.g && b == o.b && a == o.a; }
+};
+
+enum class Fit { Contain, Cover, Fill, None };
+enum class Blend { Normal, Add, Multiply, Screen };
+enum class TextAlign { Left, Center, Right };
+
+struct TextStyle {
+  std::string font = "system";  // "system", "system-bold", or a family name
+  float size = 0.05f;           // line height, as a fraction of the output height
+  Color color{1, 1, 1, 1};
+  TextAlign align = TextAlign::Center;
+  bool hasBox = false;  // a background box behind the text
+  Color box{0, 0, 0, 0.55f};
+  float maxWidth = 0.9f;  // fraction of the output width; longer text wraps
+  bool operator==(const TextStyle& o) const {
+    return font == o.font && size == o.size && color == o.color && align == o.align && hasBox == o.hasBox && box == o.box &&
+           maxWidth == o.maxWidth;
+  }
+};
+
+// One item as drawn in one output frame, with every value evaluated at that frame's time.
+struct ComposedLayer {
+  enum class Kind { Video, Image, Text, Color };
+  Kind kind = Kind::Video;
+  int item = -1;                             // scene item index
+  VideoFrame frame;                          // Video, Image
+  std::shared_ptr<const std::string> text;   // Text
+  TextStyle style;                           // Text
+  Color color;                               // Color: fills the output
+
+  // Geometry (§4.1): fit the (cropped) natural size, then place the anchor at (x, y).
+  Fit fit = Fit::Contain;
+  float x = 0.5f, y = 0.5f;                  // fractions of the output
+  float anchorX = 0.5f, anchorY = 0.5f;      // fractions of the item's box
+  float scale = 1, rotation = 0;             // rotation in degrees, clockwise
+  float offsetX = 0, offsetY = 0;            // transition (push, slide), in output widths / heights
+  float crop[4] = {0, 0, 0, 0};              // left, top, right, bottom fractions removed
+  float clip[4] = {0, 0, 1, 1};              // visible output region x0, y0, x1, y1 (wipe)
+
+  float opacity = 1;
+  Blend blend = Blend::Normal;
+  // Effects (§4.4), applied crop → chromaKey → colorAdjust → blur.
+  float brightness = 0, contrast = 1, saturation = 1;
+  float blur = 0;                            // Gaussian sigma, as a fraction of the output height
+  bool chromaKey = false;
+  Color keyColor;
+  float keyTolerance = 0.15f, keySoftness = 0.1f;
+};
+
+// One output frame as the display (or the export sink) should draw it: layers bottom to top
+// on a canvas of the scene's output size. Playback letterboxes the canvas into the view.
 struct ComposedFrame {
-  struct Layer {
-    VideoFrame frame;
-    float offsetX = 0;  // in output widths, + moves right; each layer is aspect-fit on its own
-  };
   int64_t ptsUs = 0;  // timeline time
   uint32_t serial = 0;
   bool eos = false;
-  int64_t frameDurationUs = 0;  // of the leading clip, for frame pacing
-  int layerCount = 0;           // 1, or 2 during a transition (outgoing first)
-  Layer layers[2];
-  std::shared_ptr<const std::string> text;  // bottom caption, or null
-  VideoFilter filter;
+  int64_t frameDurationUs = 0;  // of the leading item, for frame pacing
+  int width = 0, height = 0;    // canvas
+  Color background;
+  std::vector<ComposedLayer> layers;
+  VideoFilter filter;       // global, applied to video and image layers after their own effects
   int64_t presentAtNs = 0;  // Vsync driver: the vsync this frame was composed for; 0 = paced by AvSync
   size_t bytes() const { return 0; }
 };

@@ -15,13 +15,76 @@ namespace {
 constexpr int64_t kMs = 1000000;              // ns
 constexpr size_t kMaxSampleBytes = 16u << 20;  // A8
 constexpr int kMaxDimension = 8192;            // A8
+constexpr int64_t kReadPastEndUs = 1000000;    // read a little past an item's end, for B-frame reordering
 
-std::string clipName(int clip) { return "clip " + std::to_string(clip + 1) + ": "; }
+// A Timeline (the simple API) as a scene: its clips back to back on one video track, joined by
+// a push (or a cut), and its captions on a second track. Clip durations come from probing.
+Scene sceneFromTimeline(const Timeline& tl, const std::vector<MediaInfo>& infos, const ExportSettings* exportSettings) {
+  Scene s;
+  s.output.width = s.output.height = 0;  // the first clip's size
+  s.output.fpsNum = 0;                   // the first clip's rate
+  s.output.sampleRate = s.output.channels = 0;  // the first clip's audio
+  if (exportSettings) {
+    s.output.width = exportSettings->width;
+    s.output.height = exportSettings->height;
+    s.output.fpsNum = exportSettings->fps;
+  }
+  int n = int(tl.clips.size());
+  int64_t shortest = kNever;
+  for (const MediaInfo& info : infos) shortest = std::min(shortest, info.durationUs);
+  int64_t overlap = n < 2 || tl.transition.kind == TransitionKind::Cut ? 0 : std::clamp<int64_t>(tl.transition.durationUs, 0, shortest / 2);
+
+  SceneTrack video;
+  video.id = "clips";
+  int64_t start = 0;
+  for (int c = 0; c < n; ++c) {
+    SceneItem item;
+    item.id = "clip" + std::to_string(c + 1);
+    item.type = ItemType::Video;
+    item.source = tl.clips[c];
+    item.startUs = start;
+    item.durationUs = infos[c].durationUs;
+    video.items.push_back(item);
+    if (c + 1 < n && overlap > 0) {
+      SceneTransition x;
+      x.from = c;
+      x.kind = SceneTransitionKind::Push;
+      x.direction = tl.transition.kind == TransitionKind::SlideLeft ? Direction::Left : Direction::Right;
+      x.durationUs = overlap;
+      video.transitions.push_back(x);
+    }
+    start += infos[c].durationUs - overlap;
+  }
+  s.tracks.push_back(std::move(video));
+
+  // Captions: bottom center on a dark box. A caption ends where the next one starts.
+  int64_t duration = s.durationUs();
+  std::vector<TextOverlay> texts = tl.texts;
+  std::stable_sort(texts.begin(), texts.end(), [](const TextOverlay& a, const TextOverlay& b) { return a.startUs < b.startUs; });
+  SceneTrack captions;
+  captions.id = "captions";
+  for (size_t k = 0; k < texts.size(); ++k) {
+    int64_t from = texts[k].startUs, to = std::min(texts[k].endUs, duration);
+    if (k + 1 < texts.size()) to = std::min(to, texts[k + 1].startUs);
+    if (to <= from) continue;
+    SceneItem item;
+    item.type = ItemType::Text;
+    item.text = texts[k].text;
+    item.startUs = from;
+    item.durationUs = to - from;
+    item.style.hasBox = true;
+    item.transform.y = Animatable(0.96);
+    item.transform.anchorY = 1;
+    captions.items.push_back(item);
+  }
+  if (!captions.items.empty()) s.tracks.push_back(std::move(captions));
+  return s;
+}
 
 // ---------------------------------------------------------------------------------------
-// T1: probe every clip on open, start seeks, demux. Each lane reads its clip; the lane
-// whose clip ends moves on to clip + 2. Reads whichever track has room and the lowest
-// timeline decode time, so a full queue never stops the other lane or track (§2.3).
+// T1: probe every item on open, start seeks, demux. Each lane reads its items in order; a
+// lane whose item is read to the end moves on to its next one. Reads whichever track has room
+// and the lowest timeline decode time, so a full queue never stops another lane or track (§2.3).
 class SourceStage : public Stage {
  public:
   explicit SourceStage(Context& c) : ctx_(c) {}
@@ -46,87 +109,166 @@ class SourceStage : public Stage {
   }
 
  private:
-  struct LaneState {
-    int clip = kNoClip;
+  struct LaneRead {
+    int pos = kNoItem;  // position in layout.laneItems(lane)
     bool eos[2] = {true, true};
   };
 
-  int clips() const { return static_cast<int>(ctx_.sources.size()); }
+  const SceneLayout& layout() const { return ctx_.layout; }
+  int itemAt(int li) const {
+    const std::vector<int>& list = layout().laneItems(li);
+    return reads_[li].pos < int(list.size()) ? list[reads_[li].pos] : -1;
+  }
+
+  // open(Timeline): the clips' durations place them, so they are probed before the scene exists.
+  bool probeTimeline() {
+    const Timeline& tl = *ctx_.timeline;
+    std::vector<MediaInfo> infos(tl.clips.size());
+    for (size_t c = 0; c < tl.clips.size(); ++c) {
+      preopened_.push_back(ctx_.factory.createDemuxer());
+      Result r = preopened_[c]->open(tl.clips[c], &infos[c]);
+      if (r != Result::Ok) {
+        ctx_.fatal(r, "clip" + std::to_string(c + 1) + ": cannot open media");
+        return false;
+      }
+      if (infos[c].durationUs <= 0) {
+        ctx_.fatal(Result::MalformedMedia, "clip" + std::to_string(c + 1) + ": bad duration");
+        return false;
+      }
+      preinfos_.push_back(infos[c]);
+    }
+    ctx_.scene = sceneFromTimeline(tl, infos, ctx_.driver == Driver::Export ? &ctx_.exportSettings : nullptr);
+    return true;
+  }
 
   void probe() {
-    int n = clips();
-    ctx_.infos.assign(n, MediaInfo{});
-    ctx_.clipAudio.assign(n, 0);
-    std::vector<int64_t> durations;
-    std::optional<TrackInfo> output;  // the audio format the ring and speaker run at
-    for (int c = 0; c < n; ++c) {
-      ctx_.demuxers.push_back(ctx_.factory.createDemuxer());
-      MediaInfo& info = ctx_.infos[c];
-      Result r = ctx_.demuxers[c]->open(ctx_.sources[c], &info);
-      if (r != Result::Ok) return ctx_.fatal(r, clipName(c) + "cannot open media");
-      const TrackInfo& v = info.video;
-      if (!v.supported) return ctx_.fatal(Result::NoDecoder, clipName(c) + "video codec is not H.264");
-      if (v.width <= 0 || v.height <= 0 || v.width > kMaxDimension || v.height > kMaxDimension || v.frameDurationUs <= 0 ||
-          info.durationUs <= 0) {
-        return ctx_.fatal(Result::MalformedMedia, clipName(c) + "bad video dimensions, frame rate or duration");
-      }
-      if (v.rotated) ctx_.events.onWarning(Warning::RotationIgnored, clipName(c) + "track matrix is not identity");
-
-      // Configure once here, so a stream the decoder rejects fails open() and not playback.
-      Lane& lane = ctx_.lanes[Context::laneOf(c)];
-      r = lane.videoDecoder->configure(v, [] {});
-      if (r != Result::Ok) return ctx_.fatal(r, clipName(c) + "video decoder configuration failed");
-
-      if (info.audio) {
-        const TrackInfo& a = *info.audio;
-        if (!a.supported || a.sampleRate <= 0 || a.channels <= 0 || lane.audioDecoder->configure(a) != Result::Ok) {
-          ctx_.events.onWarning(Warning::AudioUnsupported, clipName(c) + "audio is not AAC-LC; the clip plays silent");
-        } else if (output && (a.sampleRate != output->sampleRate || a.channels != output->channels)) {
-          ctx_.events.onWarning(Warning::AudioUnsupported,
-                                clipName(c) + "audio format differs from the first clip with audio; the clip plays silent");
-        } else {
-          if (!output) output = a;
-          ctx_.clipAudio[c] = 1;
-        }
-      }
-      durations.push_back(info.durationUs);
+    if (ctx_.timeline && !probeTimeline()) return;
+    std::string error;
+    if (validateScene(ctx_.scene, &error) != Result::Ok) return ctx_.fatal(Result::InvalidArgument, error);
+    if (!ctx_.layout.build(ctx_.scene, &error)) return ctx_.fatal(Result::Unsupported, error);
+    int n = layout().items();
+    ctx_.items.resize(n);
+    for (size_t c = 0; c < preopened_.size(); ++c) {  // the Timeline's clips are items 0..n-1
+      ctx_.items[c].demuxer = std::move(preopened_[c]);
+      ctx_.items[c].info = preinfos_[c];
     }
-    if (output) ctx_.ring.open(output->sampleRate, output->channels, output->sampleRate / 5);  // 200 ms
+    for (int l = 0; l < layout().lanes(); ++l) {
+      auto lane = std::make_unique<Lane>();
+      lane->videoDecoder = ctx_.factory.createVideoDecoder();
+      lane->audioDecoder = ctx_.factory.createAudioDecoder();
+      lane->videoPackets.setHooks([this] { ctx_.wake(StageId::VideoDecode); }, [this] { ctx_.wake(StageId::Source); });
+      lane->audioPackets.setHooks([this] { ctx_.wake(StageId::Audio); }, [this] { ctx_.wake(StageId::Source); });
+      lane->frames.setHooks([this] { ctx_.wake(StageId::Composition); }, [this] { ctx_.wake(StageId::VideoDecode); });
+      ctx_.lanes.push_back(std::move(lane));
+    }
+    reads_.assign(layout().lanes(), LaneRead{});
+
+    std::optional<std::pair<int, int>> firstAudio;  // rate, channels
+    const TrackInfo* firstVideo = nullptr;
+    const ItemRuntime* firstImage = nullptr;
+    std::unique_ptr<IImageLoader> images;
+    for (int i = 0; i < n; ++i) {
+      const SceneItem& it = layout().item(i);
+      ItemRuntime& rt = ctx_.items[i];
+      std::string name = ctx_.itemName(i) + ": ";
+      if (it.type == ItemType::Text) rt.text = std::make_shared<const std::string>(it.text);
+      if (it.type == ItemType::Image) {
+        if (!images) images = ctx_.factory.createImageLoader();
+        if (!images) return ctx_.fatal(Result::Unsupported, name + "images are not supported on this platform");
+        Result r = images->load(it.source, &rt.image, &rt.imageWidth, &rt.imageHeight);
+        if (r != Result::Ok) return ctx_.fatal(r, name + "cannot load the image");
+        rt.image.item = i;
+        if (!firstImage) firstImage = &rt;
+      }
+      if (!layout().decodable(i)) continue;
+      if (!rt.demuxer) {
+        rt.demuxer = ctx_.factory.createDemuxer();
+        Result r = rt.demuxer->open(it.source, &rt.info);
+        if (r != Result::Ok) return ctx_.fatal(r, name + "cannot open media");
+      }
+      Lane& lane = *ctx_.lanes[layout().laneOf(i)];
+      if (it.inUs >= rt.info.durationUs) return ctx_.fatal(Result::MalformedMedia, name + "`in` is past the end of the file (R10)");
+      if (it.type == ItemType::Video) {
+        const TrackInfo& v = rt.info.video;
+        if (!v.supported) return ctx_.fatal(Result::NoDecoder, name + "video codec is not H.264");
+        if (v.width <= 0 || v.height <= 0 || v.width > kMaxDimension || v.height > kMaxDimension || v.frameDurationUs <= 0) {
+          return ctx_.fatal(Result::MalformedMedia, name + "bad video dimensions or frame rate");
+        }
+        if (v.rotated) ctx_.events.onWarning(Warning::RotationIgnored, name + "track matrix is not identity");
+        // Configure once here, so a stream the decoder rejects fails open() and not playback.
+        Result r = lane.videoDecoder->configure(v, [] {});
+        if (r != Result::Ok) return ctx_.fatal(r, name + "video decoder configuration failed");
+        if (!firstVideo) firstVideo = &v;
+      }
+      bool usable = false;
+      if (rt.info.audio) {
+        const TrackInfo& a = *rt.info.audio;
+        usable = a.supported && a.sampleRate > 0 && a.channels > 0 && lane.audioDecoder->configure(a) == Result::Ok;
+      }
+      if (it.type == ItemType::Audio && !usable) return ctx_.fatal(Result::NoDecoder, name + "has no AAC-LC audio track (R9)");
+      if (it.type == ItemType::Video && rt.info.audio && !usable && !it.mute) {
+        ctx_.events.onWarning(Warning::AudioUnsupported, name + "audio is not AAC-LC; the item plays silent");
+      }
+      rt.mixAudio = usable && !it.mute;
+      if (rt.mixAudio && !firstAudio) firstAudio = std::make_pair(rt.info.audio->sampleRate, rt.info.audio->channels);
+    }
+
+    const SceneOutput& o = ctx_.scene.output;
+    ctx_.width = o.width > 0 ? o.width : firstVideo ? firstVideo->width : firstImage ? firstImage->imageWidth : 1280;
+    ctx_.height = o.height > 0 ? o.height : firstVideo ? firstVideo->height : firstImage ? firstImage->imageHeight : 720;
+    if (o.fpsNum > 0) {
+      ctx_.fpsNum = o.fpsNum;
+      ctx_.fpsDen = o.fpsDen;
+    } else if (firstVideo) {
+      ctx_.fpsNum = 1000000;
+      ctx_.fpsDen = int(firstVideo->frameDurationUs);
+    }
+    bool audio = false;
+    for (const ItemRuntime& rt : ctx_.items) audio |= rt.mixAudio;
+    int rate = o.sampleRate > 0 ? o.sampleRate : firstAudio ? firstAudio->first : 48000;
+    int channels = o.channels > 0 ? o.channels : firstAudio ? std::min(2, firstAudio->second) : 2;
+    if (audio) ctx_.ring.open(rate, channels, rate / 5);  // 200 ms
     if (ctx_.driver == Driver::Export) {
-      Result r = ctx_.exportSink->open(ctx_.exportTarget, ctx_.exportSettings, output ? output->sampleRate : 0,
-                                       output ? output->channels : 0);
+      ExportSettings s = ctx_.exportSettings;
+      s.width = ctx_.width;
+      s.height = ctx_.height;
+      s.fps = int(std::lround(double(ctx_.fpsNum) / ctx_.fpsDen));
+      ctx_.exportSettings = s;
+      Result r = ctx_.exportSink->open(ctx_.exportTarget, s, audio ? rate : 0, audio ? channels : 0);
       if (r != Result::Ok) return ctx_.fatal(r, "cannot create the output file");
-    } else if (output && ctx_.speaker->open(output->sampleRate, output->channels, &ctx_.ring) != Result::Ok) {
+    } else if (audio && ctx_.speaker->open(rate, channels, &ctx_.ring) != Result::Ok) {
       return ctx_.fatal(Result::AudioDeviceFailed, "audio output failed to open");
     }
-    std::vector<int64_t> frameDurations;
-    for (const MediaInfo& info : ctx_.infos) frameDurations.push_back(info.video.frameDurationUs);
-    ctx_.layout.build(durations, ctx_.transition, std::move(frameDurations));
-    ctx_.hasAudio = output.has_value();
-    ctx_.master.setAudio(ctx_.hasAudio);
-    ctx_.durationUs = ctx_.layout.durationUs();
+    if (ctx_.autoDriver) {  // one video and nothing else visual: pace by its frames
+      int visual = 0, video = 0;
+      for (int i = 0; i < n; ++i) {
+        visual += layout().item(i).type != ItemType::Audio;
+        video += layout().item(i).type == ItemType::Video;
+      }
+      ctx_.driver = visual == 1 && video == 1 ? Driver::LeadingClip : Driver::Vsync;
+    }
+    ctx_.hasAudio = audio;
+    ctx_.master.setAudio(audio);
+    ctx_.durationUs = layout().durationUs();
     ctx_.probed = true;
     ctx_.requestSeek(0);  // preroll the first frame (A16)
   }
 
-  // Both clips around the target are read: the one playing and the next one, which is
-  // either already in its transition or starts after this one ends.
+  // Each lane starts at its first item that hasn't ended by the target: the one playing, or
+  // the next one, which is read ahead.
   void startSeek(PendingSeek seek) {
-    for (Lane& lane : ctx_.lanes) {
-      lane.videoPackets.flush();
-      lane.audioPackets.flush();
+    for (auto& lane : ctx_.lanes) {
+      lane->videoPackets.flush();
+      lane->audioPackets.flush();
     }
-    int first = ctx_.layout.firstActive(seek.targetUs);
-    for (int c : {first, first + 1}) {
-      int li = Context::laneOf(c);
-      LaneState& lane = lanes_[li];
-      seek.laneClip[li] = c;
-      lane.clip = c;
-      lane.eos[kVideo] = lane.eos[kAudio] = true;
-      if (c >= clips()) continue;
-      Result r = ctx_.demuxers[c]->seekTo(std::max<int64_t>(0, seek.targetUs - ctx_.layout.startUs(c)));
-      if (r != Result::Ok) return ctx_.fatal(r, clipName(c) + "seek failed");
-      lane.eos[kVideo] = lane.eos[kAudio] = false;
+    seek.lanePos.assign(layout().lanes(), 0);
+    for (int li = 0; li < layout().lanes(); ++li) {
+      const std::vector<int>& list = layout().laneItems(li);
+      int pos = 0;
+      while (pos < int(list.size()) && layout().item(list[pos]).endUs() <= seek.targetUs) ++pos;
+      reads_[li] = LaneRead{};
+      reads_[li].pos = seek.lanePos[li] = pos;
+      if (pos < int(list.size()) && !begin(li, seek.targetUs)) return;
     }
     ctx_.setSeekTarget(seek);
     serial_ = ctx_.serial + 1;
@@ -134,54 +276,61 @@ class SourceStage : public Stage {
     ctx_.wakeAll();
   }
 
-  // A lane whose clip is fully read moves on to its next clip.
+  // Positions the lane's item at timeline time t (its start, or later when seeking into it).
+  bool begin(int li, int64_t t) {
+    int i = itemAt(li);
+    ItemRuntime& rt = ctx_.items[i];
+    Result r = rt.demuxer->seekTo(layout().mediaUs(i, t));
+    if (r != Result::Ok) {
+      ctx_.fatal(r, ctx_.itemName(i) + ": seek failed");
+      return false;
+    }
+    reads_[li].eos[kVideo] = layout().item(i).type != ItemType::Video;
+    reads_[li].eos[kAudio] = !rt.info.audio;  // read (and maybe drop) audio when the file has it
+    return true;
+  }
+
+  // A lane whose item is fully read moves on to its next item.
   bool advanceLanes() {
-    for (LaneState& lane : lanes_) {
-      if (lane.clip >= clips() || !lane.eos[kVideo] || !lane.eos[kAudio]) continue;
-      lane.clip += kLanes;
-      if (lane.clip >= clips()) return true;
-      Result r = ctx_.demuxers[lane.clip]->seekTo(0);
-      if (r != Result::Ok) {
-        ctx_.fatal(r, clipName(lane.clip) + "seek failed");
-        return false;
-      }
-      lane.eos[kVideo] = lane.eos[kAudio] = false;
+    for (int li = 0; li < layout().lanes(); ++li) {
+      LaneRead& lane = reads_[li];
+      if (itemAt(li) < 0 || !lane.eos[kVideo] || !lane.eos[kAudio]) continue;
+      ++lane.pos;
+      int i = itemAt(li);
+      if (i >= 0) begin(li, layout().item(i).startUs);
       return true;
     }
     return false;
   }
 
-  // Audio packets are read (to keep the demuxer's tracks balanced) but dropped when audio is off.
+  // Audio packets are read (to keep the demuxer's tracks balanced) but dropped when not mixed.
   BoundedQueue<Packet>* queueFor(int li, int track) {
-    if (track == kVideo) return &ctx_.lanes[li].videoPackets;
-    return ctx_.hasAudio ? &ctx_.lanes[li].audioPackets : nullptr;
+    if (track == kVideo) return &ctx_.lanes[li]->videoPackets;
+    return ctx_.hasAudio ? &ctx_.lanes[li]->audioPackets : nullptr;
   }
 
   Progress readOne() {
     int bestLane = -1, bestTrack = kVideo;
     int64_t bestDts = 0;
-    for (int li = 0; li < kLanes; ++li) {
-      const LaneState& lane = lanes_[li];
-      if (lane.clip >= clips()) continue;
+    for (int li = 0; li < layout().lanes(); ++li) {
+      int i = itemAt(li);
+      if (i < 0) continue;
       for (int track : {kVideo, kAudio}) {
-        if (lane.eos[track]) continue;
+        if (reads_[li].eos[track]) continue;
         BoundedQueue<Packet>* q = queueFor(li, track);
         if (q && q->full()) continue;
-        if (track == kAudio && !ctx_.infos[lane.clip].audio) {
-          pushEos(li, track);
-          return Progress::did();
-        }
         int64_t dts = 0;
-        Result r = ctx_.demuxers[lane.clip]->peekDtsUs(track, &dts);
+        Result r = ctx_.items[i].demuxer->peekDtsUs(track, &dts);
+        if (r == Result::Ok && layout().timelineUs(i, dts) > layout().item(i).endUs() + kReadPastEndUs) r = Result::Eos;
         if (r == Result::Eos) {
           pushEos(li, track);
           return Progress::did();
         }
         if (r != Result::Ok) {
-          ctx_.fatal(r, clipName(lane.clip) + "demux failed");
+          ctx_.fatal(r, ctx_.itemName(i) + ": demux failed");
           return Progress::idle();
         }
-        dts += ctx_.layout.startUs(lane.clip);
+        dts = layout().timelineUs(i, dts);
         if (bestLane < 0 || dts < bestDts) {
           bestLane = li;
           bestTrack = track;
@@ -191,71 +340,73 @@ class SourceStage : public Stage {
     }
     if (bestLane < 0) return Progress::idle();  // queues full or every lane ended
 
-    int clip = lanes_[bestLane].clip;
+    int i = itemAt(bestLane);
     Packet p;
-    Result r = ctx_.demuxers[clip]->read(bestTrack, &p);
+    Result r = ctx_.items[i].demuxer->read(bestTrack, &p);
     if (r == Result::Eos) {
       pushEos(bestLane, bestTrack);
       return Progress::did();
     }
     if (r != Result::Ok || p.data.size() > kMaxSampleBytes) {
-      ctx_.fatal(Result::MalformedMedia, clipName(clip) + "bad sample");
+      ctx_.fatal(Result::MalformedMedia, ctx_.itemName(i) + ": bad sample");
       return Progress::idle();
     }
     p.serial = serial_;
-    p.clip = clip;
-    bool keep = bestTrack == kVideo || ctx_.clipAudio[clip];
+    p.item = i;
+    bool keep = bestTrack == kVideo || ctx_.items[i].mixAudio;
     if (BoundedQueue<Packet>* q = queueFor(bestLane, bestTrack); q && keep) q->tryPush(p);  // has room: checked above
     return Progress::did();
   }
 
-  // Also marks the end of a clip whose audio is dropped, so T4 knows the lane moved on.
+  // The end of an item's track, so T2 (video) or T4 (mixed audio) knows the lane moved on.
   void pushEos(int li, int track) {
-    LaneState& lane = lanes_[li];
-    lane.eos[track] = true;
-    if (BoundedQueue<Packet>* q = queueFor(li, track)) {
-      Packet eos;
-      eos.track = track;
-      eos.eos = true;
-      eos.serial = serial_;
-      eos.clip = lane.clip;
-      q->tryPush(eos);
-    }
+    reads_[li].eos[track] = true;
+    int i = itemAt(li);
+    bool marked = track == kVideo ? layout().item(i).type == ItemType::Video : ctx_.items[i].mixAudio;
+    BoundedQueue<Packet>* q = queueFor(li, track);
+    if (!marked || !q) return;
+    Packet eos;
+    eos.track = track;
+    eos.eos = true;
+    eos.serial = serial_;
+    eos.item = i;
+    q->tryPush(eos);
   }
 
   Context& ctx_;
   bool opened_ = false;
-  LaneState lanes_[kLanes];
+  std::vector<LaneRead> reads_;
+  std::vector<std::unique_ptr<IDemuxer>> preopened_;  // open(Timeline): the clips, probed first
+  std::vector<MediaInfo> preinfos_;
   uint32_t serial_ = 0;
 };
 
 // ---------------------------------------------------------------------------------------
 // T2: per lane, packets into the decoder, frames (PTS order) into the lane's frame queue.
-// A lane's next clip reconfigures the decoder once the previous clip has drained.
+// A lane's next item reconfigures the decoder once the previous item has drained.
 class VideoDecodeStage : public Stage {
  public:
   explicit VideoDecodeStage(Context& c) : ctx_(c) {}
 
   Progress pump() override {
     if (ctx_.halted || !ctx_.probed) return Progress::idle();
+    if (lanes_.size() != ctx_.lanes.size()) lanes_.resize(ctx_.lanes.size());
     bool did = false;
-    for (int li = 0; li < kLanes && !ctx_.halted; ++li) did |= pumpLane(li);
+    for (size_t li = 0; li < lanes_.size() && !ctx_.halted; ++li) did |= pumpLane(lanes_[li], *ctx_.lanes[li]);
     return did && !ctx_.halted ? Progress::did() : Progress::idle();
   }
 
  private:
   struct LaneState {
     uint32_t serial = 0;
-    int clip = -1;         // the clip the decoder is configured for
+    int item = -1;         // the item the decoder is configured for
     bool drained = true;   // nothing left in the decoder, so it can be reconfigured
     std::optional<Packet> input;
     std::optional<VideoFrame> output;
     bool skipToKey = false, eosSent = false;
   };
 
-  bool pumpLane(int li) {
-    LaneState& st = lanes_[li];
-    Lane& lane = ctx_.lanes[li];
+  bool pumpLane(LaneState& st, Lane& lane) {
     uint32_t serial = ctx_.serial;
     if (serial != st.serial) {
       st.serial = serial;
@@ -277,7 +428,7 @@ class VideoDecodeStage : public Stage {
       switch (lane.videoDecoder->dequeue(&f)) {
         case Result::Ok:
           if (f.serial == st.serial) {
-            f.clip = st.clip;
+            f.item = st.item;
             st.output = std::move(f);
           }
           did = true;
@@ -288,7 +439,7 @@ class VideoDecodeStage : public Stage {
             st.output = VideoFrame{};
             st.output->eos = true;
             st.output->serial = st.serial;
-            st.output->clip = st.clip;
+            st.output->item = st.item;
           }
           break;
         case Result::CorruptFrame:  // hold the last good frame; skip to the next keyframe (A14)
@@ -299,7 +450,7 @@ class VideoDecodeStage : public Stage {
         case Result::Again:
           break;
         default:
-          ctx_.fatal(Result::DecoderFailed, clipName(st.clip) + "video decoder failed");
+          ctx_.fatal(Result::DecoderFailed, ctx_.itemName(st.item) + ": video decoder failed");
           return false;
       }
     }
@@ -319,14 +470,14 @@ class VideoDecodeStage : public Stage {
       if (p.serial != st.serial) return true;
       st.input = std::move(p);
     }
-    if (st.input->clip != st.clip) {
-      if (!st.drained) return did;  // the previous clip's last frames are still coming out
-      Result r = lane.videoDecoder->configure(ctx_.infos[st.input->clip].video, [this] { ctx_.wake(StageId::VideoDecode); });
+    if (st.input->item != st.item) {
+      if (!st.drained) return did;  // the previous item's last frames are still coming out
+      Result r = lane.videoDecoder->configure(ctx_.items[st.input->item].info.video, [this] { ctx_.wake(StageId::VideoDecode); });
       if (r != Result::Ok) {
-        ctx_.fatal(r, clipName(st.input->clip) + "video decoder configuration failed");
+        ctx_.fatal(r, ctx_.itemName(st.input->item) + ": video decoder configuration failed");
         return false;
       }
-      st.clip = st.input->clip;
+      st.item = st.input->item;
       st.skipToKey = st.eosSent = false;
     }
     if (st.input->eos) {
@@ -353,13 +504,13 @@ class VideoDecodeStage : public Stage {
         st.input.reset();
         return true;
       default:
-        ctx_.fatal(Result::DecoderFailed, clipName(st.clip) + "video decoder failed");
+        ctx_.fatal(Result::DecoderFailed, ctx_.itemName(st.item) + ": video decoder failed");
         return false;
     }
   }
 
   Context& ctx_;
-  LaneState lanes_[kLanes];
+  std::vector<LaneState> lanes_;
 };
 
 // ---------------------------------------------------------------------------------------
@@ -585,15 +736,18 @@ class VideoRenderStage : public Stage {
 };
 
 // ---------------------------------------------------------------------------------------
-// T4: decode each lane's audio and mix it on the timeline into the ring the speaker pulls
-// from. During a transition the outgoing clip fades out while the incoming one fades in.
-// Clips without usable audio, and gaps in a track, are silence.
+// T4: decode each lane's audio and mix every sounding item on the timeline (spec §5.2) into
+// the ring the speaker pulls from (or the export sink). Each item is read from its decoded
+// samples at its own media time, `in + (t − start) × speed`, with linear interpolation, so
+// sample-rate conversion, speed and trims fall out of one rule. Gain, pan and transition
+// fades are evaluated at each chunk's ends and ramped across it.
 class AudioStage : public Stage {
  public:
   explicit AudioStage(Context& c) : ctx_(c) {}
 
   Progress pump() override {
     if (ctx_.halted || !ctx_.hasAudio) return Progress::idle();
+    if (lanes_.empty()) setup();
     uint32_t serial = ctx_.serial;
     if (serial != serial_) restart(serial);
     if (serial_ == 0) return Progress::idle();  // the preroll seek hasn't started yet
@@ -622,20 +776,20 @@ class AudioStage : public Stage {
       ctx_.ring.markEos();
       eosMarked_ = true;
       if (ctx_.driver == Driver::Export) {
+        // A writer that interleaves tracks can hold the video until it has audio past it;
+        // saying the audio is complete lets the last video through.
+        ctx_.exportSink->endAudio();
         ctx_.audioWritten = true;
         ctx_.wake(StageId::VideoRender);
       }
       return Progress::did();
     }
 
-    // Every clip with audio in the next chunk must be decoded that far, or have ended.
+    // Every item sounding in the next chunk must be decoded that far, or have ended.
     int64_t chunkEnd = std::min(cursor_ + kChunkFrames, endSample_);
-    for (int c = 0; c < ctx_.layout.clips() && startSample(c) < chunkEnd; ++c) {
-      if (!ctx_.clipAudio[c] || endSample(c) <= cursor_) continue;
-      int li = Context::laneOf(c);
-      const LaneMix& lane = lanes_[li];
-      if (lane.clip > c || (lane.clip == c && lane.coveredTo >= std::min(chunkEnd, endSample(c)))) continue;
-      return pull(li);
+    double t0 = double(cursor_) / rate_, t1 = double(chunkEnd) / rate_;
+    for (int i : sounding(t0, t1)) {
+      if (!ready(i, t1)) return pull(ctx_.layout.laneOf(i));
     }
     mix(chunkEnd);
     return Progress::did();
@@ -644,106 +798,198 @@ class AudioStage : public Stage {
  private:
   static constexpr int64_t kChunkFrames = 1024;
 
-  struct Segment {
-    int clip;
-    int64_t start;  // timeline sample of the first frame
-    std::vector<int16_t> pcm;
-  };
+  // Decoded audio of the lane's current item, in the item's media samples at its own rate.
   struct LaneMix {
-    int clip = kNoClip;     // the clip the lane is delivering; earlier ones are finished
-    int64_t coveredTo = 0;  // timeline sample up to which that clip's audio is decoded
-    int64_t nextStart = -1;  // where the clip's next packet continues, once one is decoded
-    std::deque<Segment> segments;
+    std::vector<int> seq;     // the lane's mixed items, in order
+    std::vector<int> seqPos;  // their positions in layout.laneItems(lane)
+    int pos = 0;              // index into seq of the item being delivered
+    bool ended = false;       // its audio has all been decoded
+    int decoderItem = -1;
+    int rate = 0, channels = 0;
+    int64_t bufStart = 0;     // media sample index of buf's first frame
+    std::vector<float> buf;   // interleaved
+    int64_t nextStart = -1;   // where the next packet continues, once one is decoded
+    int item() const { return pos < int(seq.size()) ? seq[pos] : -1; }
+    int64_t bufEnd() const { return channels ? bufStart + int64_t(buf.size()) / channels : bufStart; }
   };
 
-  int64_t toSample(int64_t us) const { return us * ctx_.ring.sampleRate() / 1000000; }
-  int64_t toUs(int64_t sample) const { return sample * 1000000 / ctx_.ring.sampleRate(); }
-  int64_t startSample(int c) const { return toSample(ctx_.layout.startUs(c)); }
-  int64_t endSample(int c) const { return toSample(ctx_.layout.endUs(c)); }
-  int64_t frames(const Segment& s) const { return static_cast<int64_t>(s.pcm.size()) / ctx_.ring.channels(); }
+  const SceneLayout& layout() const { return ctx_.layout; }
+  int64_t toUs(int64_t sample) const { return sample * 1000000 / rate_; }
+
+  void setup() {
+    rate_ = ctx_.ring.sampleRate();
+    outChannels_ = ctx_.ring.channels();
+    lanes_.resize(layout().lanes());
+    seqIndex_.assign(layout().items(), -1);
+    for (int li = 0; li < layout().lanes(); ++li) {
+      const std::vector<int>& list = layout().laneItems(li);
+      for (int k = 0; k < int(list.size()); ++k) {
+        if (!ctx_.items[list[k]].mixAudio) continue;
+        seqIndex_[list[k]] = int(lanes_[li].seq.size());
+        lanes_[li].seq.push_back(list[k]);
+        lanes_[li].seqPos.push_back(k);
+      }
+    }
+  }
 
   void restart(uint32_t serial) {
     serial_ = serial;
     PendingSeek target = ctx_.seekTarget();
-    for (int li = 0; li < kLanes; ++li) {
-      ctx_.lanes[li].audioDecoder->flush();
-      lanes_[li] = LaneMix{};
-      lanes_[li].clip = target.laneClip[li];
-      if (lanes_[li].clip < ctx_.layout.clips()) lanes_[li].coveredTo = startSample(lanes_[li].clip);
+    for (int li = 0; li < int(lanes_.size()); ++li) {
+      ctx_.lanes[li]->audioDecoder->flush();
+      LaneMix& lane = lanes_[li];
+      lane.pos = 0;
+      while (lane.pos < int(lane.seq.size()) && lane.seqPos[lane.pos] < target.lanePos[li]) ++lane.pos;
+      resetBuffer(lane);
     }
-    cursor_ = toSample(target.targetUs);  // exact seek: nothing before the target is mixed
-    endSample_ = toSample(ctx_.layout.durationUs());
+    cursor_ = std::llround(double(target.targetUs) * rate_ / 1e6);  // exact seek: nothing before the target is mixed
+    endSample_ = std::llround(double(layout().durationUs()) * rate_ / 1e6);
     ctx_.ring.flush(target.targetUs, serial_);
     chunk_.clear();
     eosMarked_ = false;
   }
 
+  static void resetBuffer(LaneMix& lane) {
+    lane.ended = false;
+    lane.buf.clear();
+    lane.bufStart = 0;
+    lane.nextStart = -1;
+  }
+
+  // Mixed items sounding somewhere in [t0, t1) seconds.
+  std::vector<int> sounding(double t0, double t1) const {
+    std::vector<int> out;
+    for (int i = 0; i < layout().items(); ++i) {
+      const SceneItem& it = layout().item(i);
+      if (ctx_.items[i].mixAudio && it.startUs / 1e6 < t1 && it.endUs() / 1e6 > t0) out.push_back(i);
+    }
+    return out;
+  }
+
+  // Media sample position of item i at timeline time t (seconds), at the item's source rate.
+  double sourcePos(int i, double t, int rate) const {
+    const SceneItem& it = layout().item(i);
+    return (it.inUs / 1e6 + (t - it.startUs / 1e6) * it.speed) * rate;
+  }
+
+  bool ready(int i, double t1) {
+    LaneMix& lane = lanes_[layout().laneOf(i)];
+    int k = seqIndex_[i];
+    while (k > lane.pos && lane.ended) {  // the lane's earlier item is done: move on
+      ++lane.pos;
+      resetBuffer(lane);
+    }
+    if (k < lane.pos) return true;  // already finished
+    if (k > lane.pos) return false;
+    if (lane.ended) return true;
+    if (!lane.rate) return false;
+    double end = std::min(t1, layout().item(i).endUs() / 1e6);
+    return lane.bufEnd() >= int64_t(std::ceil(sourcePos(i, end, lane.rate))) + 2;
+  }
+
   Progress pull(int li) {
     LaneMix& lane = lanes_[li];
     Packet p;
-    if (!ctx_.lanes[li].audioPackets.tryPop(&p)) return Progress::idle();
+    if (!ctx_.lanes[li]->audioPackets.tryPop(&p)) return Progress::idle();
     if (p.serial != serial_) return Progress::did();
+    int k = seqIndex_[p.item];
+    if (k < lane.pos) return Progress::did();  // an item the mix is already past
+    while (k > lane.pos) {  // the previous item ended (its end marker came first)
+      ++lane.pos;
+      resetBuffer(lane);
+    }
     if (p.eos) {
-      lane.clip = p.clip + kLanes;
-      lane.nextStart = -1;
-      if (lane.clip < ctx_.layout.clips()) lane.coveredTo = startSample(lane.clip);
+      lane.ended = true;
       return Progress::did();
     }
-    if (p.clip != lane.clip) {
-      lane.clip = p.clip;
-      lane.nextStart = -1;
-      lane.coveredTo = startSample(p.clip);
-    }
-    IAudioDecoder& decoder = *ctx_.lanes[li].audioDecoder;
-    if (decoderClip_[li] != p.clip) {
-      if (decoder.configure(*ctx_.infos[p.clip].audio) != Result::Ok) {
-        ctx_.fatal(Result::DecoderFailed, clipName(p.clip) + "audio decoder configuration failed");
+    const TrackInfo& format = *ctx_.items[p.item].info.audio;
+    IAudioDecoder& decoder = *ctx_.lanes[li]->audioDecoder;
+    if (lane.decoderItem != p.item) {
+      if (decoder.configure(format) != Result::Ok) {
+        ctx_.fatal(Result::DecoderFailed, ctx_.itemName(p.item) + ": audio decoder configuration failed");
         return Progress::idle();
       }
-      decoderClip_[li] = p.clip;
+      lane.decoderItem = p.item;
     }
     PcmBuffer pcm;
     Result r = decoder.decode(p, &pcm);  // on CorruptFrame, pcm is silence (A14)
     if (r == Result::CorruptFrame) {
       ctx_.metrics.countCorrupt();
     } else if (r != Result::Ok) {
-      ctx_.fatal(Result::DecoderFailed, clipName(p.clip) + "audio decoder failed");
+      ctx_.fatal(Result::DecoderFailed, ctx_.itemName(p.item) + ": audio decoder failed");
       return Progress::idle();
     }
-    Segment s{p.clip, startSample(p.clip) + std::llround(double(pcm.ptsUs) * ctx_.ring.sampleRate() / 1e6),
-              std::move(pcm.samples)};
-    // Timestamps are rounded (to 1 us here, often coarser in the file): packets within 1 ms
-    // of each other are one continuous stream, so rounding never doubles or drops a sample.
-    if (lane.nextStart >= 0 && std::llabs(s.start - lane.nextStart) <= ctx_.ring.sampleRate() / 1000) s.start = lane.nextStart;
-    int64_t end = s.start + frames(s);
-    lane.nextStart = end;
-    lane.coveredTo = std::max(lane.coveredTo, end);
-    if (end > cursor_ && s.start < endSample(s.clip)) lane.segments.push_back(std::move(s));
+    lane.rate = format.sampleRate;
+    lane.channels = format.channels;
+    append(lane, pcm);
     return Progress::did();
   }
 
-  // Sums the clips over [cursor_, chunkEnd), each cut to its time on the timeline and
-  // scaled by its transition gain.
+  // Adds a decoded packet to the lane's buffer. Timestamps are rounded (to 1 us here, often
+  // coarser in the file): packets within 1 ms of each other are one continuous stream, so
+  // rounding never doubles or drops a sample.
+  static void append(LaneMix& lane, const PcmBuffer& pcm) {
+    int ch = lane.channels;
+    int64_t frames = int64_t(pcm.samples.size()) / ch;
+    int64_t start = std::llround(double(pcm.ptsUs) * lane.rate / 1e6);
+    if (lane.nextStart >= 0 && std::llabs(start - lane.nextStart) <= lane.rate / 1000) start = lane.nextStart;
+    lane.nextStart = start + frames;
+    if (lane.buf.empty()) lane.bufStart = start;
+    int64_t skip = std::max<int64_t>(0, lane.bufEnd() - start);  // overlaps what's there: keep the first
+    if (start > lane.bufEnd()) lane.buf.resize(size_t(start - lane.bufStart) * ch, 0.0f);  // a gap: silence
+    for (int64_t f = skip; f < frames; ++f) {
+      for (int c = 0; c < ch; ++c) lane.buf.push_back(float(pcm.samples[size_t(f) * ch + c]));
+    }
+  }
+
+  // Sums the sounding items over [cursor_, chunkEnd), each cut to its time on the timeline.
   void mix(int64_t chunkEnd) {
-    int channels = ctx_.ring.channels();
-    std::vector<float> sum(size_t(chunkEnd - cursor_) * channels, 0.0f);
-    for (LaneMix& lane : lanes_) {
-      for (const Segment& s : lane.segments) {
-        int64_t from = std::max({s.start, cursor_, startSample(s.clip)});
-        int64_t to = std::min({s.start + frames(s), chunkEnd, endSample(s.clip)});
-        for (int64_t i = from; i < to; ++i) {
-          float gain = ctx_.layout.gain(s.clip, toUs(i));
-          const int16_t* in = &s.pcm[size_t(i - s.start) * channels];
-          float* out = &sum[size_t(i - cursor_) * channels];
-          for (int ch = 0; ch < channels; ++ch) out[ch] += gain * float(in[ch]);
+    int n = int(chunkEnd - cursor_);
+    std::vector<float> sum(size_t(n) * outChannels_, 0.0f);
+    double t0 = double(cursor_) / rate_, t1 = double(chunkEnd) / rate_;
+    for (int i : sounding(t0, t1)) {
+      LaneMix& lane = lanes_[layout().laneOf(i)];
+      if (lane.item() != i || lane.buf.empty()) continue;
+      const SceneItem& it = layout().item(i);
+      const SceneTrack& track = layout().trackOf(i);
+      auto gainAt = [&](double t) {
+        int64_t us = std::clamp<int64_t>(std::llround(t * 1e6), it.startUs, it.endUs());
+        return track.gain * it.gain.at(us - it.startUs) * layout().transitionGain(i, us);
+      };
+      double g0 = gainAt(t0), g1 = gainAt(t1);
+      double p0 = it.pan.at(std::llround(t0 * 1e6) - it.startUs), p1 = it.pan.at(std::llround(t1 * 1e6) - it.startUs);
+      int ch = lane.channels;
+      int64_t frames = int64_t(lane.buf.size()) / ch;
+      for (int j = 0; j < n; ++j) {
+        double t = double(cursor_ + j) / rate_;
+        if (t * 1e6 < it.startUs || t * 1e6 >= it.endUs()) continue;
+        double x = sourcePos(i, t, lane.rate) - double(lane.bufStart);
+        int64_t k = int64_t(std::floor(x));
+        if (k < 0 || k >= frames) continue;
+        double frac = x - double(k);
+        int64_t k1 = std::min(k + 1, frames - 1);
+        const float* a = &lane.buf[size_t(k) * ch];
+        const float* b = &lane.buf[size_t(k1) * ch];
+        double left = a[0] + (b[0] - a[0]) * frac;
+        double right = ch > 1 ? a[1] + (b[1] - a[1]) * frac : left;
+        double w = double(j) / n;
+        double g = g0 + (g1 - g0) * w, pan = p0 + (p1 - p0) * w;
+        float* out = &sum[size_t(j) * outChannels_];
+        if (outChannels_ == 1) {
+          out[0] += float(g * (left + right) / 2);
+        } else {
+          out[0] += float(g * std::min(1.0, 1 - pan) * left);
+          out[1] += float(g * std::min(1.0, 1 + pan) * right);
         }
       }
-      while (!lane.segments.empty() && lane.segments.front().start + frames(lane.segments.front()) <= chunkEnd) {
-        lane.segments.pop_front();
-      }
+      // Drop what the mix has passed (keep one frame for interpolation).
+      int64_t keep = std::max<int64_t>(0, int64_t(std::floor(sourcePos(i, t1, lane.rate))) - 1 - lane.bufStart);
+      keep = std::min(keep, frames);
+      lane.buf.erase(lane.buf.begin(), lane.buf.begin() + size_t(keep) * ch);
+      lane.bufStart += keep;
     }
     chunk_.resize(sum.size());
-    for (size_t i = 0; i < sum.size(); ++i) chunk_[i] = static_cast<int16_t>(std::clamp(std::lround(sum[i]), -32768L, 32767L));
+    for (size_t k = 0; k < sum.size(); ++k) chunk_[k] = static_cast<int16_t>(std::clamp(std::lround(sum[k]), -32768L, 32767L));
     offset_ = 0;
     chunkStart_ = cursor_;
     cursor_ = chunkEnd;
@@ -751,11 +997,12 @@ class AudioStage : public Stage {
 
   Context& ctx_;
   uint32_t serial_ = 0;
-  LaneMix lanes_[kLanes];
-  int decoderClip_[kLanes] = {-1, -1};
-  int64_t cursor_ = 0, endSample_ = 0;  // timeline samples
-  int64_t chunkStart_ = 0;               // timeline sample of chunk_'s first frame
-  std::vector<int16_t> chunk_;          // mixed, not yet fully written to the ring
+  int rate_ = 48000, outChannels_ = 2;
+  std::vector<LaneMix> lanes_;
+  std::vector<int> seqIndex_;           // per item: its index in its lane's seq, or -1
+  int64_t cursor_ = 0, endSample_ = 0;  // timeline samples at the output rate
+  int64_t chunkStart_ = 0;              // timeline sample of chunk_'s first frame
+  std::vector<int16_t> chunk_;          // mixed, not yet fully written
   int offset_ = 0;
   bool eosMarked_ = false;
 };
@@ -770,13 +1017,6 @@ Context::Context(PlatformFactory& f, PipelineEvents& ev, bool forExport)
       display(forExport ? nullptr : f.createDisplay()),
       exportSink(forExport ? f.createExportSink() : nullptr),
       scheduler(f.createScheduler()) {
-  for (Lane& lane : lanes) {
-    lane.videoDecoder = f.createVideoDecoder();
-    lane.audioDecoder = f.createAudioDecoder();
-    lane.videoPackets.setHooks([this] { wake(StageId::VideoDecode); }, [this] { wake(StageId::Source); });
-    lane.audioPackets.setHooks([this] { wake(StageId::Audio); }, [this] { wake(StageId::Source); });
-    lane.frames.setHooks([this] { wake(StageId::Composition); }, [this] { wake(StageId::VideoDecode); });
-  }
   composed.setHooks([this] { wake(StageId::VideoRender); }, [this] { wake(StageId::Composition); });
 }
 
@@ -784,11 +1024,10 @@ void Context::wakeAll() {
   for (int i = 0; i < kStageCount; ++i) wake(static_cast<StageId>(i));
 }
 
-std::shared_ptr<const std::string> Context::captionAt(int64_t timelineUs) const {
-  for (const Caption& c : captions) {
-    if (timelineUs >= c.startUs && timelineUs < c.endUs) return c.text;
-  }
-  return nullptr;
+std::string Context::itemName(int item) const {
+  if (item < 0 || item >= layout.items()) return "item";
+  const std::string& id = layout.item(item).id;
+  return id.empty() ? "item " + std::to_string(item + 1) : id;
 }
 
 VideoFilter Context::filter() const {
@@ -806,7 +1045,7 @@ void Context::setFilter(const VideoFilter& f) {
 
 void Context::requestSeek(int64_t targetUs) {
   std::lock_guard<std::mutex> lock(seekMu_);
-  pending_ = PendingSeek{targetUs, hostClock.nowNs()};
+  pending_ = PendingSeek{targetUs, hostClock.nowNs(), {}};
   hasPending_ = true;
 }
 

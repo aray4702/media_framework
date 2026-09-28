@@ -8,6 +8,7 @@
 //   --text "caption"               caption at the bottom for the whole timeline
 //   --transition slide-left|slide-right|cut   (default slide-left)
 //   --transition-ms N              slide length (default 1000)
+//   --scene file.json              play (or export) a scene document instead of clips
 //   --driver auto|vsync|leading    what sets the output times while playing (default auto)
 //   --export out.mp4               render the timeline into a file instead of playing it
 //   --size WxH, --fps N            export size (default 1920x1080) and frame rate (default 30)
@@ -58,6 +59,7 @@ struct Options {
   mf::Transition transition;
   mf::OutputDriver driver = mf::OutputDriver::Auto;
   NSString* exportPath = nil;
+  NSString* scenePath = nil;
   mf::ExportSettings exportSettings;
   BOOL autotest = NO;
   double playSeconds = 8;
@@ -137,7 +139,8 @@ static int64_t nowNs() { return mf::macos::hostNowNs(); }
 - (void)applicationDidFinishLaunching:(NSNotification*)note {
   [self buildWindow];
   _timer = [NSTimer scheduledTimerWithTimeInterval:1.0 / 30 target:self selector:@selector(tick) userInfo:nil repeats:YES];
-  if (_options.paths.count) [self openPaths:_options.paths];
+  if (_options.scenePath) [self openScene:_options.scenePath];
+  else if (_options.paths.count) [self openPaths:_options.paths];
 }
 
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication*)app {
@@ -218,6 +221,21 @@ static int64_t nowNs() { return mf::macos::hostNowNs(); }
   NSMutableArray<NSString*>* paths = [NSMutableArray array];
   for (NSURL* url in panel.URLs) [paths addObject:url.path];
   [self openPaths:paths];
+}
+
+- (void)openScene:(NSString*)path {
+  if (_player) _player->shutdown();
+  _player = mf::Player::create(*_platform, _listener.get());
+  _statusLabel.stringValue = path.lastPathComponent;
+  _statusLabel.textColor = NSColor.labelColor;
+  mf::Scene scene;
+  std::string error;
+  mf::Result r = mf::macos::loadScene(path.UTF8String, &scene, &error);
+  if (r == mf::Result::Ok) {
+    r = _player->open(scene, mf::macos::targetFromView((__bridge void*)_video), _options.driver, &error);
+    _player->setFilter([self currentFilter]);
+  }
+  if (r != mf::Result::Ok) [self failed:[NSString stringWithFormat:@"%s: %s", mf::toString(r), error.c_str()]];
 }
 
 - (void)openPaths:(NSArray<NSString*>*)paths {
@@ -393,14 +411,23 @@ static int exportTimeline(const Options& o) {
   } waiter;
   auto platform = mf::macos::createPlatform();
   auto exporter = mf::Exporter::create(*platform, &waiter);
-  mf::Timeline timeline;
-  for (NSString* path in o.paths) timeline.clips.push_back(mf::macos::sourceFromPath(path.UTF8String));
-  timeline.transition = o.transition;
-  if (o.text) timeline.texts.push_back({o.text.UTF8String});
   int64_t startNs = mf::macos::hostNowNs();
-  mf::Result r = exporter->start(timeline, mf::macos::exportTargetFromPath(o.exportPath.UTF8String), o.exportSettings);
+  mf::ExportTarget target = mf::macos::exportTargetFromPath(o.exportPath.UTF8String);
+  mf::Result r;
+  std::string error;
+  if (o.scenePath) {  // the scene's size and frame rate
+    mf::Scene scene;
+    r = mf::macos::loadScene(o.scenePath.UTF8String, &scene, &error);
+    if (r == mf::Result::Ok) r = exporter->start(scene, target, o.exportSettings, &error);
+  } else {
+    mf::Timeline timeline;
+    for (NSString* path in o.paths) timeline.clips.push_back(mf::macos::sourceFromPath(path.UTF8String));
+    timeline.transition = o.transition;
+    if (o.text) timeline.texts.push_back({o.text.UTF8String});
+    r = exporter->start(timeline, target, o.exportSettings);
+  }
   if (r != mf::Result::Ok) {
-    std::printf("ERROR %s\n", mf::toString(r));
+    std::printf("ERROR %s %s\n", mf::toString(r), error.c_str());
     return 1;
   }
   while (dispatch_semaphore_wait(waiter.done, dispatch_time(DISPATCH_TIME_NOW, 500 * NSEC_PER_MSEC)) != 0) {
@@ -435,6 +462,9 @@ int main(int argc, const char** argv) {
         options.driver = [value isEqualToString:@"vsync"]     ? mf::OutputDriver::Vsync
                          : [value isEqualToString:@"leading"] ? mf::OutputDriver::LeadingClip
                                                               : mf::OutputDriver::Auto;
+        ++i;
+      } else if ([arg isEqualToString:@"--scene"] && value) {
+        options.scenePath = value;
         ++i;
       } else if ([arg isEqualToString:@"--export"] && value) {
         options.exportPath = value;

@@ -26,6 +26,8 @@ class Exporter {
 
   // Returns at once; probing, decoding and encoding run on the pipeline threads.
   Result start(const Timeline&, const ExportTarget&, const ExportSettings&);
+  // Size and frame rate come from scene.output; `settings` gives the bitrates.
+  Result start(const Scene&, const ExportTarget&, const ExportSettings& settings = {}, std::string* error = nullptr);
   Result shutdown();  // cancels an export in progress and joins the threads; idempotent
 
   double progress() const;  // 0 to 1, by video frames written

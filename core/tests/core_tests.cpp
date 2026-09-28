@@ -1,9 +1,13 @@
+#include <cmath>
+#include <fstream>
+#include <sstream>
 #include <thread>
 
 #include "../src/av_sync.h"
 #include "../src/bounded_queue.h"
 #include "../src/master_clock.h"
-#include "../src/timeline.h"
+#include "../src/json.h"
+#include "../src/layout.h"
 #include "fakes.h"
 #include "test.h"
 
@@ -387,36 +391,17 @@ TEST(player_decoder_failure_during_seek_goes_to_error) {
 
 // --- Composition --------------------------------------------------------------------------
 
-TEST(timeline_layout_overlaps_clips_by_the_transition) {
-  TimelineLayout l;
-  l.build({2000000, 3000000, 2000000}, {TransitionKind::SlideLeft, 1000000});
-  CHECK_EQ(l.transitionUs(), 1000000);
-  CHECK_EQ(l.startUs(1), 1000000);
-  CHECK_EQ(l.startUs(2), 3000000);
-  CHECK_EQ(l.durationUs(), 5000000);
-  CHECK_EQ(l.firstActive(1500000), 0);
-  CHECK_EQ(l.lastActive(1500000), 1);
-  CHECK_EQ(l.firstActive(2000000), 1);
-  CHECK_EQ(l.firstActive(9000000), 2);
-  // Mid-transition, sliding left: the outgoing clip is half out, the incoming one half in.
-  CHECK(l.offsetX(0, 1500000) == -0.5f);
-  CHECK(l.offsetX(1, 1500000) == 0.5f);
-  CHECK(l.offsetX(1, 2500000) == 0.0f);
-  CHECK(l.gain(0, 1250000) == 0.75f);
-  CHECK(l.gain(1, 1250000) == 0.25f);
-  CHECK(l.gain(1, 2500000) == 1.0f);
-  CHECK(l.gain(0, 2000000) == 0.0f);
+static std::string textOf(const ComposedFrame& f) {
+  for (const ComposedLayer& l : f.layers) {
+    if (l.kind == ComposedLayer::Kind::Text) return *l.text;
+  }
+  return "";
+}
 
-  l.build({2000000, 600000}, {TransitionKind::SlideRight, 1000000});
-  CHECK_EQ(l.transitionUs(), 300000);  // at most half the shortest clip
-  CHECK_EQ(l.durationUs(), 2300000);
-  CHECK(l.offsetX(0, 1850000) == 0.5f);
-  CHECK(l.offsetX(1, 1850000) == -0.5f);
-
-  l.build({1000000, 1000000}, {TransitionKind::Cut, 1000000});
-  CHECK_EQ(l.transitionUs(), 0);
-  CHECK_EQ(l.durationUs(), 2000000);
-  CHECK(l.offsetX(1, 1000000) == 0.0f);
+static int videoLayers(const ComposedFrame& f) {
+  int n = 0;
+  for (const ComposedLayer& l : f.layers) n += l.kind == ComposedLayer::Kind::Video;
+  return n;
 }
 
 static std::vector<fake::Clip> clips(int n, int64_t durationUs, bool audio = true) {
@@ -433,18 +418,18 @@ TEST(composition_seek_into_a_transition_shows_both_clips) {
   CHECK(h.open(t) == Result::Ok);
   h.run(20);
   CHECK_EQ(h.player->durationUs(), 3000000);
-  CHECK_EQ(h.lastComposed().layerCount, 1);
+  CHECK_EQ(h.lastComposed().layers.size(), size_t(1));
 
   h.player->seek(1500000);
   h.run(50);
   CHECK_EQ(h.listener.seeks.back(), 1500000);
   const ComposedFrame& f = h.lastComposed();
   CHECK_EQ(f.ptsUs, 1500000);
-  CHECK_EQ(f.layerCount, 2);
-  CHECK_EQ(f.layers[0].frame.clip, 0);  // outgoing, at 1.5 s of its own time
+  CHECK_EQ(f.layers.size(), size_t(2));
+  CHECK_EQ(f.layers[0].frame.item, 0);  // outgoing, at 1.5 s of its own time
   CHECK_EQ(f.layers[0].frame.ptsUs, 1500000);
   CHECK(f.layers[0].offsetX == -0.5f);
-  CHECK_EQ(f.layers[1].frame.clip, 1);  // incoming, 0.5 s into it
+  CHECK_EQ(f.layers[1].frame.item, 1);  // incoming, 0.5 s into it
   CHECK_EQ(f.layers[1].frame.ptsUs, 500000);
   CHECK(f.layers[1].offsetX == 0.5f);
 }
@@ -469,13 +454,13 @@ TEST(composition_plays_through_a_transition_with_an_audio_crossfade) {
   int64_t prev = -1;
   bool ordered = true;
   for (const ComposedFrame& f : h.platform.display->composed) {
-    if (f.layerCount == 2) ++transitionFrames;
+    if (f.layers.size() == 2) ++transitionFrames;
     ordered &= f.ptsUs > prev;
     prev = f.ptsUs;
   }
   CHECK(ordered);
   CHECK(transitionFrames >= 28);  // 1 s at 30 fps
-  CHECK_EQ(h.lastComposed().layers[0].frame.clip, 1);
+  CHECK_EQ(h.lastComposed().layers[0].frame.item, 1);
 
   // Both clips play a constant level, and their gains sum to 1: the crossfade is seamless.
   const std::vector<int16_t>& heard = h.platform.speaker->heard;
@@ -514,13 +499,13 @@ TEST(composition_reuses_a_lane_for_the_third_clip) {
   CHECK_EQ(h.listener.ended, 1);
   CHECK(h.player->metrics().presented >= 70);
   CHECK_EQ(h.player->metrics().lateDrops, 0);
-  CHECK_EQ(h.lastComposed().layers[0].frame.clip, 2);
+  CHECK_EQ(h.lastComposed().layers[0].frame.item, 2);
 
   h.player->seek(2000000);
   h.run(50);
   CHECK_EQ(h.listener.seeks.back(), 2000000);
-  CHECK_EQ(h.lastComposed().layerCount, 1);
-  CHECK_EQ(h.lastComposed().layers[0].frame.clip, 2);
+  CHECK_EQ(h.lastComposed().layers.size(), size_t(1));
+  CHECK_EQ(h.lastComposed().layers[0].frame.item, 2);
   CHECK_EQ(h.lastComposed().layers[0].frame.ptsUs, 500000);
 }
 
@@ -534,7 +519,7 @@ TEST(composition_cut_has_no_overlap) {
   h.player->play();
   h.run(2500);
   CHECK_EQ(h.listener.ended, 1);
-  for (const ComposedFrame& f : h.platform.display->composed) CHECK_EQ(f.layerCount, 1);
+  for (const ComposedFrame& f : h.platform.display->composed) CHECK(f.layers.size() <= 1);
 }
 
 TEST(composition_shows_captions_in_their_time_range) {
@@ -545,10 +530,10 @@ TEST(composition_shows_captions_in_their_time_range) {
   h.run(20);
   h.player->seek(500000);
   h.run(50);
-  CHECK(h.lastComposed().text && *h.lastComposed().text == "hello");
+  CHECK(textOf(h.lastComposed()) == "hello");
   h.player->seek(1500000);
   h.run(50);
-  CHECK(!h.lastComposed().text);
+  CHECK(textOf(h.lastComposed()).empty());
 }
 
 TEST(composition_filter_applies_at_once_even_when_paused) {
@@ -602,7 +587,7 @@ static int transitionFramesShown(std::vector<fake::Clip> c, OutputDriver driver,
   CHECK_EQ(h->listener.ended, 1);
   CHECK_EQ(h->player->metrics().lateDrops, 0);
   int n = 0;
-  for (const ComposedFrame& f : h->platform.display->composed) n += f.layerCount == 2;
+  for (const ComposedFrame& f : h->platform.display->composed) n += f.layers.size() == 2;
   if (keep) *keep = h.get();
   return n;
 }
@@ -618,7 +603,7 @@ TEST(driver_vsync_moves_the_slide_every_refresh) {
   fake::Harness* h = nullptr;
   CHECK(transitionFramesShown(clips(2, 2000000), OutputDriver::Vsync, &h) >= 57);  // 60 Hz, 30 fps clips
   for (const ComposedFrame& f : h->platform.display->composed) {
-    CHECK(f.presentAtNs == 0 || f.layerCount < 2 || std::abs(f.layers[1].offsetX - (1.0 - (f.ptsUs - 1000000) / 1e6)) < 1e-3);
+    CHECK(f.presentAtNs == 0 || f.layers.size() < 2 || std::abs(f.layers[1].offsetX - (1.0 - (f.ptsUs - 1000000) / 1e6)) < 1e-3);
   }
 }
 
@@ -664,12 +649,13 @@ TEST(export_writes_every_grid_frame_with_exact_layers) {
   for (size_t n = 0; n < sink.video.size(); ++n) {
     const ComposedFrame& f = sink.video[n];
     CHECK_EQ(f.ptsUs, int64_t(n) * 1000000 / 24);
-    transition += f.layerCount == 2;
-    for (int i = 0; i < f.layerCount; ++i) {
-      int64_t start = f.layers[i].frame.clip == 0 ? 0 : 1000000;
+    transition += videoLayers(f) == 2;
+    for (size_t i = 0; i < f.layers.size(); ++i) {
+      if (f.layers[i].kind != ComposedLayer::Kind::Video) continue;
+      int64_t start = f.layers[i].frame.item == 0 ? 0 : 1000000;
       CHECK_EQ(f.layers[i].frame.ptsUs, latestFrameAt(f.ptsUs - start, 30));
     }
-    CHECK_EQ(bool(f.text), f.ptsUs < 500000);
+    CHECK_EQ(!textOf(f).empty(), f.ptsUs < 500000);
   }
   CHECK_EQ(transition, 24);
   CHECK_EQ(sink.audioFrames, int64_t{3 * 48000});
@@ -697,6 +683,301 @@ TEST(export_rejects_bad_settings_and_missing_support) {
   CHECK(h.start(Timeline{}, slow) == Result::InvalidArgument);
   fake::ExportHarness none(clips(1, 1000000), false);
   CHECK(none.start(Timeline{}, ExportSettings{}) == Result::Unsupported);
+}
+
+// --- Scene graph ----------------------------------------------------------------------------
+
+TEST(json_parses_values_and_reports_errors) {
+  json::Value v;
+  std::string error;
+  CHECK(json::parse(R"({"a": [1, -2.5e3, true, null], "b": "caf\u00e9 \ud83d\ude00\n"})", &v, &error));
+  CHECK(v.find("a")->array[1].number == -2500);
+  CHECK(v.find("b")->string == "caf\xc3\xa9 \xf0\x9f\x98\x80\n");
+  CHECK(!json::parse("{\"a\": 1,}", &v, &error));
+  CHECK(error.find("line 1") == 0);
+  CHECK(!json::parse("{\"a\": 1, \"a\": 2}", &v, &error) && error.find("duplicate key") != std::string::npos);
+  CHECK(!json::parse(std::string(100, '['), &v, &error) && error.find("nested too deeply") != std::string::npos);
+  CHECK(!json::parse("\"\\ud800\"", &v, &error));
+  CHECK(!json::parse("01", &v, &error));
+}
+
+// src "clipN" plays fake clip N.
+static MediaSource resolveClip(const std::string& src) { return fake::clipSource(std::atoi(src.c_str() + 4)); }
+
+static Scene sceneFrom(const std::string& text) {
+  Scene scene;
+  std::string error;
+  Result r = parseScene(text, resolveClip, &scene, &error);
+  if (r != Result::Ok) std::fprintf(stderr, "  scene error: %s\n", error.c_str());
+  CHECK(r == Result::Ok);
+  return scene;
+}
+
+// A document with one video track holding `items`.
+static std::string doc(const std::string& items, const std::string& output = R"({"width": 640, "height": 360, "fps": 30})") {
+  return R"({"version": 1, "output": )" + output + R"(, "tracks": [{"kind": "video", "items": [)" + items + "]}]}";
+}
+
+TEST(scene_parses_the_example_document) {
+  std::string path = std::string(__FILE__).substr(0, std::string(__FILE__).rfind("core/tests/")) + "schema/examples/two_clips_logo_title.json";
+  std::ifstream file(path);
+  std::stringstream text;
+  text << file.rdbuf();
+  Scene scene;
+  std::string error;
+  CHECK(parseScene(text.str(), [](const std::string&) { return MediaSource{}; }, &scene, &error) == Result::Ok);
+  CHECK_EQ(scene.tracks.size(), size_t(4));
+  CHECK_EQ(scene.durationUs(), 16000000);
+  const SceneTrack& main = scene.tracks[0];
+  CHECK_EQ(main.items.size(), size_t(2));
+  CHECK_EQ(main.transitions.size(), size_t(1));
+  CHECK(main.transitions[0].kind == SceneTransitionKind::Push && main.transitions[0].audio == AudioFade::EqualPower);
+  CHECK_EQ(main.items[0].inUs, 1000000);
+  CHECK(main.items[0].effects.colorAdjust && main.items[0].effects.saturation.value == 1.2);
+  CHECK(main.items[1].fit == Fit::Cover);
+  CHECK_EQ(scene.tracks[1].items[0].opacity.keys.size(), size_t(4));
+  CHECK(scene.tracks[2].items[0].style.hasBox && scene.tracks[2].items[0].style.size == 0.06f);
+  CHECK(!scene.tracks[3].video && scene.tracks[3].gain == 0.8f);
+}
+
+TEST(scene_rejects_invalid_documents_with_a_reason) {
+  const std::string red = R"("type": "color", "color": "#ff0000")";
+  struct Case {
+    std::string text, reason;
+  };
+  std::vector<Case> cases = {
+      {"{", "not valid JSON"},
+      {doc("{" + red + R"(, "start": 0, "duration": 2}, {)" + red + R"(, "start": 1, "duration": 2})"), "without a transition"},
+      {doc("{" + red + R"(, "start": 0, "duration": 2}, {"type": "transition", "kind": "crossfade", "duration": 1}, {)" + red +
+           R"(, "start": 1.5, "duration": 2})"),
+       "must start exactly"},
+      {doc(R"({"type": "transition", "kind": "crossfade", "duration": 1}, {)" + red + R"(, "start": 0, "duration": 2})"), "sit between"},
+      {doc("{" + red + R"(, "start": 0, "duration": 2, "opacity": {"keys": [[1, 0], [0.5, 1]]}})"), "key times must increase"},
+      {doc("{" + red + R"(, "start": 0, "duration": 2, "opacity": 1.5})"), "between 0 and 1"},
+      {doc("{" + red + R"(, "start": 0, "duration": 2, "colour": "#fff"})"), "unknown field 'colour'"},
+      {doc("{" + red + R"(, "start": 0, "duration": 2})", R"({"width": 641, "height": 360, "fps": 30})"), "even"},
+      {doc("{" + red + R"(, "id": "a", "start": 0, "duration": 1}, {)" + red + R"(, "id": "a", "start": 1, "duration": 1})"), "used twice"},
+      {doc("{" + red + R"(, "start": 0, "duration": 2, "effects": [{"type": "blur", "radius": 0.01}, {"type": "blur", "radius": 0.02}]})"),
+       "at most one blur"},
+      {doc("{" + red + R"(, "start": 0, "duration": 4}, {"type": "transition", "kind": "push", "duration": 3}, {)" + red +
+           R"(, "start": 1, "duration": 4})"),
+       "longer than half"},
+      {doc("{" + red + R"(, "start": 0, "duration": 2, "opacity": {"keys": [[0, 0, "bounce"]]}})"), "must be one of"},
+      {doc("{" + red + R"(, "start": "1/0", "duration": 2})"), "num/den"},
+      {doc(R"({"type": "audio", "src": "clip0", "start": 0, "duration": 2})"), "must be one of video, image"},
+      {doc(""), "nothing to play"},
+  };
+  for (const Case& c : cases) {
+    Scene scene;
+    std::string error;
+    Result r = parseScene(c.text, resolveClip, &scene, &error);
+    bool ok = r == Result::InvalidArgument && error.find(c.reason) != std::string::npos;
+    if (!ok) std::fprintf(stderr, "  expected '%s', got '%s'\n", c.reason.c_str(), error.c_str());
+    CHECK(ok);
+  }
+}
+
+TEST(scene_easing_and_keyframes) {
+  CHECK(Easing{}.apply(0.25) == 0.25);
+  CHECK(Easing{Easing::Kind::Hold}.apply(0.99) == 0);
+  CHECK(std::abs(Easing::bezier(0.42f, 0, 0.58f, 1).apply(0.5) - 0.5) < 1e-6);  // easeInOut is symmetric
+  CHECK(Easing::bezier(0.42f, 0, 1, 1).apply(0.5) < 0.4);                         // easeIn starts slow
+  CHECK(std::abs(Easing::bezier(0, 0, 1, 1).apply(0.3) - 0.3) < 1e-6);
+  Animatable a;
+  a.keys = {{0, 0, std::nullopt}, {1000000, 10, Easing{Easing::Kind::Hold}}, {2000000, 20, std::nullopt}};
+  CHECK(a.at(-5) == 0);
+  CHECK(a.at(500000) == 5);
+  CHECK(a.at(1500000) == 10);  // held until the next key
+  CHECK(a.at(2000000) == 20);
+  CHECK(a.at(9000000) == 20);
+}
+
+TEST(scene_layout_assigns_lanes_by_overlap) {
+  Scene stacked = sceneFrom(R"({"version": 1, "output": {"width": 640, "height": 360, "fps": 30}, "tracks": [
+      {"kind": "video", "items": [{"type": "video", "src": "clip0", "start": 0, "duration": 2}]},
+      {"kind": "video", "items": [{"type": "video", "src": "clip1", "start": 0.5, "duration": 1}]},
+      {"kind": "video", "items": [{"type": "video", "src": "clip2", "start": 1, "duration": 1}]},
+      {"kind": "audio", "items": [{"type": "audio", "src": "clip0", "start": 5, "duration": 1}]}]})");
+  SceneLayout layout;
+  std::string error;
+  CHECK(layout.build(stacked, &error));
+  CHECK_EQ(layout.lanes(), 3);  // three videos at once; the later audio reuses a lane
+  CHECK_EQ(layout.laneOf(3), 0);
+  Scene apart = sceneFrom(doc(R"({"type": "video", "src": "clip0", "start": 0, "duration": 1},
+                                  {"type": "video", "src": "clip1", "start": 3, "duration": 1},
+                                  {"type": "video", "src": "clip2", "start": 6, "duration": 1})"));
+  CHECK(layout.build(apart, &error));
+  CHECK_EQ(layout.lanes(), 1);
+  std::string tooMany = R"({"version": 1, "output": {"width": 640, "height": 360, "fps": 30}, "tracks": [)";
+  for (int i = 0; i < 9; ++i) tooMany += std::string(i ? "," : "") + R"({"kind": "video", "items": [{"type": "video", "src": "clip0", "start": 0, "duration": 1}]})";
+  CHECK(layout.build(sceneFrom(tooMany + "]}"), &error) == false);
+  CHECK(error.find("more than 8") != std::string::npos);
+}
+
+TEST(scene_composites_three_stacked_videos) {
+  fake::Harness h(clips(3, 2000000));
+  Scene scene = sceneFrom(R"({"version": 1, "output": {"width": 640, "height": 360, "fps": 30}, "tracks": [
+      {"kind": "video", "items": [{"type": "video", "src": "clip0", "start": 0, "duration": 2}]},
+      {"kind": "video", "items": [{"type": "video", "src": "clip1", "start": 0, "duration": 2,
+        "transform": {"x": 0.8, "y": 0.2, "scale": 0.3}}]},
+      {"kind": "video", "items": [{"type": "video", "src": "clip2", "start": 0, "duration": 2, "fit": "cover",
+        "transform": {"x": 0.2, "scale": {"keys": [[0, 0.2], [2, 0.4]]}},
+        "effects": [{"type": "colorAdjust", "saturation": 0}]}]}]})");
+  CHECK(h.openScene(scene) == Result::Ok);
+  h.run(20);
+  CHECK(h.player->state() == State::Ready);
+  h.player->seek(1000000);
+  h.run(50);
+  const ComposedFrame& f = h.lastComposed();
+  CHECK_EQ(f.width, 640);
+  CHECK_EQ(f.layers.size(), size_t(3));
+  for (int i = 0; i < 3; ++i) {
+    CHECK_EQ(f.layers[i].item, i);  // bottom to top
+    CHECK_EQ(f.layers[i].frame.ptsUs, 1000000);
+  }
+  CHECK(f.layers[1].x == 0.8f && f.layers[1].scale == 0.3f);
+  CHECK(std::abs(f.layers[2].scale - 0.3f) < 1e-6 && f.layers[2].fit == Fit::Cover && f.layers[2].saturation == 0);
+  h.player->play();
+  h.run(2500);
+  CHECK_EQ(h.listener.ended, 1);
+  MetricsReport m = h.player->metrics();
+  CHECK_EQ(m.lateDrops, 0);
+  CHECK_EQ(m.lateLayers, 0);
+  for (const ComposedFrame& c : h.platform.display->composed) CHECK_EQ(c.layers.size(), size_t(3));
+}
+
+TEST(scene_draws_image_text_and_color_items) {
+  fake::Harness h;
+  Scene scene = sceneFrom(R"({"version": 1, "output": {"width": 640, "height": 360, "fps": 30, "background": "#102030"}, "tracks": [
+      {"kind": "video", "items": [{"type": "color", "color": "#ff000080", "start": 0, "duration": 2}]},
+      {"kind": "video", "opacity": 0.5, "items": [{"type": "image", "src": "logo.png", "start": 0, "duration": 2,
+        "opacity": {"keys": [[0, 0], [1, 1]]}, "blend": "screen"}]},
+      {"kind": "video", "items": [{"type": "text", "text": "Hi", "start": 0.25, "duration": 1,
+        "style": {"size": 0.1, "align": "left", "box": "#000000"}}]}]})");
+  CHECK(h.openScene(scene) == Result::Ok);
+  h.run(20);
+  h.player->seek(500000);
+  h.run(50);
+  const ComposedFrame& f = h.lastComposed();
+  CHECK(f.background == (Color{16 / 255.f, 32 / 255.f, 48 / 255.f, 1}));
+  CHECK_EQ(f.layers.size(), size_t(3));
+  CHECK(f.layers[0].kind == ComposedLayer::Kind::Color && std::abs(f.layers[0].color.a - 128 / 255.f) < 1e-6);
+  CHECK(f.layers[1].kind == ComposedLayer::Kind::Image && f.layers[1].frame.image && f.layers[1].blend == Blend::Screen);
+  CHECK(std::abs(f.layers[1].opacity - 0.25f) < 1e-6);  // half-way up its fade, on a half-opacity track
+  CHECK(f.layers[2].kind == ComposedLayer::Kind::Text && *f.layers[2].text == "Hi" && f.layers[2].fit == Fit::None);
+  CHECK(f.layers[2].style.hasBox && f.layers[2].style.align == TextAlign::Left);
+  h.player->seek(1500000);
+  h.run(50);
+  CHECK_EQ(h.lastComposed().layers.size(), size_t(2));  // the text has ended
+  h.player->play();
+  h.run(1000);
+  CHECK_EQ(h.listener.ended, 1);  // no video or audio: the steady clock runs to the end
+}
+
+TEST(scene_transitions_crossfade_slide_and_wipe) {
+  fake::Harness h;
+  auto item = [](const char* color, double start) {
+    return std::string(R"({"type": "color", "color": ")") + color + R"(", "start": )" + std::to_string(start) + R"(, "duration": 2})";
+  };
+  Scene scene = sceneFrom(doc(item("#ff0000", 0) + R"(, {"type": "transition", "kind": "crossfade", "duration": 1}, )" +
+                              item("#00ff00", 1) + R"(, {"type": "transition", "kind": "slide", "direction": "up", "duration": 1}, )" +
+                              item("#0000ff", 2) + R"(, {"type": "transition", "kind": "wipe", "direction": "right", "duration": 1}, )" +
+                              item("#ffffff", 3)));
+  CHECK(h.openScene(scene) == Result::Ok);
+  h.run(20);
+  auto at = [&](int64_t t) -> const ComposedFrame& {
+    h.player->seek(t);
+    h.run(30);
+    return h.lastComposed();
+  };
+  const ComposedFrame& fade = at(1500000);
+  CHECK_EQ(fade.layers.size(), size_t(2));
+  CHECK(fade.layers[0].opacity == 1 && std::abs(fade.layers[1].opacity - 0.5f) < 1e-6);
+  const ComposedFrame& slide = at(2500000);
+  CHECK(slide.layers[0].offsetY == 0 && std::abs(slide.layers[1].offsetY - 0.5f) < 1e-6);  // coming up from below
+  const ComposedFrame& wipe = at(3250000);
+  CHECK(wipe.layers[1].clip[0] == 0 && std::abs(wipe.layers[1].clip[2] - 0.25f) < 1e-6);   // revealed from the left
+}
+
+TEST(scene_speed_and_in_map_to_media_time) {
+  fake::Harness h;
+  CHECK(h.openScene(sceneFrom(doc(R"({"type": "video", "src": "clip0", "start": 0, "duration": 0.5, "in": 0.5, "speed": 2})"))) ==
+        Result::Ok);
+  h.run(20);
+  h.player->seek(250000);
+  h.run(50);
+  CHECK_EQ(h.lastComposed().layers[0].frame.ptsUs, 1000000);  // 0.5 + 0.25 × 2
+}
+
+TEST(scene_mixes_resampled_audio_with_gain_and_pan) {
+  std::vector<fake::Clip> c = clips(1, 2000000);
+  c[0].sampleRate = 44100;  // mixed into 48 kHz
+  fake::Harness h(c);
+  Scene scene = sceneFrom(R"({"version": 1, "output": {"width": 640, "height": 360, "fps": 30, "sampleRate": 48000}, "tracks": [
+      {"kind": "audio", "items": [{"type": "audio", "src": "clip0", "start": 0, "duration": 1, "gain": 0.5, "pan": 1}]}]})");
+  CHECK(h.openScene(scene) == Result::Ok);
+  h.run(20);
+  h.player->play();
+  h.run(1500);
+  CHECK_EQ(h.listener.ended, 1);
+  const std::vector<int16_t>& heard = h.platform.speaker->heard;
+  int64_t right = 0;
+  bool leftSilent = true, level = true;
+  for (size_t k = 0; k + 1 < heard.size(); k += 2) {
+    leftSilent &= heard[k] == 0;
+    if (heard[k + 1] != 0) {
+      ++right;
+      level &= heard[k + 1] >= 49 && heard[k + 1] <= 51;
+    }
+  }
+  CHECK(leftSilent);
+  CHECK(level);                                    // no gaps or doubled samples from resampling
+  CHECK(right >= 47500 && right <= 48500);         // one second
+}
+
+TEST(scene_equal_power_crossfade_keeps_loudness) {
+  fake::Harness h(clips(2, 2000000));
+  Scene scene = sceneFrom(R"({"version": 1, "output": {"width": 640, "height": 360, "fps": 30}, "tracks": [
+      {"kind": "audio", "items": [{"type": "audio", "src": "clip0", "start": 0, "duration": 2},
+        {"type": "transition", "kind": "crossfade", "duration": 1, "audio": "equalPower"},
+        {"type": "audio", "src": "clip1", "start": 1, "duration": 2}]}]})");
+  CHECK(h.openScene(scene) == Result::Ok);
+  h.run(20);
+  h.player->play();
+  h.run(3500);
+  CHECK_EQ(h.listener.ended, 1);
+  const std::vector<int16_t>& heard = h.platform.speaker->heard;
+  int16_t peak = *std::max_element(heard.begin(), heard.end());
+  CHECK(peak >= 139 && peak <= 142);  // 100 × (cos + sin)(π/4) at the midpoint
+}
+
+TEST(scene_export_uses_the_output_size_and_rate) {
+  fake::ExportHarness h(clips(1, 2000000));
+  Scene scene = sceneFrom(doc(R"({"type": "video", "src": "clip0", "start": 0, "duration": 1})",
+                              R"({"width": 640, "height": 360, "fps": "30000/1001"})"));
+  CHECK(h.exporter->start(scene, ExportTarget{}) == Result::Ok);
+  h.run(20000);
+  CHECK_EQ(h.listener.completed, 1);
+  fake::ExportSink& sink = *h.platform.exportSink;
+  CHECK_EQ(sink.settings.width, 640);
+  CHECK_EQ(sink.settings.fps, 30);
+  CHECK_EQ(sink.video.size(), size_t(30));  // 1 s at 29.97 fps
+  CHECK_EQ(sink.video[29].ptsUs, int64_t{29} * 1001 * 1000000 / 30000);
+  CHECK_EQ(sink.video[0].height, 360);
+}
+
+TEST(scene_open_reports_invalid_scenes_and_too_many_lanes) {
+  fake::Harness h;
+  Scene bad;
+  std::string error;
+  CHECK(h.openScene(bad, OutputDriver::Auto, &error) == Result::InvalidArgument);
+  CHECK(!error.empty());
+  std::string tooMany = R"({"version": 1, "output": {"width": 640, "height": 360, "fps": 30}, "tracks": [)";
+  for (int i = 0; i < 9; ++i) tooMany += std::string(i ? "," : "") + R"({"kind": "video", "items": [{"type": "video", "src": "clip0", "start": 0, "duration": 1}]})";
+  CHECK(h.openScene(sceneFrom(tooMany + "]}")) == Result::Ok);  // valid; the decoders are the limit
+  h.run(20);
+  CHECK(h.player->state() == State::Error);
+  CHECK(h.listener.errors.size() == 1 && h.listener.errors[0] == Result::Unsupported);
 }
 
 int main() {

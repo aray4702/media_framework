@@ -73,6 +73,14 @@ class ISpeaker {
   virtual void pause() = 0;
 };
 
+// Still images for image items (scene_graph_spec.md §3): decoded once, on T1 while probing.
+class IImageLoader {
+ public:
+  virtual ~IImageLoader() = default;
+  // out->image: a platform surface the display can draw (Mac OS: a BGRA CVPixelBuffer).
+  virtual Result load(const MediaSource&, VideoFrame* out, int* width, int* height) = 0;
+};
+
 // Export (§2.5): renders composed frames and encodes them with the mixed audio into a file.
 // Writes never block: Again means the encoder is busy, and the caller retries shortly.
 // Destroying the sink cancels an unfinished file, and no callback runs after the destructor.
@@ -82,6 +90,7 @@ class IExportSink {
   virtual Result open(const ExportTarget&, const ExportSettings&, int sampleRate, int channels) = 0;  // channels 0: no audio
   virtual Result writeVideo(const ComposedFrame&) = 0;                                  // Ok | Again | WriteFailed
   virtual Result writeAudio(const int16_t* pcm, int frames, int64_t ptsUs) = 0;          // Ok | Again | WriteFailed
+  virtual void endAudio() {}  // the last audio has been written
   // After the last write; `done` runs on any thread once the file is complete.
   virtual void finish(std::function<void(Result)> done) = 0;
 };
@@ -110,6 +119,7 @@ class PlatformFactory {
   virtual std::unique_ptr<IDisplay> createDisplay() = 0;
   virtual std::unique_ptr<IScheduler> createScheduler() = 0;
   virtual std::unique_ptr<IExportSink> createExportSink() { return nullptr; }  // null: export unsupported
+  virtual std::unique_ptr<IImageLoader> createImageLoader() { return nullptr; }  // null: no image items
   virtual IClock& clock() = 0;
 };
 

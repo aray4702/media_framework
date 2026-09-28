@@ -18,13 +18,15 @@ add_library(mf_core STATIC
   core/src/composition.cpp
   core/src/export_driver.cpp
   core/src/exporter.cpp
+  core/src/json.cpp
+  core/src/layout.cpp
   core/src/leading_clip_driver.cpp
   core/src/master_clock.cpp
   core/src/metrics.cpp
   core/src/pipeline.cpp
   core/src/player.cpp
+  core/src/scene.cpp
   core/src/thread_scheduler.cpp
-  core/src/timeline.cpp
   core/src/types.cpp
   core/src/vsync_driver.cpp)
 target_include_directories(mf_core PUBLIC core/include)

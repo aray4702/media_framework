@@ -34,30 +34,35 @@ Progress VsyncDriver::step(FrameSampler& s, CompositionOutput& out) {
 
   int64_t t = ctx_.master.nowUs(now) + (slot - now) / 1000;
   if (last_ && t <= last_->ptsUs) return Progress::did();  // the clock is holding (audio not heard yet)
-  const TimelineLayout& layout = s.layout();
-  if (t >= layout.durationUs()) {
+  if (t >= s.layout().durationUs()) {
     out.finish();
     return Progress::did();
   }
   s.advanceAll(t);
-  for (int c = layout.firstActive(t); c < layout.clips() && layout.active(c, t); ++c) {
-    const VideoFrame* f = s.frameOf(c);
-    if (!s.exactAt(c, t) && f && s.timeOf(*f) + ctx_.infos[c].video.frameDurationUs <= t) ctx_.metrics.countLateLayer();
+  for (int i : s.videoAt(t)) {
+    const VideoFrame* f = s.frameOf(i);
+    if (!s.exactAt(i, t) && f && s.timeOf(*f) + ctx_.items[i].info.video.frameDurationUs <= t) ctx_.metrics.countLateLayer();
   }
   ComposedFrame frame = s.composeAt(t);
   frame.presentAtNs = slot;
-  if (frame.layerCount == 0 || unchanged(frame)) return Progress::did();  // the frame on screen stays
+  if (unchanged(frame)) return Progress::did();  // the frame on screen stays
   last_ = frame;
   out.emit(std::move(frame));
   return Progress::did();
 }
 
-// Nothing visible differs from the last output: same frames, offsets, caption and filter.
+// Nothing visible differs from the last output: the same frames, and every value the same.
 bool VsyncDriver::unchanged(const ComposedFrame& f) const {
-  if (!last_ || last_->layerCount != f.layerCount || last_->text != f.text || !(last_->filter == f.filter)) return false;
-  for (int i = 0; i < f.layerCount; ++i) {
-    const ComposedFrame::Layer &a = last_->layers[i], &b = f.layers[i];
-    if (a.frame.clip != b.frame.clip || a.frame.ptsUs != b.frame.ptsUs || a.offsetX != b.offsetX) return false;
+  if (!last_ || last_->layers.size() != f.layers.size() || !(last_->filter == f.filter)) return false;
+  for (size_t i = 0; i < f.layers.size(); ++i) {
+    const ComposedLayer &a = last_->layers[i], &b = f.layers[i];
+    if (a.kind != b.kind || a.item != b.item || a.frame.ptsUs != b.frame.ptsUs || a.text != b.text || !(a.color == b.color) ||
+        a.x != b.x || a.y != b.y || a.scale != b.scale || a.rotation != b.rotation || a.offsetX != b.offsetX ||
+        a.offsetY != b.offsetY || a.opacity != b.opacity || a.brightness != b.brightness || a.contrast != b.contrast ||
+        a.saturation != b.saturation || a.blur != b.blur || !std::equal(a.crop, a.crop + 4, b.crop) ||
+        !std::equal(a.clip, a.clip + 4, b.clip)) {
+      return false;
+    }
   }
   return true;
 }
