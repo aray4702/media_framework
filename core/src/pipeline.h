@@ -96,8 +96,7 @@ struct Context {
   bool autoDriver = false;  // pick LeadingClip for a single video item, else Vsync
   ExportTarget exportTarget;
   ExportSettings exportSettings;
-  Scene scene;
-  std::optional<Timeline> timeline;  // open(Timeline): turned into `scene` once its clips are probed
+  Scene scene;  // T1 fills in the durations of items that play to the end of their file
   std::atomic<bool> openRequested{false};
 
   // Written by T1 while probing, before any packet exists; read-only once `probed` is set.

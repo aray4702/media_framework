@@ -46,7 +46,7 @@ inline MediaSource clipSource(int index) { return MediaSource{std::make_shared<i
 
 class Demuxer : public IDemuxer {
  public:
-  // Plays the clip its source names, else `fallback` (demuxers made for a Timeline, in order).
+  // Plays the clip its source names (clipSource), else `fallback` (the clips in creation order).
   Demuxer(const std::vector<Clip>& clips, const Clip& fallback) : clips_(clips), clip_(fallback) {}
   Result open(const MediaSource& source, MediaInfo* out) override {
     if (source.native) clip_ = clips_[size_t(*static_cast<int*>(source.native.get())) % clips_.size()];
@@ -367,11 +367,6 @@ struct Harness {
     for (int i = 0; i < ms; ++i) step();
   }
   Result open() { return player->open(MediaSource{}, RenderTarget{}); }
-  // Opens every clip, with the given timeline settings.
-  Result open(Timeline t) {
-    t.clips.assign(platform.clips.size(), MediaSource{});
-    return player->open(t, RenderTarget{});
-  }
   const ComposedFrame& lastComposed() const { return platform.display->composed.back(); }
   Result openScene(const Scene& scene, OutputDriver driver = OutputDriver::Auto, std::string* error = nullptr) {
     return player->open(scene, RenderTarget{}, driver, error);
@@ -398,10 +393,7 @@ struct ExportHarness {
     exporter = Exporter::create(platform, &listener);
   }
   ~ExportHarness() { exporter->shutdown(); }
-  Result start(Timeline t, ExportSettings s) {
-    t.clips.assign(platform.clips.size(), MediaSource{});
-    return exporter->start(t, ExportTarget{}, s);
-  }
+  Result start(const Scene& scene, ExportSettings s = {}) { return exporter->start(scene, ExportTarget{}, s); }
   // Runs until the export completes or fails, or `ms` of fake time pass.
   void run(int ms) {
     for (int i = 0; i < ms && !exporter->done(); ++i) {

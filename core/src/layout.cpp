@@ -80,19 +80,21 @@ void SceneLayout::visibleAt(int64_t t, std::vector<Visible>* out) const {
     if (!active(b, t)) continue;
     int a = it - 1 == list.begin() ? -1 : *(it - 2);
     if (a < 0 || !active(a, t) || flat_[a].out < 0) {
-      out->push_back({b});
+      out->push_back({b, tr});
       continue;
     }
     const SceneTransition& x = transition(a, flat_[a].out);
     double p = x.durationUs > 0 ? x.easing.apply(double(t - item(b).startUs) / double(x.durationUs)) : 1;
     float dir = x.direction == Direction::Left || x.direction == Direction::Up ? -1.0f : 1.0f;
     bool vertical = x.direction == Direction::Up || x.direction == Direction::Down;
-    Visible va{a}, vb{b};
+    Visible va{a, tr}, vb{b, tr};
     switch (x.kind) {
       case SceneTransitionKind::Cut:
         break;
       case SceneTransitionKind::Crossfade:
+        va.fade = float(1 - p);
         vb.fade = float(p);
+        va.mix = vb.mix = true;
         break;
       case SceneTransitionKind::Push:
         (vertical ? va.offsetY : va.offsetX) = dir * float(p);

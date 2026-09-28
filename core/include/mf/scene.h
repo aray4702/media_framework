@@ -42,7 +42,7 @@ struct SceneTransform {
   float anchorX = 0.5f, anchorY = 0.5f;
 };
 
-// Each effect at most once per item, applied crop → chromaKey → colorAdjust → blur (§4.4).
+// Each effect at most once per item (or track), applied crop → chromaKey → colorAdjust → blur (§4.4).
 struct SceneEffects {
   bool colorAdjust = false;
   Animatable brightness{0}, contrast{1}, saturation{1};
@@ -53,6 +53,7 @@ struct SceneEffects {
   bool chromaKey = false;
   Color keyColor;
   float keyTolerance = 0.15f, keySoftness = 0.1f;
+  bool any() const { return colorAdjust || blur || crop || chromaKey; }
 };
 
 enum class ItemType { Video, Image, Text, Color, Audio };
@@ -60,8 +61,11 @@ enum class ItemType { Video, Image, Text, Color, Audio };
 struct SceneItem {
   std::string id;
   ItemType type = ItemType::Video;
+  // durationUs 0 (video and audio items): to the end of the file, from `in` at `speed`. The
+  // player fills it in when it probes the file, then checks the rules that need it.
   int64_t startUs = 0, durationUs = 0;
   int64_t endUs() const { return startUs + durationUs; }
+  bool toEnd() const { return durationUs == 0 && (type == ItemType::Video || type == ItemType::Audio); }
 
   // Video, audio, image: the file, and (video, audio) where it's read from.
   std::string src;
@@ -105,12 +109,16 @@ struct SceneTrack {
   bool enabled = true;
   float opacity = 1;  // video
   float gain = 1;     // audio
+  // Video: applied to the track's combined image (§5.1), in output coordinates. Keyframe
+  // times are scene time.
+  SceneEffects effects;
   std::vector<SceneItem> items;  // in start order
   std::vector<SceneTransition> transitions;
 };
 
+// 0 (scenes built in code, for playback): taken from the media when probed.
 struct SceneOutput {
-  int width = 1920, height = 1080;  // 0: the first video item's size (Timeline scenes)
+  int width = 1920, height = 1080;  // 0: the first video item's size
   int fpsNum = 30, fpsDen = 1;       // 0: the first video item's rate
   int sampleRate = 48000, channels = 2;  // 0: the first audio's format
   Color background{0, 0, 0, 1};
@@ -130,6 +138,7 @@ using SourceResolver = std::function<MediaSource(const std::string& src)>;
 Result parseScene(const std::string& json, const SourceResolver&, Scene* out, std::string* error);
 
 // Checks the rules (R2–R8) on a scene built in code. open() and Exporter::start() call it.
+// Rules that need the length of an item with duration 0 are checked once it is probed.
 Result validateScene(const Scene&, std::string* error);
 
 }  // namespace mf

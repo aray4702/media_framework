@@ -25,14 +25,6 @@ struct Exporter::Impl : PipelineEvents {
            s.fps >= 1 && s.fps <= 240 && s.videoBitrate > 0 && s.audioBitrate > 0;
   }
 
-  Result start(const Timeline& timeline, const ExportTarget& target, const ExportSettings& settings) {
-    if (!isValid(timeline) || !valid(settings)) return Result::InvalidArgument;
-    return begin(target, settings, [&] {
-      ctx.timeline = timeline;
-      ctx.setFilter(timeline.filter);
-    });
-  }
-
   Result start(const Scene& scene, const ExportTarget& target, ExportSettings settings, std::string* error) {
     if (validateScene(scene, error) != Result::Ok) return Result::InvalidArgument;
     if (scene.output.width <= 0 || scene.output.height <= 0 || scene.output.fpsNum <= 0) {
@@ -43,18 +35,13 @@ struct Exporter::Impl : PipelineEvents {
     settings.height = scene.output.height;
     settings.fps = std::max(1, int(std::lround(double(scene.output.fpsNum) / scene.output.fpsDen)));
     if (!valid(settings)) return Result::InvalidArgument;
-    return begin(target, settings, [&] { ctx.scene = scene; });
-  }
-
-  template <typename F>
-  Result begin(const ExportTarget& target, const ExportSettings& settings, F setScene) {
     if (started || stopped) return Result::InvalidState;
     if (!ctx.exportSink) return Result::Unsupported;
     started = true;
     ctx.driver = Driver::Export;
     ctx.exportTarget = target;
     ctx.exportSettings = settings;
-    setScene();
+    ctx.scene = scene;
     ctx.openRequested = true;
     ctx.wake(StageId::Source);
     return Result::Ok;
@@ -117,9 +104,6 @@ std::unique_ptr<Exporter> Exporter::create(PlatformFactory& factory, ExportListe
 Exporter::Exporter(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
 Exporter::~Exporter() = default;
 
-Result Exporter::start(const Timeline& t, const ExportTarget& target, const ExportSettings& s) {
-  return impl_->onOwner() ? impl_->start(t, target, s) : Result::WrongThread;
-}
 Result Exporter::start(const Scene& scene, const ExportTarget& target, const ExportSettings& s, std::string* error) {
   return impl_->onOwner() ? impl_->start(scene, target, s, error) : Result::WrongThread;
 }

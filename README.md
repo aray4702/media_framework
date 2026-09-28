@@ -35,7 +35,7 @@ The core never calls a platform API directly. To port the player, you write the 
 - **Real-time safe and bounded:** the audio path is lock-free and does not allocate. Every queue is capped by count, bytes and duration.
 - **Built-in metrics:** dropped frames, jank, A/V offset, time to first frame and seek latency, all measured from actual present times.
 - **Composition:** clips play back to back with a horizontal slide (and an audio crossfade) between them, a caption at the bottom, and live brightness and contrast, all drawn in one GPU pass with no extra copy.
-- **Scene graph:** a JSON document of tracks holding video, image, text, color and audio items, with transitions (cut, crossfade, push, slide, wipe), per-item effects (color adjust, chroma key, crop, blur), blend modes, and keyframe animation of any number. See [scene_graph_spec.md](scene_graph_spec.md).
+- **Scene graph:** a JSON document of tracks holding video, image, text, color and audio items, with transitions (cut, crossfade, push, slide, wipe), per-item and per-track effects (color adjust, chroma key, crop, blur), blend modes, and keyframe animation of any number. See [scene_graph_spec.md](scene_graph_spec.md).
 - **Three output drivers:** leading-clip (one output frame per source frame), vsync (one per display refresh, so slides stay smooth) and export (a fixed frame grid, written to an H.264/AAC MP4 faster than real time).
 
 
@@ -50,10 +50,10 @@ The core never calls a platform API directly. To port the player, you write the 
 | Container    | MP4                                                                                                                                                                          |
 | Video        | H.264, constant frame rate, hardware decode through VideoToolbox, zero-copy to Metal                                                                                         |
 | Audio        | AAC-LC, optional. S16 PCM output through a CoreAudio AudioUnit                                                                                                               |
-| API          | `open` (one file or a `Timeline`), `play`, `pause`, `seek`, `setFilter`, `shutdown`, plus `durationUs`, `positionUs` and `metrics` queries                                 |
-| Composition  | Up to 16 clips joined by a slide (left or right) or a cut, with an equal-gain audio crossfade. Captions at the bottom by time range. Brightness and contrast, live             |
+| API          | `open` (one file or a `Scene`), `play`, `pause`, `seek`, `setFilter`, `shutdown`, plus `durationUs`, `positionUs` and `metrics` queries                                 |
+| Composition  | Clips joined by push, slide, wipe, crossfade or cut, with an audio crossfade. Text items for captions. Items with duration 0 play to the end of their file. Brightness and contrast, live |
 | Scene graph  | Up to 16 tracks and 8 overlapping video/audio items. Video, image, text, color and audio items; keyframes with easing; fit, transform, opacity, blend; effects; audio gain, pan, resampling and `speed` |
-| Drivers      | Leading-clip or vsync while playing (`Auto` picks leading-clip for one clip, vsync for several). Export to MP4 (H.264 + AAC) on a fixed frame grid                             |
+| Drivers      | Leading-clip or vsync while playing (`Auto` picks leading-clip when the only visual item is one video, else vsync). Export to MP4 (H.264 + AAC) on a fixed frame grid                             |
 | States       | `Start`, `Ready`, `Play`, `Error`, `Shutdown`                                                                                                                                |
 | A/V sync     | Audio master clock that includes output latency. Falls back to the system clock when there is no audio track or the audio ends first                                         |
 | Frame pacing | Frame rate capped to the display refresh rate on a vsync grid. Handles refresh-rate changes when the window moves to another display                                         |
@@ -154,38 +154,44 @@ player->metrics().toString();    // dropped/jank/A-V/TTFF/seek summary
 player->shutdown();              // joins the threads; idempotent. Also run by the destructor
 ```
 
-To play several clips as one timeline, pass a `Timeline` to `open` instead:
+`player->setFilter({0.1f, 1.2f})` sets brightness and contrast at any time; it takes effect on the next frame, or redraws when paused.
 
-```cpp
-mf::Timeline timeline;
-timeline.clips = {mf::macos::sourceFromPath("a.mp4"), mf::macos::sourceFromPath("b.mp4")};
-timeline.transition = {mf::TransitionKind::SlideLeft, 1'000'000};   // 1 s; SlideRight or Cut
-timeline.texts = {{"Chapter one", 0, 5'000'000}};                    // caption for the first 5 s
-timeline.filter = {0.1f, 1.2f};                                       // brightness, contrast
-player->open(timeline, target);
-
-player->setFilter({0.0f, 1.0f});  // any time; takes effect on the next frame, or redraws when paused
-```
-
-Clip `i+1` starts one transition before clip `i` ends, so `durationUs()` is the sum of the clips minus the overlaps. `seek` and `positionUs` use timeline time. Set `timeline.driver` to `OutputDriver::LeadingClip` or `OutputDriver::Vsync` to override `Auto`.
-
-For layers, animation and effects, load a scene document instead (scene_graph_spec.md):
+For several clips, layers, animation and effects, open a scene (scene_graph_spec.md). Load a document:
 
 ```cpp
 mf::Scene scene;
 std::string error;
 if (mf::macos::loadScene("edit.json", &scene, &error) != mf::Result::Ok) { /* error says where and why */ }
-player->open(scene, target);          // or exporter->start(scene, mf::macos::exportTargetFromPath("out.mp4"))
+player->open(scene, target, mf::OutputDriver::Auto, &error);
 ```
 
-To render a timeline into a file, use an `Exporter` with the same `Timeline`:
+or build one in code. Here two clips follow each other with a 1 s push; the first plays to the end of its file (duration 0), so the second's start needs the first's length, `lengthOfA`:
+
+```cpp
+mf::SceneTrack track;
+mf::SceneItem a, b;
+a.type = b.type = mf::ItemType::Video;
+a.source = mf::macos::sourceFromPath("a.mp4");                 // duration 0: to the end of the file
+b.source = mf::macos::sourceFromPath("b.mp4");
+b.startUs = lengthOfA - 1'000'000;
+b.durationUs = 4'000'000;
+mf::SceneTransition push;                                       // joins items 0 and 1
+push.kind = mf::SceneTransitionKind::Push;
+push.durationUs = 1'000'000;
+track.items = {a, b};
+track.transitions = {push};
+scene.tracks = {track};
+```
+
+`seek`, `positionUs` and `durationUs` use scene time. Pass `OutputDriver::LeadingClip` or `OutputDriver::Vsync` to `open` to override `Auto`.
+
+To render a scene into a file, use an `Exporter`. The size and frame rate come from `scene.output`:
 
 ```cpp
 #include "mf/exporter.h"
 
 auto exporter = mf::Exporter::create(*platform, &exportListener);   // onCompleted / onError
-mf::ExportSettings settings{1280, 720, 30};                          // width, height, fps
-exporter->start(timeline, mf::macos::exportTargetFromPath("out.mp4"), settings);
+exporter->start(scene, mf::macos::exportTargetFromPath("out.mp4"));  // optional ExportSettings: bitrates
 exporter->progress();            // 0 to 1
 exporter->shutdown();            // after onCompleted; cancels an unfinished export
 ```
@@ -286,7 +292,7 @@ flowchart TB
 
     subgraph core["core — portable C++17"]
         direction LR
-        Player["Player / Impl<br/>API · state machine"] --> Ctx["Context<br/>2 lanes of queues · AudioRing<br/>MasterClock · Metrics · Timeline"] --> Stages["5 non-blocking Stages<br/>Source · VideoDecode · Composition<br/>VideoRender · Audio"]
+        Player["Player / Impl<br/>API · state machine"] --> Ctx["Context<br/>Scene · SceneLayout · lanes of queues<br/>AudioRing · MasterClock · Metrics"] --> Stages["5 non-blocking Stages<br/>Source · VideoDecode · Composition<br/>VideoRender · Audio"]
     end
 
     IF[["Adapter interfaces: IDemuxer · IVideoDecoder · IAudioDecoder · ISpeaker · IDisplay · IScheduler · IClock"]]
@@ -303,7 +309,7 @@ flowchart TB
 
 
 
-**Pipeline.** Solid arrows carry media data and dashed arrows carry timing. Each stage runs on its own thread (T1, T2, TC, T3, T4). Bounded queues sit between the stages. Clip `i` of the timeline plays on lane `i % 2`, and each lane has its own packet queues, decoders and frame queue, so the next clip decodes alongside the current one during a transition.
+**Pipeline.** Solid arrows carry media data and dashed arrows carry timing. Each stage runs on its own thread (T1, T2, TC, T3, T4). Bounded queues sit between the stages. Each video or audio item plays on a lane (up to 8, assigned so items sharing a lane never overlap), and each lane has its own packet queues, decoders and frame queue, so the next clip decodes alongside the current one during a transition.
 
 ```mermaid
 flowchart LR
@@ -356,7 +362,7 @@ flowchart LR
 | --------------------- | --------------------------------------------------------------- | ---------------------------------------------------------------------------- |
 | Player / Impl         | [player.cpp](core/src/player.cpp)                               | Public API, owner-thread check, state machine, pipeline events               |
 | Context               | [pipeline.h](core/src/pipeline.h)                               | Owns adapters, queues, ring, clock and metrics; seek slot; serials           |
-| SourceStage (T1)      | [pipeline.cpp](core/src/pipeline.cpp)                           | Probe every clip, start seeks, move lanes to their next clip, demux from the track with the lowest timeline DTS |
+| SourceStage (T1)      | [pipeline.cpp](core/src/pipeline.cpp)                           | Probe every item, start seeks, move lanes to their next item, demux from the track with the lowest timeline DTS |
 | VideoDecodeStage (T2) | [pipeline.cpp](core/src/pipeline.cpp)                           | Per lane: packets → decoder → frames in PTS order; reconfigure for the next clip |
 | CompositionStage (TC) | [composition.cpp](core/src/composition.cpp)                     | Hand composed frames to T3; the exact seek; then delegate to the driver       |
 | FrameSampler          | [composition.cpp](core/src/composition.cpp)                     | Each lane's next and latest frame; advance to `t`; `composeAt(t)`             |
@@ -364,7 +370,7 @@ flowchart LR
 | VsyncDriver           | [vsync_driver.cpp](core/src/vsync_driver.cpp)                   | One output per display refresh; late layers hold; unchanged refreshes skipped |
 | ExportDriver          | [export_driver.cpp](core/src/export_driver.cpp)                 | Fixed `n / fps` grid; waits for every layer's exact frame                    |
 | VideoRenderStage (T3) | [pipeline.cpp](core/src/pipeline.cpp)                           | Complete seeks, A/V sync, present or drop, start and stop output, detect end, redraw on a filter change |
-| AudioStage (T4)       | [pipeline.cpp](core/src/pipeline.cpp)                           | Decode both lanes' AAC, mix on the timeline with the crossfade, write to the ring |
+| AudioStage (T4)       | [pipeline.cpp](core/src/pipeline.cpp)                           | Decode each lane's AAC, mix on the timeline with gains and fades, write to the ring |
 | Scene parser          | [scene.cpp](core/src/scene.cpp), [json.cpp](core/src/json.cpp)   | JSON, the schema's checks and rules R1–R8, R12; keyframes and easing         |
 | SceneLayout           | [layout.cpp](core/src/layout.cpp)                               | Lanes by interval coloring; what's visible at `t` with transition offsets, clips and fades; audio fades |
 | Exporter              | [exporter.cpp](core/src/exporter.cpp)                           | The same pipeline with the export driver, writing to an `IExportSink`        |

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <initializer_list>
+#include <limits>
 #include <cstdio>
 #include <cstdlib>
 #include <set>
@@ -273,7 +274,7 @@ class Reader {
       const std::string& t = type->string;
       bool* seen = t == "colorAdjust" ? &out->colorAdjust : t == "blur" ? &out->blur : t == "crop" ? &out->crop : t == "chromaKey" ? &out->chromaKey : nullptr;
       if (!seen) return fail(ep + ".type", "must be one of colorAdjust, blur, crop, chromaKey");
-      if (*seen) return fail(ep, "an item has at most one " + t + " effect");
+      if (*seen) return fail(ep, "at most one " + t + " effect (R12)");
       *seen = true;
       if (t == "colorAdjust") {
         if (!object(e, ep, {"type", "brightness", "contrast", "saturation"}) ||
@@ -343,7 +344,7 @@ class Reader {
     if (!ok) return false;
     if (!v.find("start") || !v.find("duration")) return fail(path, "needs start and duration");
     if (!id(v.find("id"), path + ".id", &out->id) || !time(v.find("start"), path + ".start", &out->startUs, false) ||
-        !time(v.find("duration"), path + ".duration", &out->durationUs, true)) {
+        !time(v.find("duration"), path + ".duration", &out->durationUs, t != "video" && t != "audio")) {  // 0: to the end
       return false;
     }
     if (t == "video" || t == "audio" || t == "image") {
@@ -405,9 +406,12 @@ class Reader {
     const Value* kind = v.isObject() ? v.find("kind") : nullptr;
     if (!kind || !kind->isString() || (kind->string != "video" && kind->string != "audio")) return fail(path + ".kind", "must be video or audio");
     out->video = kind->string == "video";
-    if (!object(v, path, {"id", "kind", "enabled", "items", "metadata", out->video ? "opacity" : "gain"})) return false;
+    bool known = out->video ? object(v, path, {"id", "kind", "enabled", "items", "metadata", "opacity", "effects"})
+                            : object(v, path, {"id", "kind", "enabled", "items", "metadata", "gain"});
+    if (!known) return false;
     if (!id(v.find("id"), path + ".id", &out->id) || !boolean(v.find("enabled"), path + ".enabled", &out->enabled) ||
-        !numberF(v.find("opacity"), path + ".opacity", &out->opacity, 0, 1) || !numberF(v.find("gain"), path + ".gain", &out->gain, 0, 4)) {
+        !numberF(v.find("opacity"), path + ".opacity", &out->opacity, 0, 1) || !numberF(v.find("gain"), path + ".gain", &out->gain, 0, 4) ||
+        !effects(v.find("effects"), path + ".effects", &out->effects)) {
       return false;
     }
     const Value* items = v.find("items");
@@ -505,28 +509,34 @@ struct Checker {
     return buf;
   }
 
+  // Ranges (R7) and keyframes (R6) of an item's or a track's effects; keys lie within [0, d].
+  bool effects(const SceneEffects& e, const std::string& p, int64_t d) {
+    if (!range(e.brightness, p + ".effects.brightness", d, -1, 1) || !range(e.contrast, p + ".effects.contrast", d, 0, 2) ||
+        !range(e.saturation, p + ".effects.saturation", d, 0, 2) || !range(e.blurRadius, p + ".effects.radius", d, 0, 0.1) ||
+        !range(e.cropLeft, p + ".effects.left", d, 0, 1) || !range(e.cropTop, p + ".effects.top", d, 0, 1) ||
+        !range(e.cropRight, p + ".effects.right", d, 0, 1) || !range(e.cropBottom, p + ".effects.bottom", d, 0, 1)) {
+      return false;
+    }
+    if (e.crop && !e.cropLeft.animated() && !e.cropRight.animated() && e.cropLeft.value + e.cropRight.value >= 1) {
+      return fail(p + ".effects", "crop removes the whole width (R7)");
+    }
+    if (e.crop && !e.cropTop.animated() && !e.cropBottom.animated() && e.cropTop.value + e.cropBottom.value >= 1) {
+      return fail(p + ".effects", "crop removes the whole height (R7)");
+    }
+    return true;
+  }
+
   bool item(const SceneItem& it, const std::string& p) {
-    int64_t d = it.durationUs;
-    if (d <= 0 || it.startUs < 0) return fail(p, "needs start >= 0 and duration > 0");
+    if (it.startUs < 0 || it.durationUs < 0 || (it.durationUs == 0 && !it.toEnd())) return fail(p, "needs start >= 0 and duration > 0");
+    int64_t d = it.toEnd() ? std::numeric_limits<int64_t>::max() : it.durationUs;  // keys: checked against the end once probed
     if (it.speed <= 0 || it.speed > 16 || it.inUs < 0) return fail(p, "needs in >= 0 and speed in (0, 16]");
     bool visual = it.type != ItemType::Audio;
     if (visual) {
       const SceneTransform& tr = it.transform;
-      const SceneEffects& e = it.effects;
       if (!range(tr.x, p + ".transform.x", d, -100, 100) || !range(tr.y, p + ".transform.y", d, -100, 100) ||
           !range(tr.scale, p + ".transform.scale", d, 0.0001, 100) || !range(tr.rotation, p + ".transform.rotation", d, -1e6, 1e6) ||
-          !range(it.opacity, p + ".opacity", d, 0, 1) || !range(e.brightness, p + ".effects.brightness", d, -1, 1) ||
-          !range(e.contrast, p + ".effects.contrast", d, 0, 2) || !range(e.saturation, p + ".effects.saturation", d, 0, 2) ||
-          !range(e.blurRadius, p + ".effects.radius", d, 0, 0.1) || !range(e.cropLeft, p + ".effects.left", d, 0, 1) ||
-          !range(e.cropTop, p + ".effects.top", d, 0, 1) || !range(e.cropRight, p + ".effects.right", d, 0, 1) ||
-          !range(e.cropBottom, p + ".effects.bottom", d, 0, 1)) {
+          !range(it.opacity, p + ".opacity", d, 0, 1) || !effects(it.effects, p, d)) {
         return false;
-      }
-      if (e.crop && !e.cropLeft.animated() && !e.cropRight.animated() && e.cropLeft.value + e.cropRight.value >= 1) {
-        return fail(p + ".effects", "crop removes the whole width (R7)");
-      }
-      if (e.crop && !e.cropTop.animated() && !e.cropBottom.animated() && e.cropTop.value + e.cropBottom.value >= 1) {
-        return fail(p + ".effects", "crop removes the whole height (R7)");
       }
       if (it.type == ItemType::Text && (it.text.empty() || it.style.size <= 0)) return fail(p, "text needs text and a size");
     }
@@ -537,6 +547,8 @@ struct Checker {
   }
 
   bool track(const SceneTrack& t, const std::string& p) {
+    if (!t.video && t.effects.any()) return fail(p + ".effects", "only video tracks have effects");
+    if (!effects(t.effects, p, std::numeric_limits<int64_t>::max())) return false;  // scene time: keys from 0 on
     for (size_t k = 0; k < t.items.size(); ++k) {
       const SceneItem& it = t.items[k];
       std::string ip = p + ".items[" + std::to_string(k) + "]";
@@ -554,15 +566,16 @@ struct Checker {
       std::string ip = p + ".items[" + std::to_string(k) + "]";
       if (b.startUs < a.startUs) return fail(ip, "items must be in start order (R2)");
       const SceneTransition* tr = after[k - 1];
+      if (tr && tr->kind == SceneTransitionKind::Cut && tr->durationUs != 0) return fail(p, "a cut has duration 0 (R5)");
+      if (a.toEnd()) continue;  // where it ends is known once probed
       if (!tr) {
         if (b.startUs < a.endUs()) return fail(ip, "overlaps the item before it without a transition between them (R2)");
         continue;
       }
-      if (tr->kind == SceneTransitionKind::Cut && tr->durationUs != 0) return fail(p, "a cut has duration 0 (R5)");
       if (b.startUs != a.endUs() - tr->durationUs) {
         return fail(ip, "must start exactly " + fmt(tr->durationUs / 1e6) + " s before the item before it ends (R4)");
       }
-      if (tr->durationUs * 2 > std::min(a.durationUs, b.durationUs)) {
+      if (!b.toEnd() && tr->durationUs * 2 > std::min(a.durationUs, b.durationUs)) {
         return fail(ip, "the transition before it is longer than half of an item it joins (R5)");
       }
     }
@@ -578,12 +591,14 @@ struct Checker {
     if (o.channels < 0 || o.channels > 2 || o.sampleRate < 0 || o.sampleRate > 192000) return fail("output", "bad audio format");
     if (s.tracks.empty() || s.tracks.size() > 16) return fail("$.tracks", "must be 1 to 16 tracks");
     size_t total = 0;
+    bool toEnd = false;
     for (size_t k = 0; k < s.tracks.size(); ++k) {
       if (!track(s.tracks[k], "tracks[" + std::to_string(k) + "]")) return false;
       total += s.tracks[k].items.size();
+      for (const SceneItem& it : s.tracks[k].items) toEnd |= s.tracks[k].enabled && it.toEnd();
     }
     if (total > 1000) return fail("$.tracks", "more than 1000 items");
-    if (s.durationUs() <= 0) return fail("$.tracks", "nothing to play: every enabled track is empty (R8)");
+    if (s.durationUs() <= 0 && !toEnd) return fail("$.tracks", "nothing to play: every enabled track is empty (R8)");
     return true;
   }
 };

@@ -16,7 +16,7 @@ class ExportListener {
   virtual void onError(Result, const std::string& /*reason*/) {}  // fatal; nothing more is written
 };
 
-// Renders a timeline into a file as fast as the decoders and encoder allow (§2.5): frames on a
+// Renders a scene into a file as fast as the decoders and encoder allow (§2.5): frames on a
 // fixed n / fps grid, each composed once every layer has its exact frame, plus the mixed audio.
 // Every method must be called on the thread that called create().
 class Exporter {
@@ -24,9 +24,8 @@ class Exporter {
   static std::unique_ptr<Exporter> create(PlatformFactory&, ExportListener*);
   ~Exporter();
 
-  // Returns at once; probing, decoding and encoding run on the pipeline threads.
-  Result start(const Timeline&, const ExportTarget&, const ExportSettings&);
-  // Size and frame rate come from scene.output; `settings` gives the bitrates.
+  // Returns at once; probing, decoding and encoding run on the pipeline threads. Size and frame
+  // rate come from scene.output (which must set them); `settings` gives the bitrates.
   Result start(const Scene&, const ExportTarget&, const ExportSettings& settings = {}, std::string* error = nullptr);
   Result shutdown();  // cancels an export in progress and joins the threads; idempotent
 

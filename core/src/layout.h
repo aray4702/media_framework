@@ -36,11 +36,14 @@ class SceneLayout {
   int64_t timelineUs(int i, int64_t mediaUs) const;
 
   // What a video track shows at t: its item, or the two items of a transition (outgoing first).
+  // The two items of a transition are combined on their own before the track is drawn (§5.1).
   struct Visible {
     int item;
+    int track = -1;                  // scene track index
     float offsetX = 0, offsetY = 0;  // push and slide, in output widths / heights
     float clip[4] = {0, 0, 1, 1};    // wipe: the visible part of the output
     float fade = 1;                  // crossfade: multiplies the opacity
+    bool mix = false;                // crossfade: the pair is summed, (1 − p)·A + p·B, not drawn B over A
   };
   // Every enabled video track, bottom to top.
   void visibleAt(int64_t t, std::vector<Visible>* out) const;

@@ -33,6 +33,7 @@ Why a format of our own: OTIO is the standard for moving an edit between tools, 
 - **Units:** seconds, as a number (`2.5`) or an exact rational string (`"1001/30000"`). The engine converts to microseconds, rounding to nearest. Use rationals for frame-exact NTSC rates.
 - **Item placement:** an item occupies `[start, start + duration)` on the timeline.
 - **Media items** (video, audio) read their file at media time `m = in + (t − start) × speed`. `speed` > 0, 1 by default. The file must cover `[in, in + duration × speed)`.
+- **Duration 0** (video and audio items only) means "to the end of the file": the engine sets `duration = (file length − in) / speed` when it opens the file. Rules that need the item's end (R2, R4, R5, R6) are then checked against that length, so a violation is reported when the file is probed rather than when the document is loaded.
 - **Keyframe times are relative to the item's start**, so moving an item moves its animation.
 - **The timeline's duration** is the latest end of any item on an enabled track. Where nothing covers the output, it shows `background` and plays silence.
 
@@ -71,8 +72,8 @@ With every default, a `contain` item is centered and aspect-fit, which is exactl
 
 ### 4.2 Opacity and blending
 
-- **Opacity:** `opacity` (0 to 1, default 1) multiplies the item's alpha. A track's `opacity` multiplies all its items.
-- **Blend modes** (`blend`), with source `S` and destination `D` both in premultiplied alpha:
+- **Opacity:** `opacity` (0 to 1, default 1) multiplies the item's alpha. A track's `opacity` multiplies the track's combined image once (§5.1), not each item.
+- **Blend modes** (`blend`) apply where a track is drawn onto the tracks below it (§5.1), using the blend of the track's top item (the incoming one during a transition). Inside a track, the two items of a transition are combined by the transition, not by their blend modes. With source `S` and destination `D` both in premultiplied alpha:
 
 | `blend` | Result |
 | --- | --- |
@@ -114,7 +115,9 @@ Animatable fields and their ranges (checked on every key):
 
 ### 4.4 Effects
 
-An item has **at most one effect of each type**, and they always apply **in this order**, whatever the list order: `crop` → `chromaKey` → `colorAdjust` → `blur`. They act on the item's own image, before fit and transform. A fixed order keeps every effect a single shader pass, except blur, which needs two. RGB values are in 0–1:
+An item has **at most one effect of each type**, and they always apply **in this order**, whatever the list order: `crop` → `chromaKey` → `colorAdjust` → `blur`. They act on the item's own image, before fit and transform.
+
+A **video track** can have `effects` too, with the same types, order and limits. They act on the track's combined image (§5.1), in output coordinates: `crop` removes those fractions of the output, and `blur`'s σ is relative to the output height. Their keyframe times are scene time, not item time. A fixed order keeps every effect a single shader pass, except blur, which needs two. RGB values are in 0–1:
 
 | `type` | Parameters | Definition |
 | --- | --- | --- |
@@ -148,9 +151,11 @@ Text wraps at `maxWidth`. It is rasterized at the output resolution, with a box 
 
 1. Start from `background`.
 2. For each enabled video track, bottom to top:
-   1. For each item active at `t` (one, or two inside a transition), evaluate its properties at `t`, take its frame (§3), apply its effects, crop, fit and transform.
-   2. Combine the pair through the transition, if any (§5.3).
-   3. Multiply by opacity and track opacity, and blend onto the result.
+   1. For each item active at `t` (one, or two inside a transition), evaluate its properties at `t`, take its frame (§3), apply its effects (§4.4), crop, fit and transform, and multiply by its opacity. The player's global filter (`setFilter`) applies to video and image items here, after their own effects.
+   2. Combine them into the track's image, starting from transparent: the item alone, or the pair through the transition (§5.3). Nothing below the track takes part in this step.
+   3. Apply the track's effects (§4.4) to that image, multiply by the track's opacity, and blend it onto the result with the top item's blend mode (§4.2).
+
+A track with one item and no effects gives the same result drawn straight onto the result, which is what the engine does; it combines a track on its own only during a transition or when the track has effects.
 
 The output is a pure function of `t` and the decoded frames, which is what makes the leading-clip, vsync and export drivers render identically at the same `t`.
 
@@ -175,7 +180,7 @@ The `direction` (`left`, `right`, `up`, `down`) is the way the content moves. Of
 | `kind` | Video |
 | --- | --- |
 | `cut` | Duration 0: A, then B |
-| `crossfade` | Both drawn, then mixed as `(1 − p)·A + p·B` (premultiplied) |
+| `crossfade` | Both drawn, then mixed as `(1 − p)·A + p·B` (premultiplied), so A fades out as B fades in |
 | `push` | A offset by `dir·p`, B by `dir·(p − 1)`: both move, and B pushes A out. **This is the engine's current `SlideLeft`/`SlideRight`** |
 | `slide` | A stays; B moves in over it from offset `dir·(p − 1)` |
 | `wipe` | A stays; B is revealed by an edge moving in `direction`, covering fraction `p` of the output |
@@ -205,9 +210,9 @@ The **schema** checks structure, types, enumerations, required fields and fixed 
 | R7 | Every animated value, including every key, is within its range (§4.3). A `crop` never removes the whole width or height |
 | R8 | At least one enabled track has an item |
 | R9 *(runtime)* | Each `src` opens and has the needed track: video for `video`, audio for `audio`, a decodable image for `image` |
-| R10 *(runtime)* | A media item's `in` lies inside its file. If the file ends before `in + duration × speed`, the item holds its last frame (video) or goes silent (audio) |
+| R10 *(runtime)* | A media item's `in` lies inside its file (for duration 0 as well). If the file ends before `in + duration × speed`, the item holds its last frame (video) or goes silent (audio) |
 | R11 *(runtime)* | At most 8 video and audio items play at once, counting each item from 1 s before its start (so its decoder can start early). Each such item needs its own decoder, and the platform's hardware limits still apply (e.g. two 4K H.264 streams at once on Apple silicon) |
-| R12 | An item has at most one effect of each type (§4.4) |
+| R12 | An item or a track has at most one effect of each type (§4.4); only video tracks have effects |
 
 A document that fails R1–R8 or R12 is rejected by `open()` or `Exporter::start()` with `InvalidArgument`, before anything is decoded. R9–R11 fail asynchronously through `onError`, like media errors today.
 
@@ -215,16 +220,16 @@ Compatibility: `version` changes only for changes that alter rendering. New opti
 
 ## 7. Implementation
 
-The engine plays and exports scenes: `Player::open(const Scene&, ...)`, `Exporter::start(const Scene&, ...)`, and `mf::macos::loadScene(path, ...)`, which reads a document and resolves each `src` relative to it. The simpler `Timeline` API is turned into a scene internally: one video track of clips joined by `push` transitions, plus a caption track.
+The engine plays and exports scenes: `Player::open(const Scene&, ...)`, `Exporter::start(const Scene&, ...)`, and `mf::macos::loadScene(path, ...)`, which reads a document and resolves each `src` relative to it. `Player::open(const MediaSource&, ...)` plays one file as a scene of one video item with duration 0 and an output taken from the file.
 
 | Part | Where |
 | --- | --- |
 | JSON reader (strict RFC 8259, key order kept, depth limit) | [core/src/json.cpp](core/src/json.cpp) |
 | Parsing, the schema's checks, rules R1–R8 and R12, keyframes and easing | [core/src/scene.cpp](core/src/scene.cpp) |
 | Lanes and "what is visible at `t`" (transition offsets, clips, fades; audio fades) | [core/src/layout.cpp](core/src/layout.cpp) |
-| Per-item frame selection; `composeAt(t)` evaluates every visible item into a `ComposedLayer` | [core/src/composition.cpp](core/src/composition.cpp) |
+| Per-item frame selection; `composeAt(t)` evaluates every visible item into a `ComposedLayer`, and a track that is combined on its own into a `ComposedGroup` (its effects, opacity, blend) | [core/src/composition.cpp](core/src/composition.cpp) |
 | Audio mix: every sounding item, resampled and sped up by reading at its media time | `AudioStage` in [core/src/pipeline.cpp](core/src/pipeline.cpp) |
-| Drawing: fit, transform, blend modes, effects, blur passes, wipe clips, styled text | [platform/macos/src/metal_compositor.mm](platform/macos/src/metal_compositor.mm) |
+| Drawing: fit, transform, blend modes, effects, blur passes, wipe clips, styled text; a grouped track is drawn into its own texture first, then onto the canvas | [platform/macos/src/metal_compositor.mm](platform/macos/src/metal_compositor.mm) |
 | Image items | [platform/macos/src/image_loader.mm](platform/macos/src/image_loader.mm) (ImageIO, EXIF orientation) |
 
 - **Lanes.** Each video or audio item gets a lane: its own decoders and queues. Lanes are assigned greedily in start order, and an item can reuse a lane once the lane's previous item has ended, counting from 1 s before the new item starts. That's the fewest lanes possible. For clips joined by transitions this gives the two alternating lanes the timeline engine used.
@@ -240,7 +245,7 @@ OTIO carries the edit: tracks, clips, gaps, transitions and time ranges. Everyth
 | Scene graph | OTIO |
 | --- | --- |
 | Document | `Timeline`, `global_start_time` 0. `metadata.mf = {version, output}` |
-| Video / audio track | `Track(kind = Video / Audio)` in `timeline.tracks` (a `Stack`: later tracks on top, as here). `enabled`, `opacity`, `gain` go to `metadata.mf` |
+| Video / audio track | `Track(kind = Video / Audio)` in `timeline.tracks` (a `Stack`: later tracks on top, as here). `enabled`, `opacity`, `gain`, `effects` go to `metadata.mf` |
 | `video`, `audio` item | `Clip` with `ExternalReference(target_url = src)`, `source_range = (in, duration × speed)`. Speed ≠ 1 is a `LinearTimeWarp` effect |
 | `image` item | `Clip` with `ExternalReference` to the image, `source_range = (0, duration)` |
 | `color` item | `Clip` with `GeneratorReference(generator_kind = "SolidColor", parameters = {color})` |

@@ -285,6 +285,14 @@
           "maximum": 1,
           "default": 1
         },
+        "effects": {
+          "type": "array",
+          "maxItems": 4,
+          "items": {
+            "$ref": "#/$defs/effect"
+          },
+          "description": "Applied to the track's combined image (§5.1), in output coordinates; keyframe times are scene time. At most one of each type (R12)."
+        },
         "items": {
           "type": "array",
           "items": {
@@ -445,7 +453,7 @@
       }
     },
     "timing": {
-      "description": "Where an item sits: [start, start + duration) on the timeline.",
+      "description": "Where an item sits: [start, start + duration) on the timeline. Duration 0 (video and audio items only): to the end of the file.",
       "type": "object",
       "required": [
         "start",
@@ -459,10 +467,18 @@
           "$ref": "#/$defs/time"
         },
         "duration": {
-          "$ref": "#/$defs/positiveTime"
+          "$ref": "#/$defs/time"
         },
         "metadata": {
           "$ref": "#/$defs/metadata"
+        }
+      }
+    },
+    "fixedDuration": {
+      "description": "Items without a file to end with need a duration above 0.",
+      "properties": {
+        "duration": {
+          "$ref": "#/$defs/positiveTime"
         }
       }
     },
@@ -613,6 +629,9 @@
           "$ref": "#/$defs/timing"
         },
         {
+          "$ref": "#/$defs/fixedDuration"
+        },
+        {
           "$ref": "#/$defs/visual"
         }
       ],
@@ -636,6 +655,9 @@
       "allOf": [
         {
           "$ref": "#/$defs/timing"
+        },
+        {
+          "$ref": "#/$defs/fixedDuration"
         },
         {
           "$ref": "#/$defs/visual"
@@ -706,6 +728,9 @@
       "allOf": [
         {
           "$ref": "#/$defs/timing"
+        },
+        {
+          "$ref": "#/$defs/fixedDuration"
         },
         {
           "$ref": "#/$defs/visual"

@@ -1,8 +1,8 @@
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -85,32 +85,17 @@ struct VideoFilter {
   bool operator==(const VideoFilter& o) const { return brightness == o.brightness && contrast == o.contrast; }
 };
 
-// Between each pair of clips. Slide: the outgoing clip moves out while the incoming one
-// moves in behind it, over durationUs; the two clips overlap on the timeline by that long.
-enum class TransitionKind { Cut, SlideLeft, SlideRight };
-struct Transition {
-  TransitionKind kind = TransitionKind::SlideLeft;
-  int64_t durationUs = 1000000;  // shortened to half the shortest clip; ignored for Cut
-};
-
-// A caption at the bottom of the video, in timeline time [startUs, endUs).
-struct TextOverlay {
-  std::string text;
-  int64_t startUs = 0;
-  int64_t endUs = std::numeric_limits<int64_t>::max();
-};
-
 // What sets the output times while playing (§2.5). Export always uses a fixed frame grid.
 enum class OutputDriver {
-  Auto,         // LeadingClip for a single clip, Vsync for several
+  Auto,         // LeadingClip when the only visual item is one video, else Vsync
   LeadingClip,  // one output frame per frame of the highest-fps active clip, paced by AvSync
   Vsync,        // one output frame per display refresh, at the clock time it will be seen
 };
 
 // Export output (§2.5). Frames are composed at n / fps and written with the platform encoder.
 struct ExportSettings {
-  int width = 1920, height = 1080;  // even, at most 8192; each clip is aspect-fit into it
-  int fps = 30;                      // 1 to 240
+  int width = 1920, height = 1080;  // set from the scene's output by Exporter::start
+  int fps = 30;                      // likewise
   int videoBitrate = 10000000;
   int audioBitrate = 192000;
 };
@@ -145,11 +130,27 @@ struct TextStyle {
   }
 };
 
+// Effects (§4.4) as drawn in one output frame, applied crop → chromaKey → colorAdjust → blur.
+struct ComposedEffects {
+  float crop[4] = {0, 0, 0, 0};              // left, top, right, bottom fractions removed
+  float brightness = 0, contrast = 1, saturation = 1;
+  float blur = 0;                            // Gaussian sigma, as a fraction of the output height
+  bool chromaKey = false;
+  Color keyColor;
+  float keyTolerance = 0.15f, keySoftness = 0.1f;
+  bool operator==(const ComposedEffects& o) const {
+    return std::equal(crop, crop + 4, o.crop) && brightness == o.brightness && contrast == o.contrast &&
+           saturation == o.saturation && blur == o.blur && chromaKey == o.chromaKey && keyColor == o.keyColor &&
+           keyTolerance == o.keyTolerance && keySoftness == o.keySoftness;
+  }
+};
+
 // One item as drawn in one output frame, with every value evaluated at that frame's time.
 struct ComposedLayer {
   enum class Kind { Video, Image, Text, Color };
   Kind kind = Kind::Video;
   int item = -1;                             // scene item index
+  int group = -1;                            // ComposedFrame::groups index, or -1: drawn onto the canvas
   VideoFrame frame;                          // Video, Image
   std::shared_ptr<const std::string> text;   // Text
   TextStyle style;                           // Text
@@ -161,17 +162,25 @@ struct ComposedLayer {
   float anchorX = 0.5f, anchorY = 0.5f;      // fractions of the item's box
   float scale = 1, rotation = 0;             // rotation in degrees, clockwise
   float offsetX = 0, offsetY = 0;            // transition (push, slide), in output widths / heights
-  float crop[4] = {0, 0, 0, 0};              // left, top, right, bottom fractions removed
   float clip[4] = {0, 0, 1, 1};              // visible output region x0, y0, x1, y1 (wipe)
 
   float opacity = 1;
-  Blend blend = Blend::Normal;
-  // Effects (§4.4), applied crop → chromaKey → colorAdjust → blur.
-  float brightness = 0, contrast = 1, saturation = 1;
-  float blur = 0;                            // Gaussian sigma, as a fraction of the output height
-  bool chromaKey = false;
-  Color keyColor;
-  float keyTolerance = 0.15f, keySoftness = 0.1f;
+  Blend blend = Blend::Normal;  // in a group: Normal (over) or Add (crossfade mix)
+  ComposedEffects effects;
+};
+
+// A track drawn on its own first (scene_graph_spec.md §5.1): its layers are combined over a
+// transparent image, then the track's effects and opacity apply, and the result is blended
+// onto the canvas. Used while two of its items are visible (a transition) or when the track
+// has effects; otherwise its layer is drawn onto the canvas directly, which looks the same.
+struct ComposedGroup {
+  int track = -1;  // scene track index
+  float opacity = 1;
+  Blend blend = Blend::Normal;  // onto the canvas: the top item's
+  ComposedEffects effects;      // on the combined image, in output coordinates
+  bool operator==(const ComposedGroup& o) const {
+    return track == o.track && opacity == o.opacity && blend == o.blend && effects == o.effects;
+  }
 };
 
 // One output frame as the display (or the export sink) should draw it: layers bottom to top
@@ -183,7 +192,8 @@ struct ComposedFrame {
   int64_t frameDurationUs = 0;  // of the leading item, for frame pacing
   int width = 0, height = 0;    // canvas
   Color background;
-  std::vector<ComposedLayer> layers;
+  std::vector<ComposedLayer> layers;  // a group's layers are next to each other
+  std::vector<ComposedGroup> groups;
   VideoFilter filter;       // global, applied to video and image layers after their own effects
   int64_t presentAtNs = 0;  // Vsync driver: the vsync this frame was composed for; 0 = paced by AvSync
   size_t bytes() const { return 0; }

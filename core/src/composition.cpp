@@ -147,6 +147,30 @@ int FrameSampler::leadItem(int64_t t) const {
   return lead;
 }
 
+// Effects evaluated at `at`: item-local time for an item's, scene time for a track's.
+static ComposedEffects evaluate(const SceneEffects& e, int64_t at) {
+  ComposedEffects out;
+  if (e.crop) {
+    out.crop[0] = float(e.cropLeft.at(at));
+    out.crop[1] = float(e.cropTop.at(at));
+    out.crop[2] = float(e.cropRight.at(at));
+    out.crop[3] = float(e.cropBottom.at(at));
+  }
+  if (e.colorAdjust) {
+    out.brightness = float(e.brightness.at(at));
+    out.contrast = float(e.contrast.at(at));
+    out.saturation = float(e.saturation.at(at));
+  }
+  if (e.blur) out.blur = float(e.blurRadius.at(at));
+  if (e.chromaKey) {
+    out.chromaKey = true;
+    out.keyColor = e.keyColor;
+    out.keyTolerance = e.keyTolerance;
+    out.keySoftness = e.keySoftness;
+  }
+  return out;
+}
+
 ComposedFrame FrameSampler::composeAt(int64_t t) const {
   ComposedFrame out;
   out.ptsUs = t;
@@ -160,6 +184,11 @@ ComposedFrame FrameSampler::composeAt(int64_t t) const {
 
   std::vector<SceneLayout::Visible> visible;
   layout().visibleAt(t, &visible);
+  // A track is drawn on its own first (a group) while two of its items are visible, or when it
+  // has effects (§5.1). A lone item without track effects is drawn onto the canvas directly.
+  const std::vector<SceneTrack>& tracks = ctx_.scene.tracks;
+  std::vector<int> shown(tracks.size(), 0), groupOf(tracks.size(), -1);
+  for (const SceneLayout::Visible& v : visible) ++shown[v.track];
   for (const SceneLayout::Visible& v : visible) {
     const SceneItem& it = layout().item(v.item);
     const ItemRuntime& rt = ctx_.items[v.item];
@@ -201,26 +230,26 @@ ComposedFrame FrameSampler::composeAt(int64_t t) const {
     l.offsetX = v.offsetX;
     l.offsetY = v.offsetY;
     std::copy(v.clip, v.clip + 4, l.clip);
-    l.opacity = float(it.opacity.at(local)) * v.fade * layout().trackOf(v.item).opacity;
-    l.blend = it.blend;
-    const SceneEffects& e = it.effects;
-    if (e.crop) {
-      l.crop[0] = float(e.cropLeft.at(local));
-      l.crop[1] = float(e.cropTop.at(local));
-      l.crop[2] = float(e.cropRight.at(local));
-      l.crop[3] = float(e.cropBottom.at(local));
-    }
-    if (e.colorAdjust) {
-      l.brightness = float(e.brightness.at(local));
-      l.contrast = float(e.contrast.at(local));
-      l.saturation = float(e.saturation.at(local));
-    }
-    if (e.blur) l.blur = float(e.blurRadius.at(local));
-    if (e.chromaKey) {
-      l.chromaKey = true;
-      l.keyColor = e.keyColor;
-      l.keyTolerance = e.keyTolerance;
-      l.keySoftness = e.keySoftness;
+    l.effects = evaluate(it.effects, local);
+    const SceneTrack& track = tracks[v.track];
+    float opacity = float(it.opacity.at(local)) * v.fade;
+    if (shown[v.track] > 1 || track.effects.any()) {
+      int& g = groupOf[v.track];
+      if (g < 0) {
+        g = int(out.groups.size());
+        ComposedGroup group;
+        group.track = v.track;
+        group.opacity = track.opacity;
+        group.effects = evaluate(track.effects, t);
+        out.groups.push_back(group);
+      }
+      out.groups[g].blend = it.blend;  // the top item's: the one drawn last
+      l.group = g;
+      l.opacity = opacity;
+      l.blend = v.mix ? Blend::Add : Blend::Normal;  // combined over a transparent image
+    } else {
+      l.opacity = opacity * track.opacity;
+      l.blend = it.blend;
     }
     out.layers.push_back(std::move(l));
   }

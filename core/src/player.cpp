@@ -14,14 +14,6 @@ bool isValid(const VideoFilter& f) {
          f.contrast >= 0 && f.contrast <= 2;
 }
 
-bool isValid(const Timeline& t) {
-  if (t.clips.empty() || t.clips.size() > Timeline::kMaxClips || t.transition.durationUs < 0) return false;
-  for (const TextOverlay& o : t.texts) {
-    if (o.startUs < 0 || o.endUs <= o.startUs) return false;
-  }
-  return isValid(t.filter);
-}
-
 struct Player::Impl : PipelineEvents {
   Impl(PlatformFactory& factory, PlayerListener* l) : ctx(factory, *this), listener(l), owner(std::this_thread::get_id()) {
     stages = makeStages(ctx);
@@ -40,26 +32,8 @@ struct Player::Impl : PipelineEvents {
 
   // --- API (owner thread) ---
 
-  Result open(const Timeline& timeline, const RenderTarget& target) {
-    if (!isValid(timeline)) return Result::InvalidArgument;
-    bool single = timeline.clips.size() == 1;
-    Driver driver = timeline.driver == OutputDriver::LeadingClip || (timeline.driver == OutputDriver::Auto && single)
-                        ? Driver::LeadingClip
-                        : Driver::Vsync;
-    return start(target, driver, false, [&] {
-      ctx.timeline = timeline;
-      ctx.setFilter(timeline.filter);
-    });
-  }
-
   Result open(const Scene& scene, const RenderTarget& target, OutputDriver driver, std::string* error) {
     if (validateScene(scene, error) != Result::Ok) return Result::InvalidArgument;
-    Driver d = driver == OutputDriver::LeadingClip ? Driver::LeadingClip : Driver::Vsync;
-    return start(target, d, driver == OutputDriver::Auto, [&] { ctx.scene = scene; });
-  }
-
-  template <typename F>
-  Result start(const RenderTarget& target, Driver driver, bool autoDriver, F setScene) {
     {
       std::lock_guard<std::mutex> lock(stateMu);
       if (state != State::Start || openCalled) return Result::InvalidState;
@@ -67,9 +41,9 @@ struct Player::Impl : PipelineEvents {
     }
     Result r = ctx.display->attach(target, [this](int64_t pts, int64_t ns) { onPresented(pts, ns); });
     if (r != Result::Ok) return r;
-    ctx.driver = driver;
-    ctx.autoDriver = autoDriver;
-    setScene();
+    ctx.driver = driver == OutputDriver::LeadingClip ? Driver::LeadingClip : Driver::Vsync;
+    ctx.autoDriver = driver == OutputDriver::Auto;
+    ctx.scene = scene;
     ctx.metrics.startTtff(ctx.hostClock.nowNs());
     ctx.openRequested = true;
     ctx.wake(StageId::Source);
@@ -255,13 +229,18 @@ Player::~Player() = default;
 Result Player::open(const Scene& s, const RenderTarget& t, OutputDriver d, std::string* error) {
   return impl_->onOwner() ? impl_->open(s, t, d, error) : Result::WrongThread;
 }
-Result Player::open(const Timeline& tl, const RenderTarget& t) {
-  return impl_->onOwner() ? impl_->open(tl, t) : Result::WrongThread;
-}
 Result Player::open(const MediaSource& s, const RenderTarget& t) {
-  Timeline tl;
-  tl.clips = {s};
-  return open(tl, t);
+  Scene scene;
+  scene.output.width = scene.output.height = 0;  // the file's size, frame rate and audio format
+  scene.output.fpsNum = 0;
+  scene.output.sampleRate = scene.output.channels = 0;
+  SceneTrack track;
+  SceneItem item;
+  item.type = ItemType::Video;
+  item.source = s;  // duration 0: to the end of the file
+  track.items.push_back(item);
+  scene.tracks.push_back(track);
+  return open(scene, t);
 }
 Result Player::setFilter(const VideoFilter& f) { return impl_->onOwner() ? impl_->setFilter(f) : Result::WrongThread; }
 Result Player::play() { return impl_->onOwner() ? impl_->play() : Result::WrongThread; }

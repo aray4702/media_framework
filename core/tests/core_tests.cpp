@@ -411,11 +411,54 @@ static std::vector<fake::Clip> clips(int n, int64_t durationUs, bool audio = tru
   return std::vector<fake::Clip>(n, c);
 }
 
+// The clips back to back on one video track (clip k plays fake clip k), joined by pushes of
+// `transitionUs`. The output takes the first clip's size, rate and audio format.
+static Scene clipScene(const std::vector<fake::Clip>& c, int64_t transitionUs = 0, Direction direction = Direction::Left) {
+  Scene s;
+  s.output.width = s.output.height = s.output.fpsNum = 0;
+  s.output.sampleRate = s.output.channels = 0;
+  SceneTrack track;
+  int64_t start = 0;
+  for (size_t k = 0; k < c.size(); ++k) {
+    SceneItem it;
+    it.type = ItemType::Video;
+    it.source = fake::clipSource(int(k));
+    it.startUs = start;
+    it.durationUs = c[k].durationUs;
+    track.items.push_back(it);
+    if (k + 1 < c.size() && transitionUs > 0) {
+      SceneTransition x;
+      x.from = int(k);
+      x.kind = SceneTransitionKind::Push;
+      x.direction = direction;
+      x.durationUs = transitionUs;
+      track.transitions.push_back(x);
+    }
+    start += c[k].durationUs - transitionUs;
+  }
+  s.tracks.push_back(track);
+  return s;
+}
+
+// A caption at the bottom, on a track of its own.
+static void addCaption(Scene* s, const std::string& text, int64_t startUs, int64_t endUs) {
+  SceneItem it;
+  it.type = ItemType::Text;
+  it.text = text;
+  it.startUs = startUs;
+  it.durationUs = endUs - startUs;
+  it.style.hasBox = true;
+  it.transform.y = Animatable(0.96);
+  it.transform.anchorY = 1;
+  SceneTrack track;
+  track.items.push_back(it);
+  s->tracks.push_back(track);
+}
+
 TEST(composition_seek_into_a_transition_shows_both_clips) {
-  fake::Harness h(clips(2, 2000000));
-  Timeline t;
-  t.transition = {TransitionKind::SlideLeft, 1000000};
-  CHECK(h.open(t) == Result::Ok);
+  std::vector<fake::Clip> c = clips(2, 2000000);
+  fake::Harness h(c);
+  CHECK(h.openScene(clipScene(c, 1000000)) == Result::Ok);
   h.run(20);
   CHECK_EQ(h.player->durationUs(), 3000000);
   CHECK_EQ(h.lastComposed().layers.size(), size_t(1));
@@ -435,10 +478,9 @@ TEST(composition_seek_into_a_transition_shows_both_clips) {
 }
 
 TEST(composition_plays_through_a_transition_with_an_audio_crossfade) {
-  fake::Harness h(clips(2, 2000000));
-  Timeline t;
-  t.transition = {TransitionKind::SlideLeft, 1000000};
-  h.open(t);
+  std::vector<fake::Clip> c = clips(2, 2000000);
+  fake::Harness h(c);
+  h.openScene(clipScene(c, 1000000));
   h.run(20);
   h.player->play();
   h.run(3500);
@@ -474,9 +516,7 @@ TEST(composition_fades_to_a_clip_without_audio) {
   std::vector<fake::Clip> c = clips(2, 2000000);
   c[1].audio = false;
   fake::Harness h(c);
-  Timeline t;
-  t.transition = {TransitionKind::SlideRight, 1000000};
-  h.open(t);
+  h.openScene(clipScene(c, 1000000, Direction::Right));
   h.run(20);
   h.player->play();
   h.run(3500);
@@ -488,10 +528,9 @@ TEST(composition_fades_to_a_clip_without_audio) {
 }
 
 TEST(composition_reuses_a_lane_for_the_third_clip) {
-  fake::Harness h(clips(3, 1000000));
-  Timeline t;
-  t.transition = {TransitionKind::SlideLeft, 250000};
-  h.open(t);
+  std::vector<fake::Clip> c = clips(3, 1000000);
+  fake::Harness h(c);
+  h.openScene(clipScene(c, 250000));
   h.run(20);
   CHECK_EQ(h.player->durationUs(), 2500000);
   h.player->play();
@@ -510,10 +549,9 @@ TEST(composition_reuses_a_lane_for_the_third_clip) {
 }
 
 TEST(composition_cut_has_no_overlap) {
-  fake::Harness h(clips(2, 1000000));
-  Timeline t;
-  t.transition.kind = TransitionKind::Cut;
-  h.open(t);
+  std::vector<fake::Clip> c = clips(2, 1000000);
+  fake::Harness h(c);
+  h.openScene(clipScene(c));
   h.run(20);
   CHECK_EQ(h.player->durationUs(), 2000000);
   h.player->play();
@@ -524,9 +562,9 @@ TEST(composition_cut_has_no_overlap) {
 
 TEST(composition_shows_captions_in_their_time_range) {
   fake::Harness h;
-  Timeline t;
-  t.texts = {{"hello", 0, 1000000}};
-  h.open(t);
+  Scene s = clipScene({fake::Clip{}});
+  addCaption(&s, "hello", 0, 1000000);
+  h.openScene(s);
   h.run(20);
   h.player->seek(500000);
   h.run(50);
@@ -538,9 +576,8 @@ TEST(composition_shows_captions_in_their_time_range) {
 
 TEST(composition_filter_applies_at_once_even_when_paused) {
   fake::Harness h;
-  Timeline t;
-  t.filter = {-0.1f, 0.9f};
-  h.open(t);
+  h.open();
+  CHECK(h.player->setFilter({-0.1f, 0.9f}) == Result::Ok);  // before the first frame
   h.run(20);
   CHECK(h.lastComposed().filter == (VideoFilter{-0.1f, 0.9f}));
 
@@ -558,29 +595,67 @@ TEST(composition_filter_applies_at_once_even_when_paused) {
   CHECK(h.player->setFilter({NAN, 1}) == Result::InvalidArgument);
 }
 
-TEST(composition_rejects_bad_timelines) {
-  fake::Harness h;
-  Timeline empty;
-  CHECK(h.player->open(empty, RenderTarget{}) == Result::InvalidArgument);
-  Timeline tooMany;
-  tooMany.clips.resize(Timeline::kMaxClips + 1);
-  CHECK(h.player->open(tooMany, RenderTarget{}) == Result::InvalidArgument);
-  Timeline badText;
-  badText.texts = {{"x", 1000, 1000}};
-  CHECK(h.open(badText) == Result::InvalidArgument);
-  CHECK(h.open(Timeline{}) == Result::Ok);  // nothing was opened by the failed calls
+TEST(scene_duration_0_plays_to_the_end_of_the_file) {
+  std::vector<fake::Clip> c = clips(2, 2000000);
+  fake::Harness h(c);
+  Scene s = clipScene(c);
+  s.tracks[0].items[0].durationUs = 0;  // 2 s
+  s.tracks[0].items[1].inUs = 500000;
+  s.tracks[0].items[1].durationUs = 0;  // the 1.5 s after `in`
+  CHECK(h.openScene(s) == Result::Ok);
+  h.run(20);
+  CHECK_EQ(h.player->durationUs(), 3500000);
+  h.player->seek(2500000);
+  h.run(50);
+  CHECK_EQ(h.lastComposed().layers.size(), size_t(1));
+  CHECK_EQ(h.lastComposed().layers[0].frame.item, 1);
+  CHECK_EQ(h.lastComposed().layers[0].frame.ptsUs, 1000000);  // in + 0.5 s
+
+  fake::Harness single;  // open(MediaSource): one video, to the end of the file
+  CHECK(single.open() == Result::Ok);
+  single.run(20);
+  CHECK_EQ(single.player->durationUs(), 2000000);
+}
+
+TEST(scene_duration_0_is_checked_once_probed) {
+  std::vector<fake::Clip> c = clips(2, 2000000);
+  {
+    fake::Harness h(c);
+    Scene s = clipScene(c);
+    s.tracks[0].items[0].durationUs = 0;
+    s.tracks[0].items[1].startUs = 1000000;  // overlaps the first once its length is known (R2)
+    CHECK(h.openScene(s) == Result::Ok);
+    h.run(20);
+    CHECK(h.player->state() == State::Error);
+    CHECK(h.listener.errors == std::vector<Result>{Result::InvalidArgument});
+  }
+  {
+    fake::Harness h(c);
+    Scene s = clipScene(c);
+    s.tracks[0].items[0].durationUs = 0;
+    s.tracks[0].items[0].inUs = 3000000;  // past the end of the file (R10)
+    CHECK(h.openScene(s) == Result::Ok);
+    h.run(20);
+    CHECK(h.listener.errors == std::vector<Result>{Result::MalformedMedia});
+  }
+  {
+    fake::Harness h(c);
+    Scene s = clipScene(c);
+    addCaption(&s, "x", 0, 1000000);
+    s.tracks[1].items[0].durationUs = 0;  // only video and audio items have a file to end with
+    std::string error;
+    CHECK(h.openScene(s, OutputDriver::Auto, &error) == Result::InvalidArgument);
+    CHECK(!error.empty());
+  }
 }
 
 // --- Output drivers -----------------------------------------------------------------------
 
-// Plays a two-clip timeline (1 s slide) to the end and counts the frames shown mid-slide.
+// Plays two clips (1 s slide) to the end and counts the frames shown mid-slide.
 static int transitionFramesShown(std::vector<fake::Clip> c, OutputDriver driver, fake::Harness** keep = nullptr) {
   static std::unique_ptr<fake::Harness> h;
-  h = std::make_unique<fake::Harness>(std::move(c));
-  Timeline t;
-  t.transition = {TransitionKind::SlideLeft, 1000000};
-  t.driver = driver;
-  h->open(t);
+  h = std::make_unique<fake::Harness>(c);
+  h->openScene(clipScene(c, 1000000), driver);
   h->run(20);
   h->player->play();
   h->run(3500);
@@ -608,10 +683,9 @@ TEST(driver_vsync_moves_the_slide_every_refresh) {
 }
 
 TEST(driver_vsync_skips_refreshes_with_nothing_new) {
-  fake::Harness h(clips(1, 1000000));
-  Timeline t;
-  t.driver = OutputDriver::Vsync;
-  h.open(t);
+  std::vector<fake::Clip> c = clips(1, 1000000);
+  fake::Harness h(c);
+  h.openScene(clipScene(c), OutputDriver::Vsync);
   h.run(20);
   h.player->play();
   h.run(1500);
@@ -631,19 +705,26 @@ static int64_t latestFrameAt(int64_t localUs, int fps) {
   return i * 1000000 / fps;
 }
 
+// Export needs the output size and rate: 1920x1080 at `fps`, 48 kHz stereo.
+static Scene exportScene(const std::vector<fake::Clip>& c, int64_t transitionUs, int fps = 30) {
+  Scene s = clipScene(c, transitionUs);
+  s.output = SceneOutput{};
+  s.output.fpsNum = fps;
+  return s;
+}
+
 TEST(export_writes_every_grid_frame_with_exact_layers) {
-  fake::ExportHarness h(clips(2, 2000000));
-  Timeline t;
-  t.transition = {TransitionKind::SlideLeft, 1000000};
-  t.texts = {{"caption", 0, 500000}};
-  ExportSettings s;
-  s.fps = 24;  // not the clips' 30 fps: each output frame samples the clips
-  CHECK(h.start(t, s) == Result::Ok);
+  std::vector<fake::Clip> c = clips(2, 2000000);
+  fake::ExportHarness h(c);
+  Scene s = exportScene(c, 1000000, 24);  // not the clips' 30 fps: each output frame samples the clips
+  addCaption(&s, "caption", 0, 500000);
+  CHECK(h.start(s) == Result::Ok);
   h.run(20000);
   CHECK_EQ(h.listener.completed, 1);
   CHECK(h.exporter->progress() == 1.0);
   fake::ExportSink& sink = *h.platform.exportSink;
   CHECK(sink.finished);
+  CHECK_EQ(sink.settings.fps, 24);
   CHECK_EQ(sink.video.size(), size_t(72));  // 3 s at 24 fps
   int transition = 0;
   for (size_t n = 0; n < sink.video.size(); ++n) {
@@ -665,24 +746,29 @@ TEST(export_writes_every_grid_frame_with_exact_layers) {
 }
 
 TEST(export_keeps_going_when_the_encoder_is_busy) {
-  fake::ExportHarness h(clips(2, 1000000), true, 3);
-  CHECK(h.start(Timeline{}, ExportSettings{}) == Result::Ok);
+  std::vector<fake::Clip> c = clips(2, 1000000);
+  fake::ExportHarness h(c, true, 3);
+  CHECK(h.start(exportScene(c, 500000)) == Result::Ok);
   h.run(20000);
   CHECK_EQ(h.listener.completed, 1);
-  CHECK_EQ(h.platform.exportSink->video.size(), size_t(45));  // 1.5 s (slide capped at 0.5 s) at 30 fps
+  CHECK_EQ(h.platform.exportSink->video.size(), size_t(45));  // 1.5 s at 30 fps
   CHECK_EQ(h.platform.exportSink->audioFrames, int64_t{72000});
 }
 
 TEST(export_rejects_bad_settings_and_missing_support) {
-  fake::ExportHarness h(clips(1, 1000000));
-  ExportSettings odd;
-  odd.width = 1279;
-  CHECK(h.start(Timeline{}, odd) == Result::InvalidArgument);
-  ExportSettings slow;
-  slow.fps = 0;
-  CHECK(h.start(Timeline{}, slow) == Result::InvalidArgument);
-  fake::ExportHarness none(clips(1, 1000000), false);
-  CHECK(none.start(Timeline{}, ExportSettings{}) == Result::Unsupported);
+  std::vector<fake::Clip> c = clips(1, 1000000);
+  fake::ExportHarness h(c);
+  Scene odd = exportScene(c, 0);
+  odd.output.width = 1279;
+  CHECK(h.start(odd) == Result::InvalidArgument);
+  Scene noRate = exportScene(c, 0);
+  noRate.output.fpsNum = 0;
+  CHECK(h.start(noRate) == Result::InvalidArgument);
+  ExportSettings noBitrate;
+  noBitrate.videoBitrate = 0;
+  CHECK(h.start(exportScene(c, 0), noBitrate) == Result::InvalidArgument);
+  fake::ExportHarness none(c, false);
+  CHECK(none.start(exportScene(c, 0)) == Result::Unsupported);
 }
 
 // --- Scene graph ----------------------------------------------------------------------------
@@ -836,7 +922,8 @@ TEST(scene_composites_three_stacked_videos) {
     CHECK_EQ(f.layers[i].frame.ptsUs, 1000000);
   }
   CHECK(f.layers[1].x == 0.8f && f.layers[1].scale == 0.3f);
-  CHECK(std::abs(f.layers[2].scale - 0.3f) < 1e-6 && f.layers[2].fit == Fit::Cover && f.layers[2].saturation == 0);
+  CHECK(std::abs(f.layers[2].scale - 0.3f) < 1e-6 && f.layers[2].fit == Fit::Cover && f.layers[2].effects.saturation == 0);
+  CHECK(f.groups.empty());  // one item per track, no track effects: drawn straight onto the canvas
   h.player->play();
   h.run(2500);
   CHECK_EQ(h.listener.ended, 1);
@@ -890,13 +977,69 @@ TEST(scene_transitions_crossfade_slide_and_wipe) {
     h.run(30);
     return h.lastComposed();
   };
-  const ComposedFrame& fade = at(1500000);
+  const ComposedFrame& fade = at(1250000);  // a quarter through: (1 − p)·A + p·B, summed in the track's own image
   CHECK_EQ(fade.layers.size(), size_t(2));
-  CHECK(fade.layers[0].opacity == 1 && std::abs(fade.layers[1].opacity - 0.5f) < 1e-6);
+  CHECK_EQ(fade.groups.size(), size_t(1));
+  CHECK(fade.layers[0].group == 0 && fade.layers[1].group == 0);
+  CHECK(std::abs(fade.layers[0].opacity - 0.75f) < 1e-6 && std::abs(fade.layers[1].opacity - 0.25f) < 1e-6);
+  CHECK(fade.layers[0].blend == Blend::Add && fade.layers[1].blend == Blend::Add);
   const ComposedFrame& slide = at(2500000);
   CHECK(slide.layers[0].offsetY == 0 && std::abs(slide.layers[1].offsetY - 0.5f) < 1e-6);  // coming up from below
+  CHECK(slide.layers[0].opacity == 1 && slide.layers[1].blend == Blend::Normal && slide.layers[1].group == 0);  // B over A
   const ComposedFrame& wipe = at(3250000);
   CHECK(wipe.layers[1].clip[0] == 0 && std::abs(wipe.layers[1].clip[2] - 0.25f) < 1e-6);   // revealed from the left
+}
+
+// §5.1: a track's pair is combined on its own, then its effects, opacity and the top item's
+// blend apply to the result. A lone item without track effects is drawn straight onto the canvas.
+TEST(scene_groups_a_track_in_a_transition_or_with_effects) {
+  fake::Harness h;
+  Scene scene = sceneFrom(R"({"version": 1, "output": {"width": 640, "height": 360, "fps": 30}, "tracks": [
+      {"kind": "video", "items": [{"type": "color", "color": "#00ff00", "start": 0, "duration": 4}]},
+      {"kind": "video", "opacity": 0.5, "items": [
+        {"type": "color", "color": "#ff0000", "start": 0, "duration": 2, "opacity": 0.8},
+        {"type": "transition", "kind": "push", "duration": 1},
+        {"type": "color", "color": "#0000ff", "start": 1, "duration": 2, "blend": "screen"}]},
+      {"kind": "video", "effects": [{"type": "colorAdjust", "brightness": {"keys": [[0, 0], [4, -0.4]]}},
+                                    {"type": "crop", "right": 0.5}],
+        "items": [{"type": "color", "color": "#ffffff", "start": 2, "duration": 2}]}]})");
+  CHECK(h.openScene(scene) == Result::Ok);
+  h.run(20);
+  auto at = [&](int64_t t) -> const ComposedFrame& {
+    h.player->seek(t);
+    h.run(30);
+    return h.lastComposed();
+  };
+  const ComposedFrame& push = at(1500000);
+  CHECK_EQ(push.layers.size(), size_t(3));
+  CHECK_EQ(push.layers[0].group, -1);  // the bottom track
+  CHECK_EQ(push.groups.size(), size_t(1));
+  const ComposedGroup& pair = push.groups[0];
+  CHECK(pair.track == 1 && pair.opacity == 0.5f && pair.blend == Blend::Screen);  // track opacity, B's blend
+  CHECK(push.layers[1].group == 0 && push.layers[2].group == 0);
+  CHECK(std::abs(push.layers[1].opacity - 0.8f) < 1e-6 && push.layers[2].opacity == 1);  // without the track's opacity
+  CHECK(push.layers[1].blend == Blend::Normal && push.layers[2].blend == Blend::Normal);
+
+  const ComposedFrame& alone = at(500000);  // before the push: one item, no track effects
+  CHECK(alone.groups.empty() && alone.layers.size() == size_t(2));
+  CHECK(std::abs(alone.layers[1].opacity - 0.4f) < 1e-6);  // 0.8 on a half-opacity track
+
+  const ComposedFrame& effects = at(2500000);  // after the push; the top track has effects, keyed in scene time
+  CHECK_EQ(effects.groups.size(), size_t(1));
+  const ComposedGroup& top = effects.groups[0];
+  CHECK_EQ(top.track, 2);
+  CHECK(std::abs(top.effects.brightness - -0.25f) < 1e-6 && top.effects.crop[2] == 0.5f);
+  CHECK(effects.layers[1].group == -1 && effects.layers[2].group == 0);
+  CHECK(effects.layers[2].effects.brightness == 0);  // the track's effects aren't the item's
+
+  std::string error;
+  CHECK(parseScene(R"({"version": 1, "output": {"width": 640, "height": 360, "fps": 30}, "tracks": [
+      {"kind": "video", "effects": [{"type": "blur", "radius": 0.5}], "items": [{"type": "color", "color": "#ffffff", "start": 0, "duration": 1}]}]})",
+                   resolveClip, &scene, &error) == Result::InvalidArgument);
+  CHECK(error.find("tracks[0].effects.radius") != std::string::npos);
+  CHECK(parseScene(R"({"version": 1, "output": {"width": 640, "height": 360, "fps": 30}, "tracks": [
+      {"kind": "audio", "effects": [{"type": "blur", "radius": 0.01}], "items": [{"type": "audio", "src": "clip0", "start": 0, "duration": 1}]}]})",
+                   resolveClip, &scene, &error) == Result::InvalidArgument);
 }
 
 TEST(scene_speed_and_in_map_to_media_time) {

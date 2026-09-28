@@ -53,14 +53,13 @@ Progress VsyncDriver::step(FrameSampler& s, CompositionOutput& out) {
 
 // Nothing visible differs from the last output: the same frames, and every value the same.
 bool VsyncDriver::unchanged(const ComposedFrame& f) const {
-  if (!last_ || last_->layers.size() != f.layers.size() || !(last_->filter == f.filter)) return false;
+  if (!last_ || last_->layers.size() != f.layers.size() || !(last_->filter == f.filter) || !(last_->groups == f.groups)) return false;
   for (size_t i = 0; i < f.layers.size(); ++i) {
     const ComposedLayer &a = last_->layers[i], &b = f.layers[i];
     if (a.kind != b.kind || a.item != b.item || a.frame.ptsUs != b.frame.ptsUs || a.text != b.text || !(a.color == b.color) ||
         a.x != b.x || a.y != b.y || a.scale != b.scale || a.rotation != b.rotation || a.offsetX != b.offsetX ||
-        a.offsetY != b.offsetY || a.opacity != b.opacity || a.brightness != b.brightness || a.contrast != b.contrast ||
-        a.saturation != b.saturation || a.blur != b.blur || !std::equal(a.crop, a.crop + 4, b.crop) ||
-        !std::equal(a.clip, a.clip + 4, b.clip)) {
+        a.offsetY != b.offsetY || a.opacity != b.opacity || a.blend != b.blend || a.group != b.group ||
+        !(a.effects == b.effects) || !std::equal(a.clip, a.clip + 4, b.clip)) {
       return false;
     }
   }

@@ -2,7 +2,6 @@
 
 #include <memory>
 #include <string>
-#include <vector>
 
 #include "mf/adapters.h"
 #include "mf/scene.h"
@@ -24,17 +23,6 @@ struct MetricsReport {
   std::string toString() const;
 };
 
-// What open() plays: clips back to back, joined by a transition, with captions and a filter.
-struct Timeline {
-  static constexpr size_t kMaxClips = 16;
-  std::vector<MediaSource> clips;  // 1 to kMaxClips, played in order
-  Transition transition;           // between each pair of clips
-  std::vector<TextOverlay> texts;  // timeline time; the first one covering a frame is shown
-  VideoFilter filter;
-  OutputDriver driver = OutputDriver::Auto;  // playback only; export ignores it
-};
-
-bool isValid(const Timeline&);
 bool isValid(const VideoFilter&);
 
 // Callbacks run on internal threads. They must return quickly and must never wait on the
@@ -59,8 +47,7 @@ class Player {
   // Returns at once; probing runs on T1. The scene is validated here (InvalidArgument, with
   // `error` saying why); media problems arrive later through onError.
   Result open(const Scene&, const RenderTarget&, OutputDriver = OutputDriver::Auto, std::string* error = nullptr);
-  Result open(const Timeline&, const RenderTarget&);     // clips back to back, as a scene
-  Result open(const MediaSource&, const RenderTarget&);  // a timeline of one clip
+  Result open(const MediaSource&, const RenderTarget&);  // a scene of one video, to the end of the file
   Result play();
   Result pause();
   Result seek(int64_t positionUs);  // completes via onSeekCompleted

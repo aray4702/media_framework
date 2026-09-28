@@ -4,7 +4,9 @@
 // target, cleared to its background, then every layer bottom to top. A layer is fitted,
 // transformed (anchor, scale, rotation, transition offset), clipped (wipe) and blended, with
 // its effects applied in the shader: chroma key, color adjust, then the global filter. A
-// blurred layer is first drawn into a texture and blurred in two Gaussian passes. Video layers
+// blurred layer is first drawn into a texture and blurred in two Gaussian passes. A group (a
+// track in a transition, or with effects) is first combined into its own texture, then drawn
+// onto the canvas as one layer with the track's effects, opacity and blend. Video layers
 // are sampled straight from their decoder surfaces, so compositing adds no copy. The display
 // draws into drawables with it, and the export sink into encoder buffers.
 
@@ -35,7 +37,13 @@ class MetalCompositor {
 
   bool prepare(const ComposedLayer&, double canvasW, double canvasH, double scale, Prepared*, std::vector<CVMetalTextureRef>*);
   void blurInto(Prepared*, const ComposedLayer&, id<MTLCommandBuffer>, double sigmaPx);
-  void draw(id<MTLRenderCommandEncoder>, const Prepared&, const ComposedLayer&, const VideoFilter&, bool effects);
+  // `filter`: the global filter, for video and image layers; null for a track's combined image.
+  void draw(id<MTLRenderCommandEncoder>, id<MTLRenderPipelineState>, const Prepared&, const ComposedLayer&, const VideoFilter* filter,
+            bool effects);
+  void drawLayer(id<MTLRenderCommandEncoder>, id<MTLRenderPipelineState>, const Prepared&, const ComposedLayer&, const VideoFilter*,
+                 const MTLViewport&, double targetW, double targetH);
+  bool combine(const ComposedFrame&, int group, const std::vector<Prepared>&, const std::vector<bool>& ok, const MTLViewport&,
+               double targetW, double targetH, id<MTLCommandBuffer>, Prepared* out);
 
   // Text rendered once into a texture, reused while the text, style and size stay the same.
   struct TextTexture {
@@ -50,7 +58,9 @@ class MetalCompositor {
   MTLPixelFormat format_ = MTLPixelFormatBGRA8Unorm;
   id<MTLRenderPipelineState> pipelines_[kSources][4] = {};  // by source, by blend mode
   id<MTLRenderPipelineState> offscreen_[kSources] = {};     // effects into a blur texture, no blending
+  id<MTLRenderPipelineState> group_[kSources][2] = {};      // into a track's image: over, and plus (crossfade)
   id<MTLRenderPipelineState> blur_ = nil;                    // one Gaussian pass
+  std::vector<id<MTLTexture>> groupTextures_;  // one per group of a frame, reused
   CVMetalTextureCacheRef cache_ = nullptr;
   std::list<TextTexture> texts_;  // most recent first
 };

@@ -34,9 +34,9 @@ Source: [reqs.md](reqs.md). This spec defines the smallest version that works en
         ┌──────── Player (C++ core: state machine, clock, queues) ────────┐
         │                                                                 │
  T1 Source:  IDemuxer ─(video)─► [video pkt Q] ──► T2 VideoDecode: IVideoDecoder ──► [frame Q] ─┐
-  (per clip,  (per track) ─(audio)─► [audio pkt Q] ─┐                                              ├─► TC Composition ──► [composed Q] ──► T3 VideoRender: IDisplay ──► presenter
-   2 lanes)                                        └─► T4 Audio: IAudioDecoder ×2, mixer ──► ISpeaker ring ──► RT render callback
-             each lane (clip i on lane i % 2) has its own packet queues, decoders and frame queue ─┘
+  (per item,  (per track) ─(audio)─► [audio pkt Q] ─┐                                              ├─► TC Composition ──► [composed Q] ──► T3 VideoRender: IDisplay ──► presenter
+   per lane)                                       └─► T4 Audio: IAudioDecoder per lane, mixer ──► ISpeaker ring ──► RT render callback
+             each lane (≤ 8; items on a lane never overlap) has its own packet queues, decoders, frame queue ─┘
         │                                                                 │
         └──────────── MasterClock = audio frames consumed | steady_clock ─┘
 ```
@@ -49,7 +49,7 @@ Source: [reqs.md](reqs.md). This spec defines the smallest version that works en
 - `MasterClock`: follows the audio clock when an audio track is playing, otherwise `std::chrono::steady_clock` (§4).
 - `AvSync`: decides for each frame whether to present or drop, and when to present it (§4).
 - `Metrics`: counters and histograms, fed with actual present times from the display. Dumped to the log on `shutdown` and exposed through a query.
-- `SceneLayout`: where each item of a scene plays, its lane, and what is visible at a given time with transition offsets and fades (§2.4; scene_graph_spec.md §7). A `Timeline` is turned into a scene of one video track.
+- `SceneLayout`: where each item of a scene plays, its lane, and what is visible at a given time with transition offsets and fades (§2.4; scene_graph_spec.md §7).
 - `Exporter`: the same pipeline with the export driver, writing to an `IExportSink` (§2.5).
 
 **Why C++17.** reqs.md asks for the common logic in C++. The standard is set to C++17 because:
@@ -165,7 +165,7 @@ Threading is part of the platform scheduler, not the core contract. The MVP's Ma
 | Caller          | API calls only. Every call returns without doing I/O or decoding. Only `shutdown` waits, to join the threads.                                                                                                                                                                                                                                    |
 | T1 Source       | Probes and configures on `open`, handles pending seeks, and demuxes. Among the tracks whose queue has room, it reads from the one with the lowest next decode time. A full video queue therefore never stops audio from being read, so a badly interleaved file can't deadlock the pipeline. The parser stage is a pass-through in the MVP (A3). |
 | T2 Video decode | For each lane: takes a packet, queues it into the lane's decoder, dequeues output in PTS order, and pushes it to the lane's frame queue.                                                                                                                                                                                                           |
-| TC Composition  | Merges the two lanes' frames in timeline order and builds each `ComposedFrame`: layers, slide offsets, caption, filter. Picks the frame to show for an exact seek (§4).                                                                                                                                                                           |
+| TC Composition  | Merges the lanes' frames in timeline order and builds each `ComposedFrame`: one layer per visible item, transitions, effects, filter. Picks the frame to show for an exact seek (§4).                                                                                                                                                                                            |
 | T3 Video render | Takes a composed frame, runs `AvSync`, then hands it to the presenter or drops it.                                                                                                                                                                                                                                                              |
 | T4 Audio        | Takes packets from both lanes, decodes them, mixes them on the timeline (§2.4), and writes to the `ISpeaker` ring buffer. When the ring is full, the thread waits a few ms. The frames the render callback consumes drive the master clock.                                                                                                        |
 
@@ -180,55 +180,32 @@ On Mac OS, T2 is thin: VideoToolbox already decodes asynchronously, so T2 mostly
 
 Host unit tests use a **single-threaded manual scheduler** that calls `pump()` in a fixed order with a fake clock. This makes the tests for sync, seek and the state machine deterministic.
 
-### 2.4 Composition: timeline, lanes and the composition stage
+### 2.4 Composition: scenes, lanes and the composition stage
 
-The player plays a **timeline**: up to 16 clips in order, a transition between each pair, captions and a filter.
+The player plays a **scene** (scene_graph_spec.md): tracks of video, image, text, color and audio items, transitions between neighbouring items of a track, effects and keyframes. It is loaded from a JSON document (`mf::macos::loadScene`) or built in code. A video or audio item with **duration 0 plays to the end of its file**: T1 opens the file, sets the duration, then checks the rules that need it. `open(MediaSource)` is a scene of one such item, with the output size, rate and audio format taken from the file. The filter (brightness −1..1, contrast 0..2) is not part of the scene; it is set with `setFilter`, live.
 
-```cpp
-struct Timeline {
-  std::vector<MediaSource> clips;   // 1 to 16, played in order
-  Transition transition;            // Cut, SlideLeft or SlideRight, with durationUs (default 1 s)
-  std::vector<TextOverlay> texts;   // {text, startUs, endUs} on the timeline; the first match is shown
-  VideoFilter filter;               // brightness -1..1 (0 = none), contrast 0..2 (1 = none); live via setFilter
-};
-```
+**Layout.** `SceneLayout` flattens the enabled tracks into items. Two items of a track overlap only across a transition, by exactly its length, so each video track shows at most two items at a time.
 
-**Layout.** Clip `i+1` starts `T` before clip `i` ends, so the two overlap for the transition, and the timeline is `sum(durations) − (n−1)·T` long. `T` is capped at half the shortest clip. So at most two clips are active at any time, and clip `i+2` starts only after clip `i` ends. A cut is `T = 0`.
+**Lanes.** Each video or audio item plays on a **lane**: its own packet queues, video and audio decoders and frame queue. Items are assigned greedily in start order, each widened by 1 s of preroll, so items that never overlap share a lane and an incoming item decodes alongside the outgoing one (at most 8 lanes). T1 probes every item on `open` (one demuxer each, to fail early on unsupported media), then:
 
-**Lanes.** Clip `i` always plays on **lane `i % 2`**. Each lane has its own packet queues, video and audio decoders and frame queue, so the incoming clip decodes alongside the outgoing one. T1 probes every clip on `open` (one demuxer each, for the durations and to fail early on unsupported media), then:
+- **Seek to `t`:** each lane seeks its first item that hasn't ended by `t` to its media time at `t` (or to its start, when it begins later).
+- **End of an item:** once a lane has read both tracks of an item to the end, it moves on to its next item from its start.
+- Packets carry their item index. When a lane's next item arrives, T2 waits for the previous item to drain (its Eos), then reconfigures the decoder. VideoToolbox keeps the session when `VTDecompressionSessionCanAcceptFormatDescription` accepts the new format.
 
-- **Seek to `t`:** the lane of the first clip active at `t` seeks into it, and the other lane seeks the next clip to `max(0, t − start)`.
-- **End of a clip:** once a lane has read both tracks of clip `i` to the end, it moves on to clip `i+2` from 0.
-- Packets carry their clip index. When a lane's next clip arrives, T2 waits for the previous clip to drain (its Eos), then reconfigures the decoder. VideoToolbox keeps the session when `VTDecompressionSessionCanAcceptFormatDescription` accepts the new format.
+**Composition stage (TC).** It takes frames from every lane in timeline order (the item's start plus its media time mapped through `in` and `speed`) and keeps each item's latest frame. `composeAt(t)` builds a `ComposedFrame`: one layer per visible item, bottom to top, with its transform, opacity, effects and transition offset, clip or fade evaluated at `t` (scene_graph_spec.md §4, §5). A track in a transition, or with effects of its own, becomes a group: its items are combined on their own first (B over A, or a true crossfade mix), then the track's effects and opacity apply and the result is blended onto the tracks below (§5.1). A frame past its item's end is dropped.
 
-**Composition stage (TC).** It takes frames from both lanes in timeline order (`start[clip] + pts`). It moves on only when the other lane can't still deliver an earlier frame: that lane has a frame waiting, or it is still before its clip's start, or it has finished. For each frame:
+**Drawing.** `IDisplay::present` takes the `ComposedFrame` and draws it with `MetalCompositor`, so frames stay zero-copy: each layer from its decoder surface (or its image, or text rasterized once with Core Text and cached), fitted, transformed and blended, with its effects and the global filter in the fragment shader. T3 stamps the latest filter onto each frame it presents, so a slider change shows on the next frame. While paused, it redraws the frame on screen.
 
-- A frame past its clip's end is dropped: the next clip cuts it.
-- A frame of the **outgoing** clip is kept as that lane's latest frame. It is shown under the leading clip's next frame.
-- A frame of the **leading** clip (the latest one active at its time) becomes a `ComposedFrame`: the outgoing clip's latest frame and this one, each with its horizontal offset, plus the caption and the filter.
-
-```cpp
-struct ComposedFrame {
-  int64_t ptsUs;  uint32_t serial;  bool eos;  int64_t frameDurationUs;   // of the leading clip
-  int layerCount; struct { VideoFrame frame; float offsetX; } layers[2];  // outgoing first; offset in output widths
-  std::shared_ptr<const std::string> text;  VideoFilter filter;
-};
-```
-
-At transition progress `p = (t − start) / T`, slide-left puts the outgoing clip at `−p` and the incoming one at `1 − p`; slide-right mirrors this. Output frames follow the leading clip's frame rate, and AvSync paces them with its frame duration.
-
-**Drawing.** `IDisplay::present` takes the `ComposedFrame` and draws it in one pass, so frames stay zero-copy: each layer from its decoder surface, aspect-fit and offset, with the filter applied in the fragment shader as `rgb' = (rgb − 0.5) · contrast + 0.5 + brightness`. The caption goes on top, centered at the bottom of the leading clip's picture and not sliding. On Mac OS it is rasterized once with Core Text into a texture and reused while the text and size stay the same. T3 stamps the latest filter onto each frame it presents, so a slider change shows on the next frame. While paused, it redraws the frame on screen.
-
-**Audio.** T4 mixes on the timeline in 1024-frame chunks. Before mixing a chunk, every clip with audio in it must be decoded that far or have ended. Each clip is cut to its time on the timeline and scaled by a linear gain that fades in and out over the transitions. The two gains in an overlap sum to 1, so a slide is an equal-gain crossfade. Consecutive packets of a clip within 1 ms of each other are treated as one continuous stream, so timestamp rounding never doubles or drops a sample. The output format is that of the first clip with usable audio. Clips without audio, or with a different sample rate or channel count, play silent (`AudioUnsupported` warning for the latter; resampling is a next step). The master clock is the mixed audio, so it runs across clip boundaries.
+**Audio.** T4 mixes on the timeline in 1024-frame chunks. Before mixing a chunk, every item sounding in it must be decoded that far or have ended. Each item is read at its own media time with linear interpolation (resampling, `speed`), scaled by its gain, pan, track gain and transition fades. Consecutive packets of an item within 1 ms of each other are treated as one continuous stream, so timestamp rounding never doubles or drops a sample. The master clock is the mixed audio, so it runs across item boundaries and through gaps.
 
 ### 2.5 Output drivers and export
 
-The composition stage's `FrameSampler` keeps, for each lane, the **latest frame at or before the output time** and composes the output at a time `t` with `composeAt(t)`: every active clip's frame with its offset at `t`, the caption at `t`, the current filter. Only the **driver** differs: it picks the output times and decides what happens when a layer's frame for `t` isn't decoded yet.
+The composition stage's `FrameSampler` keeps, for each lane, the **latest frame at or before the output time** and composes the output at a time `t` with `composeAt(t)`: every visible item's layer with its values at `t`, and the current filter. Only the **driver** differs: it picks the output times and decides what happens when a layer's frame for `t` isn't decoded yet.
 
 | Driver | Output times | A layer's frame isn't ready | Use |
 | --- | --- | --- | --- |
-| **LeadingClip** | Each frame of the leading clip: the highest frame rate among the active clips (the later clip on a tie) | Frames are handled in timeline order, so the other layers are always exact | `Auto` for one clip. Output = source frames, paced by AvSync |
-| **Vsync** | Each display refresh: `t = clock(now) + (vsync − now)`, composed half a frame before the hand-over deadline | Hold its last frame and count a late layer; never wait | `Auto` for several clips. Slides and effects move every refresh |
+| **LeadingClip** | Each frame of the leading clip: the highest frame rate among the active clips (the later clip on a tie) | Frames are handled in timeline order, so the other layers are always exact | `Auto` when the only visual item is one video. Output = source frames, paced by AvSync |
+| **Vsync** | Each display refresh: `t = clock(now) + (vsync − now)`, composed half a frame before the hand-over deadline | Hold its last frame and count a late layer; never wait | `Auto` otherwise. Transitions and animation move every refresh |
 | **Export** | Fixed grid `t = n / fps` | Wait until every layer has its exact frame | `Exporter` only |
 
 Each driver is its own class behind `CompositionDriver` (`LeadingClipDriver`, `VsyncDriver`, `ExportDriver`), with one `step(sampler, output)` method. The stage runs the shared exact seek first, then calls the driver's `step` until the timeline ends.
@@ -245,7 +222,7 @@ class IExportSink {   // Mac OS: MetalCompositor into AVAssetWriter's BGRA buffe
   virtual void finish(std::function<void(Result)> done) = 0;
 };
 class Exporter {       // same pipeline, driver = Export
-  Result start(const Timeline&, const ExportTarget&, const ExportSettings&);  // width/height even, fps 1–240
+  Result start(const Scene&, const ExportTarget&, const ExportSettings&, std::string* error);  // size, fps from scene.output
   Result shutdown();   // cancels an unfinished file
   double progress() const;
 };
@@ -263,8 +240,8 @@ Callbacks run **on internal threads**. A callback must return quickly and **must
 class Player {
  public:
   static std::unique_ptr<Player> create(PlatformFactory&, PlayerListener*);  // binds owner thread
-  Result open(const Timeline&, RenderTarget);  // validates and returns; probe, configure and preroll run on T1 (§2.4)
-  Result open(MediaSource, RenderTarget);      // a timeline of one clip
+  Result open(const Scene&, RenderTarget, OutputDriver, std::string* error);  // validates and returns; probe, configure and preroll run on T1 (§2.4)
+  Result open(MediaSource, RenderTarget);      // a scene of one video, to the end of the file
   Result play();
   Result pause();
   Result seek(int64_t positionUs);    // sync validation; completion via onSeekCompleted

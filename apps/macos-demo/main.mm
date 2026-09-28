@@ -5,12 +5,12 @@
 //   mf_demo --autotest [options] clip.mp4 [clip.mp4 ...] [play-seconds]
 //                                  plays, scrubs, seeks, prints metrics, exits
 // Options:
-//   --text "caption"               caption at the bottom for the whole timeline
+//   --text "caption"               caption at the bottom for the whole scene
 //   --transition slide-left|slide-right|cut   (default slide-left)
 //   --transition-ms N              slide length (default 1000)
 //   --scene file.json              play (or export) a scene document instead of clips
 //   --driver auto|vsync|leading    what sets the output times while playing (default auto)
-//   --export out.mp4               render the timeline into a file instead of playing it
+//   --export out.mp4               render the scene into a file instead of playing it
 //   --size WxH, --fps N            export size (default 1920x1080) and frame rate (default 30)
 
 #import <AppKit/AppKit.h>
@@ -19,6 +19,7 @@
 
 #include <mach/mach.h>
 
+#include <algorithm>
 #include <atomic>
 #include <random>
 
@@ -56,7 +57,9 @@
 struct Options {
   NSArray<NSString*>* paths = @[];
   NSString* text = nil;
-  mf::Transition transition;
+  mf::SceneTransitionKind transition = mf::SceneTransitionKind::Push;  // or Cut
+  mf::Direction direction = mf::Direction::Left;
+  int64_t transitionUs = 1000000;
   mf::OutputDriver driver = mf::OutputDriver::Auto;
   NSString* exportPath = nil;
   NSString* scenePath = nil;
@@ -100,6 +103,70 @@ class Listener : public mf::PlayerListener {
 };
 
 static int64_t nowNs() { return mf::macos::hostNowNs(); }
+
+// The clips back to back on one video track, joined by the chosen transition (at most half the
+// shortest clip), with the caption over the whole scene. Each file is opened here to learn its
+// length, which places the clips after it. The output takes the first clip's size and rate,
+// or the export size and rate.
+static mf::Result sceneFromClips(mf::PlatformFactory& platform, const Options& o, NSArray<NSString*>* paths, bool forExport,
+                                 mf::Scene* out, std::string* error) {
+  mf::SceneTrack video;
+  int64_t shortest = INT64_MAX;
+  for (NSString* path in paths) {
+    mf::SceneItem it;
+    it.type = mf::ItemType::Video;
+    it.id = path.lastPathComponent.UTF8String;
+    it.source = mf::macos::sourceFromPath(path.UTF8String);
+    mf::MediaInfo info;
+    mf::Result r = platform.createDemuxer()->open(it.source, &info);
+    if (r != mf::Result::Ok || info.durationUs <= 0) {
+      *error = it.id + ": cannot open media";
+      return r != mf::Result::Ok ? r : mf::Result::MalformedMedia;
+    }
+    it.durationUs = info.durationUs;
+    shortest = std::min(shortest, info.durationUs);
+    video.items.push_back(it);
+  }
+  if (video.items.empty()) {
+    *error = "no clips";
+    return mf::Result::InvalidArgument;
+  }
+  size_t n = video.items.size();
+  int64_t overlap = n < 2 || o.transition == mf::SceneTransitionKind::Cut ? 0 : std::clamp<int64_t>(o.transitionUs, 0, shortest / 2);
+  int64_t start = 0;
+  for (size_t c = 0; c < n; ++c) {
+    video.items[c].startUs = start;
+    start += video.items[c].durationUs - overlap;
+    if (c + 1 < n && overlap > 0) {
+      mf::SceneTransition x;
+      x.from = int(c);
+      x.kind = o.transition;
+      x.direction = o.direction;
+      x.durationUs = overlap;
+      video.transitions.push_back(x);
+    }
+  }
+  mf::Scene scene;
+  scene.output.width = forExport ? o.exportSettings.width : 0;
+  scene.output.height = forExport ? o.exportSettings.height : 0;
+  scene.output.fpsNum = forExport ? o.exportSettings.fps : 0;
+  scene.output.sampleRate = scene.output.channels = 0;  // the first clip's audio
+  scene.tracks.push_back(std::move(video));
+  if (o.text) {
+    mf::SceneItem caption;
+    caption.type = mf::ItemType::Text;
+    caption.text = o.text.UTF8String;
+    caption.durationUs = scene.durationUs();
+    caption.style.hasBox = true;
+    caption.transform.y = mf::Animatable(0.96);
+    caption.transform.anchorY = 1;
+    mf::SceneTrack captions;
+    captions.items.push_back(caption);
+    scene.tracks.push_back(std::move(captions));
+  }
+  *out = std::move(scene);
+  return mf::Result::Ok;
+}
 
 @implementation Controller {
   NSWindow* _window;
@@ -244,14 +311,14 @@ static int64_t nowNs() { return mf::macos::hostNowNs(); }
   _statusLabel.stringValue = paths.count == 1 ? paths[0].lastPathComponent
                                               : [NSString stringWithFormat:@"%lu clips", (unsigned long)paths.count];
   _statusLabel.textColor = NSColor.labelColor;
-  mf::Timeline timeline;
-  for (NSString* path in paths) timeline.clips.push_back(mf::macos::sourceFromPath(path.UTF8String));
-  timeline.transition = _options.transition;
-  timeline.driver = _options.driver;
-  if (_options.text) timeline.texts.push_back({_options.text.UTF8String});
-  timeline.filter = [self currentFilter];
-  mf::Result r = _player->open(timeline, mf::macos::targetFromView((__bridge void*)_video));
-  if (r != mf::Result::Ok) [self failed:[NSString stringWithUTF8String:mf::toString(r)]];
+  mf::Scene scene;
+  std::string error;
+  mf::Result r = sceneFromClips(*_platform, _options, paths, NO, &scene, &error);
+  if (r == mf::Result::Ok) {
+    r = _player->open(scene, mf::macos::targetFromView((__bridge void*)_video), _options.driver, &error);
+    _player->setFilter([self currentFilter]);
+  }
+  if (r != mf::Result::Ok) [self failed:[NSString stringWithFormat:@"%s: %s", mf::toString(r), error.c_str()]];
 }
 
 - (mf::VideoFilter)currentFilter {
@@ -395,7 +462,7 @@ static int64_t nowNs() { return mf::macos::hostNowNs(); }
 @end
 
 // Headless export: prints progress, exits 0 once the file is written.
-static int exportTimeline(const Options& o) {
+static int exportScene(const Options& o) {
   struct Waiter : mf::ExportListener {
     dispatch_semaphore_t done = dispatch_semaphore_create(0);
     std::atomic<bool> ok{false};
@@ -413,19 +480,11 @@ static int exportTimeline(const Options& o) {
   auto exporter = mf::Exporter::create(*platform, &waiter);
   int64_t startNs = mf::macos::hostNowNs();
   mf::ExportTarget target = mf::macos::exportTargetFromPath(o.exportPath.UTF8String);
-  mf::Result r;
+  mf::Scene scene;
   std::string error;
-  if (o.scenePath) {  // the scene's size and frame rate
-    mf::Scene scene;
-    r = mf::macos::loadScene(o.scenePath.UTF8String, &scene, &error);
-    if (r == mf::Result::Ok) r = exporter->start(scene, target, o.exportSettings, &error);
-  } else {
-    mf::Timeline timeline;
-    for (NSString* path in o.paths) timeline.clips.push_back(mf::macos::sourceFromPath(path.UTF8String));
-    timeline.transition = o.transition;
-    if (o.text) timeline.texts.push_back({o.text.UTF8String});
-    r = exporter->start(timeline, target, o.exportSettings);
-  }
+  mf::Result r = o.scenePath ? mf::macos::loadScene(o.scenePath.UTF8String, &scene, &error)  // its own size and rate
+                             : sceneFromClips(*platform, o, o.paths, YES, &scene, &error);
+  if (r == mf::Result::Ok) r = exporter->start(scene, target, o.exportSettings, &error);
   if (r != mf::Result::Ok) {
     std::printf("ERROR %s %s\n", mf::toString(r), error.c_str());
     return 1;
@@ -454,9 +513,8 @@ int main(int argc, const char** argv) {
         options.text = value;
         ++i;
       } else if ([arg isEqualToString:@"--transition"] && value) {
-        options.transition.kind = [value isEqualToString:@"cut"]           ? mf::TransitionKind::Cut
-                                  : [value isEqualToString:@"slide-right"] ? mf::TransitionKind::SlideRight
-                                                                           : mf::TransitionKind::SlideLeft;
+        options.transition = [value isEqualToString:@"cut"] ? mf::SceneTransitionKind::Cut : mf::SceneTransitionKind::Push;
+        options.direction = [value isEqualToString:@"slide-right"] ? mf::Direction::Right : mf::Direction::Left;
         ++i;
       } else if ([arg isEqualToString:@"--driver"] && value) {
         options.driver = [value isEqualToString:@"vsync"]     ? mf::OutputDriver::Vsync
@@ -477,7 +535,7 @@ int main(int argc, const char** argv) {
         options.exportSettings.fps = value.intValue;
         ++i;
       } else if ([arg isEqualToString:@"--transition-ms"] && value) {
-        options.transition.durationUs = static_cast<int64_t>(value.doubleValue * 1000);
+        options.transitionUs = static_cast<int64_t>(value.doubleValue * 1000);
         ++i;
       } else if ([[arg stringByTrimmingCharactersInSet:numeric] length] == 0 &&
                  ![[NSFileManager defaultManager] fileExistsAtPath:arg]) {
@@ -487,7 +545,7 @@ int main(int argc, const char** argv) {
       }
     }
     options.paths = paths;
-    if (options.exportPath) return exportTimeline(options);
+    if (options.exportPath) return exportScene(options);
     NSApplication* app = [NSApplication sharedApplication];
     app.activationPolicy = NSApplicationActivationPolicyRegular;
     Controller* controller = [[Controller alloc] initWithOptions:options];

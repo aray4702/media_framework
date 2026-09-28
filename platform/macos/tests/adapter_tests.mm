@@ -1,13 +1,18 @@
-// Checks the Mac OS demuxer and decoders on a real clip, without a window or audio output.
+// Checks the Mac OS demuxer and decoders on a real clip, without a window or audio output, and
+// the compositor's track groups (scene_graph_spec.md §5.1) by reading back rendered pixels.
 // Usage: macos_adapter_tests clip.mp4
 
 #import <Foundation/Foundation.h>
+#import <Metal/Metal.h>
 
+#include <array>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <thread>
 #include <vector>
 
+#include "../src/metal_compositor.h"
 #include "mf/macos.h"
 
 using namespace mf;
@@ -72,7 +77,111 @@ static std::vector<int64_t> decodeAllVideo(IDemuxer& demuxer, IVideoDecoder& dec
   return pts;
 }
 
+// --- Compositor -------------------------------------------------------------------------------
+
+using Rgb = std::array<float, 3>;
+
+// A full-canvas color layer, drawn at `offsetX` output widths.
+static ComposedLayer colorLayer(Color color, float opacity, int group, Blend blend = Blend::Normal, float offsetX = 0) {
+  ComposedLayer l;
+  l.kind = ComposedLayer::Kind::Color;
+  l.color = color;
+  l.opacity = opacity;
+  l.group = group;
+  l.blend = blend;
+  l.offsetX = offsetX;
+  return l;
+}
+
+// Renders a 64x32 frame on a green background and returns the pixel at (x, 16).
+static std::vector<Rgb> render(id<MTLDevice> device, ComposedFrame frame, std::initializer_list<int> xs) {
+  frame.width = 64;
+  frame.height = 32;
+  frame.background = {0, 1, 0, 1};
+  macos::MetalCompositor compositor;
+  CHECK(compositor.init(device, MTLPixelFormatBGRA8Unorm));
+  MTLTextureDescriptor* d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:64 height:32 mipmapped:NO];
+  d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+  d.storageMode = MTLStorageModeShared;
+  id<MTLTexture> target = [device newTextureWithDescriptor:d];
+  id<MTLCommandQueue> queue = [device newCommandQueue];
+  id<MTLCommandBuffer> cmd = [queue commandBuffer];
+  compositor.encode(frame, target, cmd);
+  [cmd commit];
+  [cmd waitUntilCompleted];
+  std::vector<Rgb> out;
+  for (int x : xs) {
+    uint8_t bgra[4];
+    [target getBytes:bgra bytesPerRow:64 * 4 fromRegion:MTLRegionMake2D(NSUInteger(x), 16, 1, 1) mipmapLevel:0];
+    out.push_back({bgra[2] / 255.f, bgra[1] / 255.f, bgra[0] / 255.f});
+  }
+  return out;
+}
+
+static ComposedGroup track(float opacity = 1) {
+  ComposedGroup g;
+  g.track = 1;
+  g.opacity = opacity;
+  return g;
+}
+
+static bool near(const Rgb& a, const Rgb& b) {
+  for (int i = 0; i < 3; ++i) {
+    if (std::abs(a[i] - b[i]) > 3 / 255.f) return false;
+  }
+  return true;
+}
+
+static void compositorTests() {
+  id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+  if (!device) {
+    std::fprintf(stderr, "compositor: no Metal device, skipped\n");
+    return;
+  }
+  const Color red{1, 0, 0, 1}, blue{0, 0, 1, 1};
+
+  // A push on a half-opacity track: B over A inside the track, then the track at 0.5 over the
+  // green below. Drawn one by one, B's half would also show A through it.
+  ComposedFrame push;
+  push.layers = {colorLayer(red, 1, 0), colorLayer(blue, 1, 0, Blend::Normal, 0.5f)};
+  push.groups.push_back(track(0.5f));
+  std::vector<Rgb> p = render(device, push, {8, 56});
+  CHECK(near(p[0], {0.5f, 0.5f, 0}));  // A over green
+  CHECK(near(p[1], {0, 0.5f, 0.5f}));  // B only, over green
+
+  // A crossfade a quarter through, with B half transparent: (1 − p)·A + p·B, then over green.
+  ComposedFrame fade;
+  fade.layers = {colorLayer(red, 0.75f, 0, Blend::Add), colorLayer({0, 0, 1, 0.5f}, 0.25f, 0, Blend::Add)};
+  fade.groups.push_back(track());
+  Rgb f = render(device, fade, {32})[0];
+  CHECK(near(f, {0.75f, 0.125f, 0.125f}));  // alpha 0.875, so 0.125 of the green shows
+
+  // Track effects on the combined image: brightness −0.5, and the right half cropped away.
+  ComposedFrame effects;
+  effects.layers = {colorLayer(red, 1, 0)};
+  ComposedGroup g = track();
+  g.effects.brightness = -0.5f;
+  g.effects.crop[2] = 0.5f;
+  effects.groups.push_back(g);
+  std::vector<Rgb> e = render(device, effects, {8, 56});
+  CHECK(near(e[0], {0.5f, 0, 0}));
+  CHECK(near(e[1], {0, 1, 0}));  // cropped: the background
+
+  // A track blurred as a whole: its edge is soft, while each layer alone has none.
+  ComposedFrame blur;
+  blur.layers = {colorLayer(red, 1, 0, Blend::Normal, -0.5f)};  // the left half
+  ComposedGroup b = track();
+  b.effects.blur = 0.1f;  // σ = 3.2 px
+  blur.groups.push_back(b);
+  std::vector<Rgb> r = render(device, blur, {4, 31, 32, 60});
+  CHECK(near(r[0], {1, 0, 0}) && near(r[3], {0, 1, 0}));
+  CHECK(r[1][0] > 0.3f && r[1][0] < 0.8f && r[2][0] > 0.2f && r[2][0] < 0.7f);  // mixed across the edge
+  std::fprintf(stderr, "compositor: push %.2f,%.2f,%.2f  fade %.2f,%.2f,%.2f  blur edge %.2f,%.2f\n", p[1][0], p[1][1], p[1][2],
+               f[0], f[1], f[2], r[1][0], r[2][0]);
+}
+
 int main(int argc, char** argv) {
+  compositorTests();
   if (argc < 2) {
     std::fprintf(stderr, "usage: %s clip.mp4\n", argv[0]);
     return 2;

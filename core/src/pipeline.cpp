@@ -4,6 +4,7 @@
 #include <cmath>
 #include <deque>
 #include <limits>
+#include <map>
 #include <string>
 
 #include "av_sync.h"
@@ -16,70 +17,6 @@ constexpr int64_t kMs = 1000000;              // ns
 constexpr size_t kMaxSampleBytes = 16u << 20;  // A8
 constexpr int kMaxDimension = 8192;            // A8
 constexpr int64_t kReadPastEndUs = 1000000;    // read a little past an item's end, for B-frame reordering
-
-// A Timeline (the simple API) as a scene: its clips back to back on one video track, joined by
-// a push (or a cut), and its captions on a second track. Clip durations come from probing.
-Scene sceneFromTimeline(const Timeline& tl, const std::vector<MediaInfo>& infos, const ExportSettings* exportSettings) {
-  Scene s;
-  s.output.width = s.output.height = 0;  // the first clip's size
-  s.output.fpsNum = 0;                   // the first clip's rate
-  s.output.sampleRate = s.output.channels = 0;  // the first clip's audio
-  if (exportSettings) {
-    s.output.width = exportSettings->width;
-    s.output.height = exportSettings->height;
-    s.output.fpsNum = exportSettings->fps;
-  }
-  int n = int(tl.clips.size());
-  int64_t shortest = kNever;
-  for (const MediaInfo& info : infos) shortest = std::min(shortest, info.durationUs);
-  int64_t overlap = n < 2 || tl.transition.kind == TransitionKind::Cut ? 0 : std::clamp<int64_t>(tl.transition.durationUs, 0, shortest / 2);
-
-  SceneTrack video;
-  video.id = "clips";
-  int64_t start = 0;
-  for (int c = 0; c < n; ++c) {
-    SceneItem item;
-    item.id = "clip" + std::to_string(c + 1);
-    item.type = ItemType::Video;
-    item.source = tl.clips[c];
-    item.startUs = start;
-    item.durationUs = infos[c].durationUs;
-    video.items.push_back(item);
-    if (c + 1 < n && overlap > 0) {
-      SceneTransition x;
-      x.from = c;
-      x.kind = SceneTransitionKind::Push;
-      x.direction = tl.transition.kind == TransitionKind::SlideLeft ? Direction::Left : Direction::Right;
-      x.durationUs = overlap;
-      video.transitions.push_back(x);
-    }
-    start += infos[c].durationUs - overlap;
-  }
-  s.tracks.push_back(std::move(video));
-
-  // Captions: bottom center on a dark box. A caption ends where the next one starts.
-  int64_t duration = s.durationUs();
-  std::vector<TextOverlay> texts = tl.texts;
-  std::stable_sort(texts.begin(), texts.end(), [](const TextOverlay& a, const TextOverlay& b) { return a.startUs < b.startUs; });
-  SceneTrack captions;
-  captions.id = "captions";
-  for (size_t k = 0; k < texts.size(); ++k) {
-    int64_t from = texts[k].startUs, to = std::min(texts[k].endUs, duration);
-    if (k + 1 < texts.size()) to = std::min(to, texts[k + 1].startUs);
-    if (to <= from) continue;
-    SceneItem item;
-    item.type = ItemType::Text;
-    item.text = texts[k].text;
-    item.startUs = from;
-    item.durationUs = to - from;
-    item.style.hasBox = true;
-    item.transform.y = Animatable(0.96);
-    item.transform.anchorY = 1;
-    captions.items.push_back(item);
-  }
-  if (!captions.items.empty()) s.tracks.push_back(std::move(captions));
-  return s;
-}
 
 // ---------------------------------------------------------------------------------------
 // T1: probe every item on open, start seeks, demux. Each lane reads its items in order; a
@@ -109,6 +46,10 @@ class SourceStage : public Stage {
   }
 
  private:
+  struct Preopened {
+    std::unique_ptr<IDemuxer> demuxer;
+    MediaInfo info;
+  };
   struct LaneRead {
     int pos = kNoItem;  // position in layout.laneItems(lane)
     bool eos[2] = {true, true};
@@ -120,38 +61,46 @@ class SourceStage : public Stage {
     return reads_[li].pos < int(list.size()) ? list[reads_[li].pos] : -1;
   }
 
-  // open(Timeline): the clips' durations place them, so they are probed before the scene exists.
-  bool probeTimeline() {
-    const Timeline& tl = *ctx_.timeline;
-    std::vector<MediaInfo> infos(tl.clips.size());
-    for (size_t c = 0; c < tl.clips.size(); ++c) {
-      preopened_.push_back(ctx_.factory.createDemuxer());
-      Result r = preopened_[c]->open(tl.clips[c], &infos[c]);
-      if (r != Result::Ok) {
-        ctx_.fatal(r, "clip" + std::to_string(c + 1) + ": cannot open media");
-        return false;
+  // Items with duration 0 play to the end of their file: their files are opened first, so the
+  // rules that need an item's length and the layout see the real durations.
+  bool resolveDurations() {
+    for (size_t t = 0; t < ctx_.scene.tracks.size(); ++t) {
+      SceneTrack& track = ctx_.scene.tracks[t];
+      for (size_t k = 0; k < track.items.size(); ++k) {
+        SceneItem& it = track.items[k];
+        if (!track.enabled || !it.toEnd()) continue;
+        std::string name = !it.id.empty() ? it.id : "tracks[" + std::to_string(t) + "].items[" + std::to_string(k) + "]";
+        Preopened& p = preopened_[&it];
+        p.demuxer = ctx_.factory.createDemuxer();
+        Result r = p.demuxer->open(it.source, &p.info);
+        if (r != Result::Ok) {
+          ctx_.fatal(r, name + ": cannot open media");
+          return false;
+        }
+        if (it.inUs >= p.info.durationUs) {
+          ctx_.fatal(Result::MalformedMedia, name + ": `in` is past the end of the file (R10)");
+          return false;
+        }
+        it.durationUs = std::max<int64_t>(1, std::llround(double(p.info.durationUs - it.inUs) / it.speed));
       }
-      if (infos[c].durationUs <= 0) {
-        ctx_.fatal(Result::MalformedMedia, "clip" + std::to_string(c + 1) + ": bad duration");
-        return false;
-      }
-      preinfos_.push_back(infos[c]);
     }
-    ctx_.scene = sceneFromTimeline(tl, infos, ctx_.driver == Driver::Export ? &ctx_.exportSettings : nullptr);
     return true;
   }
 
   void probe() {
-    if (ctx_.timeline && !probeTimeline()) return;
+    if (!resolveDurations()) return;
     std::string error;
     if (validateScene(ctx_.scene, &error) != Result::Ok) return ctx_.fatal(Result::InvalidArgument, error);
     if (!ctx_.layout.build(ctx_.scene, &error)) return ctx_.fatal(Result::Unsupported, error);
     int n = layout().items();
     ctx_.items.resize(n);
-    for (size_t c = 0; c < preopened_.size(); ++c) {  // the Timeline's clips are items 0..n-1
-      ctx_.items[c].demuxer = std::move(preopened_[c]);
-      ctx_.items[c].info = preinfos_[c];
+    for (int i = 0; i < n; ++i) {  // files already opened by resolveDurations()
+      auto p = preopened_.find(&layout().item(i));
+      if (p == preopened_.end()) continue;
+      ctx_.items[i].demuxer = std::move(p->second.demuxer);
+      ctx_.items[i].info = p->second.info;
     }
+    preopened_.clear();
     for (int l = 0; l < layout().lanes(); ++l) {
       auto lane = std::make_unique<Lane>();
       lane->videoDecoder = ctx_.factory.createVideoDecoder();
@@ -376,8 +325,7 @@ class SourceStage : public Stage {
   Context& ctx_;
   bool opened_ = false;
   std::vector<LaneRead> reads_;
-  std::vector<std::unique_ptr<IDemuxer>> preopened_;  // open(Timeline): the clips, probed first
-  std::vector<MediaInfo> preinfos_;
+  std::map<const SceneItem*, Preopened> preopened_;  // items with duration 0, until they have an index
   uint32_t serial_ = 0;
 };
 

@@ -39,6 +39,11 @@ def keyframes(value):
     return None
 
 
+def to_end(item):
+    """A video or audio item with duration 0 plays to the end of its file, unknown here."""
+    return item["type"] in ("video", "audio") and to_time(item["duration"]) == 0
+
+
 def check_animatable(name, value, duration, where, errors):
     lo, hi = RANGES.get(name, (None, None))
     keys = keyframes(value)
@@ -51,12 +56,12 @@ def check_animatable(name, value, duration, where, errors):
         times = [t for t, _ in keys]
         if any(b <= a for a, b in zip(times, times[1:])):
             errors.append(f"{where}: {name} key times must increase")
-        if times[0] < 0 or times[-1] > duration + EPSILON:
+        if times[0] < 0 or (duration is not None and times[-1] > duration + EPSILON):
             errors.append(f"{where}: {name} keys must lie within the item (0 to {float(duration)} s)")
 
 
 def check_item(item, where, errors):
-    duration = to_time(item["duration"])
+    duration = None if to_end(item) else to_time(item["duration"])  # None: checked by the engine once probed
     for name in ("opacity", "gain", "pan"):
         if name in item:
             check_animatable(name, item[name], duration, where, errors)
@@ -65,11 +70,16 @@ def check_item(item, where, errors):
             check_animatable(name, value, duration, f"{where}.transform", errors)
     if "audio" in item and "gain" in item["audio"]:
         check_animatable("gain", item["audio"]["gain"], duration, f"{where}.audio", errors)
-    types = [e["type"] for e in item.get("effects", [])]
+    check_effects(item, duration, where, errors)
+
+
+def check_effects(node, duration, where, errors):
+    """At most one effect of each type (R12), values in range (R7), keys within the item (R6)."""
+    types = [e["type"] for e in node.get("effects", [])]
     for t in set(types):
         if types.count(t) > 1:
-            errors.append(f"{where}.effects: at most one {t} effect per item (R12)")
-    for i, effect in enumerate(item.get("effects", [])):
+            errors.append(f"{where}.effects: at most one {t} effect (R12)")
+    for i, effect in enumerate(node.get("effects", [])):
         for name, value in effect.items():
             if name != "type" and not isinstance(value, str) and name not in ("tolerance", "softness"):
                 check_animatable(name, value, duration, f"{where}.effects[{i}]", errors)
@@ -84,6 +94,7 @@ def check_item(item, where, errors):
 
 def check_track(track, t_index, errors):
     name = f"tracks[{t_index}]" + (f" ({track['id']})" if "id" in track else "")
+    check_effects(track, None, name, errors)  # scene time: keys from 0 on
     items = track["items"]
     previous = None  # the last non-transition item
     pending = None   # a transition waiting for the item after it
@@ -103,6 +114,8 @@ def check_track(track, t_index, errors):
             prev_end = prev_start + to_time(prev_item["duration"])
             if start < prev_start:
                 errors.append(f"{where}: items must be in start order")
+            elif to_end(prev_item):
+                pass  # where it ends is known once the engine probes its file
             elif pending is None:
                 if start < prev_end - EPSILON:
                     errors.append(f"{where}: overlaps {prev_where} without a transition between them")
@@ -114,7 +127,7 @@ def check_track(track, t_index, errors):
                 if abs(start - (prev_end - d)) > EPSILON:
                     errors.append(f"{t_where}: the items around it must overlap by exactly {float(d)} s "
                                   f"(next item starts at {float(start)}, expected {float(prev_end - d)})")
-                limit = min(prev_end - prev_start, end - start) / 2
+                limit = (prev_end - prev_start if to_end(item) else min(prev_end - prev_start, end - start)) / 2
                 if d > limit + EPSILON:
                     errors.append(f"{t_where}: {float(d)} s is longer than half of an item it joins ({float(limit)} s)")
         previous, pending = (item, where), None
@@ -174,7 +187,8 @@ def main(paths):
         else:
             end = max((to_time(i["start"]) + to_time(i["duration"]) for tr in doc["tracks"] for i in tr["items"]
                        if i["type"] != "transition"), default=0)
-            print(f"{path}: ok ({len(doc['tracks'])} tracks, {float(end):g} s)")
+            open_ended = any(to_end(i) for tr in doc["tracks"] for i in tr["items"] if i["type"] != "transition")
+            print(f"{path}: ok ({len(doc['tracks'])} tracks, {'at least ' if open_ended else ''}{float(end):g} s)")
     return 1 if failed else 0
 
 

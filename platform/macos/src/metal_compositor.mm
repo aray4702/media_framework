@@ -90,18 +90,29 @@ constexpr MTLPixelFormat kOffscreenFormat = MTLPixelFormatRGBA16Float;
 constexpr size_t kMaxTexts = 16;
 const Vert kFullQuad = {{-1, 1, 1, 1, -1, -1, 1, -1}, {0, 0, 1, 1}};
 
-// The layer's own effects as shader parameters: chroma key and color adjust.
+// A layer's (or a track's) effects as shader parameters: chroma key and color adjust.
 Fx effectsOf(const ComposedLayer& l, float opacity) {
-  Fx fx{{l.color.r, l.color.g, l.color.b, l.color.a}, l.brightness, l.contrast, l.saturation, opacity, 0, 1, 0, 0, 0, 0, 0, 0};
-  if (l.chromaKey) {
-    float Y = 0.2126f * l.keyColor.r + 0.7152f * l.keyColor.g + 0.0722f * l.keyColor.b;
+  const ComposedEffects& e = l.effects;
+  Fx fx{{l.color.r, l.color.g, l.color.b, l.color.a}, e.brightness, e.contrast, e.saturation, opacity, 0, 1, 0, 0, 0, 0, 0, 0};
+  if (e.chromaKey) {
+    float Y = 0.2126f * e.keyColor.r + 0.7152f * e.keyColor.g + 0.0722f * e.keyColor.b;
     fx.keyOn = 1;
-    fx.tolerance = l.keyTolerance;
-    fx.softness = l.keySoftness;
-    fx.keyCb = (l.keyColor.b - Y) / 1.8556f;
-    fx.keyCr = (l.keyColor.r - Y) / 1.5748f;
+    fx.tolerance = e.keyTolerance;
+    fx.softness = e.keySoftness;
+    fx.keyCb = (e.keyColor.b - Y) / 1.8556f;
+    fx.keyCr = (e.keyColor.r - Y) / 1.5748f;
   }
   return fx;
+}
+
+// A track's combined image drawn as one layer: its effects, opacity and blend (§5.1).
+ComposedLayer groupLayer(const ComposedGroup& g) {
+  ComposedLayer l;
+  l.kind = ComposedLayer::Kind::Image;
+  l.opacity = g.opacity;
+  l.blend = g.blend;
+  l.effects = g.effects;
+  return l;
 }
 
 }  // namespace
@@ -129,7 +140,8 @@ bool MetalCompositor::init(id<MTLDevice> device, MTLPixelFormat format) {
   }
   id<MTLFunction> vertex = [library newFunctionWithName:@"vmain"];
   NSString* fragments[kSources] = {@"fnv12", @"frgba", @"fcolor"};
-  auto make = [&](NSString* fragment, MTLPixelFormat pf, int blend) -> id<MTLRenderPipelineState> {
+  // blend -1: none. Plus: S + D for color and alpha, so a crossfade pair sums to (1 − p)·A + p·B.
+  auto make = [&](NSString* fragment, MTLPixelFormat pf, int blend, bool plus = false) -> id<MTLRenderPipelineState> {
     MTLRenderPipelineDescriptor* d = [MTLRenderPipelineDescriptor new];
     d.vertexFunction = vertex;
     d.fragmentFunction = [library newFunctionWithName:fragment];
@@ -138,7 +150,7 @@ bool MetalCompositor::init(id<MTLDevice> device, MTLPixelFormat format) {
     if (blend >= 0) {  // premultiplied source over an opaque canvas
       c.blendingEnabled = YES;
       c.sourceAlphaBlendFactor = MTLBlendFactorOne;
-      c.destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+      c.destinationAlphaBlendFactor = plus ? MTLBlendFactorOne : MTLBlendFactorOneMinusSourceAlpha;
       switch (static_cast<Blend>(blend)) {
         case Blend::Normal:  // S + D·(1 − αS)
           c.sourceRGBBlendFactor = MTLBlendFactorOne;
@@ -167,6 +179,8 @@ bool MetalCompositor::init(id<MTLDevice> device, MTLPixelFormat format) {
       if (!(pipelines_[s][b] = make(fragments[s], format, b))) return false;
     }
     if (!(offscreen_[s] = make(fragments[s], kOffscreenFormat, -1))) return false;
+    if (!(group_[s][0] = make(fragments[s], kOffscreenFormat, int(Blend::Normal)))) return false;
+    if (!(group_[s][1] = make(fragments[s], kOffscreenFormat, int(Blend::Add), true))) return false;
   }
   if (!(blur_ = make(@"fblur", kOffscreenFormat, -1))) return false;
   return CVMetalTextureCacheCreate(nullptr, nullptr, device_, nullptr, &cache_) == kCVReturnSuccess;
@@ -218,7 +232,8 @@ bool MetalCompositor::prepare(const ComposedLayer& l, double W, double H, double
       break;
   }
 
-  float u0 = l.crop[0], v0 = l.crop[1], u1 = 1 - l.crop[2], v1 = 1 - l.crop[3];
+  const float* crop = l.effects.crop;
+  float u0 = crop[0], v0 = crop[1], u1 = 1 - crop[2], v1 = 1 - crop[3];
   if (u1 <= u0 || v1 <= v0) return false;
   double cw = nw * (u1 - u0), ch = nh * (v1 - v0);
   double bw = cw, bh = ch;
@@ -299,24 +314,90 @@ void MetalCompositor::blurInto(Prepared* p, const ComposedLayer& l, id<MTLComman
   p->effectsDone = true;
 }
 
-void MetalCompositor::draw(id<MTLRenderCommandEncoder> enc, const Prepared& p, const ComposedLayer& l, const VideoFilter& filter,
-                           bool effects) {
+void MetalCompositor::draw(id<MTLRenderCommandEncoder> enc, id<MTLRenderPipelineState> pipeline, const Prepared& p,
+                           const ComposedLayer& l, const VideoFilter* filter, bool effects) {
   Fx fx = effectsOf(l, l.opacity);
   if (!effects) {
     fx.brightness = 0;
     fx.contrast = fx.saturation = 1;
     fx.keyOn = 0;
   }
-  if (l.kind == ComposedLayer::Kind::Video || l.kind == ComposedLayer::Kind::Image) {  // the global filter
-    fx.gBrightness = filter.brightness;
-    fx.gContrast = filter.contrast;
+  if (filter && (l.kind == ComposedLayer::Kind::Video || l.kind == ComposedLayer::Kind::Image)) {  // the global filter
+    fx.gBrightness = filter->brightness;
+    fx.gContrast = filter->contrast;
   }
-  [enc setRenderPipelineState:pipelines_[p.source][int(l.blend)]];
+  [enc setRenderPipelineState:pipeline];
   [enc setVertexBytes:&p.vert length:sizeof(p.vert) atIndex:0];
   [enc setFragmentBytes:&fx length:sizeof(fx) atIndex:0];
   if (p.tex0) [enc setFragmentTexture:p.tex0 atIndex:0];
   if (p.tex1) [enc setFragmentTexture:p.tex1 atIndex:1];
   [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+}
+
+// Draws one layer, limited to its wipe region when it has one.
+void MetalCompositor::drawLayer(id<MTLRenderCommandEncoder> enc, id<MTLRenderPipelineState> pipeline, const Prepared& p,
+                                const ComposedLayer& l, const VideoFilter* filter, const MTLViewport& viewport, double tw, double th) {
+  bool clipped = l.clip[0] > 0 || l.clip[1] > 0 || l.clip[2] < 1 || l.clip[3] < 1;
+  if (clipped) {  // wipe: only this part of the canvas
+    double x0 = viewport.originX + l.clip[0] * viewport.width, x1 = viewport.originX + l.clip[2] * viewport.width;
+    double y0 = viewport.originY + l.clip[1] * viewport.height, y1 = viewport.originY + l.clip[3] * viewport.height;
+    NSUInteger sx = NSUInteger(std::clamp(std::floor(x0), 0.0, tw)), sy = NSUInteger(std::clamp(std::floor(y0), 0.0, th));
+    NSUInteger ex = NSUInteger(std::clamp(std::ceil(x1), 0.0, tw)), ey = NSUInteger(std::clamp(std::ceil(y1), 0.0, th));
+    if (ex <= sx || ey <= sy) return;
+    [enc setScissorRect:{sx, sy, ex - sx, ey - sy}];
+  }
+  draw(enc, pipeline, p, l, filter, !p.effectsDone);
+  if (clipped) [enc setScissorRect:{0, 0, NSUInteger(tw), NSUInteger(th)}];
+}
+
+// A track's layers combined over a transparent image the size of the target, so they keep their
+// positions: B over A, or summed for a crossfade. The result is drawn as one layer covering the
+// canvas, less the track's crop, with the track's effects.
+bool MetalCompositor::combine(const ComposedFrame& c, int g, const std::vector<Prepared>& prepared, const std::vector<bool>& ok,
+                              const MTLViewport& viewport, double tw, double th, id<MTLCommandBuffer> cmd, Prepared* out) {
+  const float* crop = c.groups[g].effects.crop;
+  float x0 = crop[0], y0 = crop[1], x1 = 1 - crop[2], y1 = 1 - crop[3];
+  if (x1 <= x0 || y1 <= y0) return false;
+  // Kept from frame to frame: allocating a target-sized texture per frame costs a refresh. Frames
+  // are encoded in order on one queue, and Metal orders the passes that write and read it.
+  if (size_t(g) >= groupTextures_.size()) groupTextures_.resize(size_t(g) + 1);
+  __strong id<MTLTexture>& texture = groupTextures_[size_t(g)];
+  if (!texture || texture.width != NSUInteger(tw) || texture.height != NSUInteger(th)) {
+    MTLTextureDescriptor* d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:kOffscreenFormat
+                                                                                  width:NSUInteger(tw)
+                                                                                 height:NSUInteger(th)
+                                                                              mipmapped:NO];
+    d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    d.storageMode = MTLStorageModePrivate;
+    texture = [device_ newTextureWithDescriptor:d];
+  }
+  MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+  rp.colorAttachments[0].texture = texture;
+  rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+  rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
+  rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+  id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:rp];
+  [enc setViewport:viewport];
+  for (size_t i = 0; i < c.layers.size(); ++i) {
+    const ComposedLayer& l = c.layers[i];
+    if (l.group != g || !ok[i]) continue;
+    drawLayer(enc, group_[prepared[i].source][l.blend == Blend::Add ? 1 : 0], prepared[i], l, &c.filter, viewport, tw, th);
+  }
+  [enc endEncoding];
+
+  out->source = kRgba;
+  out->tex0 = texture;
+  out->tex1 = nil;
+  Vert& v = out->vert;
+  float pos[8] = {2 * x0 - 1, 1 - 2 * y0, 2 * x1 - 1, 1 - 2 * y0, 2 * x0 - 1, 1 - 2 * y1, 2 * x1 - 1, 1 - 2 * y1};  // TL, TR, BL, BR
+  std::copy(pos, pos + 8, v.pos);
+  v.uv[0] = float((viewport.originX + x0 * viewport.width) / tw);
+  v.uv[1] = float((viewport.originY + y0 * viewport.height) / th);
+  v.uv[2] = float((viewport.originX + x1 * viewport.width) / tw);
+  v.uv[3] = float((viewport.originY + y1 * viewport.height) / th);
+  out->boxW = (x1 - x0) * viewport.width;  // target pixels, for a blur texture
+  out->boxH = (y1 - y0) * viewport.height;
+  return true;
 }
 
 void MetalCompositor::encode(const ComposedFrame& c, id<MTLTexture> target, id<MTLCommandBuffer> cmd) {
@@ -331,7 +412,15 @@ void MetalCompositor::encode(const ComposedFrame& c, id<MTLTexture> target, id<M
   for (size_t i = 0; i < c.layers.size(); ++i) {  // blurred layers render first, into their own textures
     const ComposedLayer& l = c.layers[i];
     ok[i] = l.opacity > 0 && prepare(l, W, H, scale, &prepared[i], textures.get());
-    if (ok[i] && l.blur > 0) blurInto(&prepared[i], l, cmd, l.blur * H * scale);
+    if (ok[i] && l.effects.blur > 0) blurInto(&prepared[i], l, cmd, l.effects.blur * H * scale);
+  }
+  // Then each track drawn on its own, with its effects (and its blur) on the combined image.
+  std::vector<Prepared> groups(c.groups.size());
+  std::vector<bool> groupOk(c.groups.size());
+  for (size_t g = 0; g < c.groups.size(); ++g) {
+    const ComposedGroup& group = c.groups[g];
+    groupOk[g] = group.opacity > 0 && combine(c, int(g), prepared, ok, viewport, tw, th, cmd, &groups[g]);
+    if (groupOk[g] && group.effects.blur > 0) blurInto(&groups[g], groupLayer(group), cmd, group.effects.blur * H * scale);
   }
 
   MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
@@ -345,23 +434,19 @@ void MetalCompositor::encode(const ComposedFrame& c, id<MTLTexture> target, id<M
   ComposedLayer background;
   background.kind = ComposedLayer::Kind::Color;
   background.color = c.background;
-  draw(enc, Prepared{}, background, c.filter, false);
+  draw(enc, pipelines_[kColor][int(Blend::Normal)], Prepared{}, background, nullptr, false);
 
-  MTLScissorRect full{0, 0, NSUInteger(tw), NSUInteger(th)};
+  std::vector<bool> drawn(c.groups.size());
   for (size_t i = 0; i < c.layers.size(); ++i) {
-    if (!ok[i]) continue;
     const ComposedLayer& l = c.layers[i];
-    bool clipped = l.clip[0] > 0 || l.clip[1] > 0 || l.clip[2] < 1 || l.clip[3] < 1;
-    if (clipped) {  // wipe: only this part of the canvas
-      double x0 = viewport.originX + l.clip[0] * viewport.width, x1 = viewport.originX + l.clip[2] * viewport.width;
-      double y0 = viewport.originY + l.clip[1] * viewport.height, y1 = viewport.originY + l.clip[3] * viewport.height;
-      NSUInteger sx = NSUInteger(std::clamp(std::floor(x0), 0.0, tw)), sy = NSUInteger(std::clamp(std::floor(y0), 0.0, th));
-      NSUInteger ex = NSUInteger(std::clamp(std::ceil(x1), 0.0, tw)), ey = NSUInteger(std::clamp(std::ceil(y1), 0.0, th));
-      if (ex <= sx || ey <= sy) continue;
-      [enc setScissorRect:{sx, sy, ex - sx, ey - sy}];
+    if (int g = l.group; g >= 0) {  // the track's combined image, where its first layer would go
+      if (drawn[g] || !groupOk[g]) continue;
+      drawn[g] = true;
+      ComposedLayer gl = groupLayer(c.groups[g]);
+      draw(enc, pipelines_[kRgba][int(gl.blend)], groups[g], gl, nullptr, !groups[g].effectsDone);  // the filter is in its layers
+      continue;
     }
-    draw(enc, prepared[i], l, c.filter, !prepared[i].effectsDone);
-    if (clipped) [enc setScissorRect:full];
+    if (ok[i]) drawLayer(enc, pipelines_[prepared[i].source][int(l.blend)], prepared[i], l, &c.filter, viewport, tw, th);
   }
   [enc endEncoding];
 
