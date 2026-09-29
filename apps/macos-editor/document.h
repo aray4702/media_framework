@@ -25,7 +25,7 @@ class Document {
   static constexpr int64_t kMinDurationUs = 100000;
   static constexpr int64_t kStillDurationUs = 5000000;  // new image, text and color items
 
-  Document();
+  Document();  // a new project: 1920 × 1080 at 30 fps on a gray background, one video track
 
   // Takes a scene read from a document. Items, tracks and transitions without an id get one, and
   // new ids never repeat one it has. File lengths are forgotten: setLength() them again.
@@ -53,6 +53,11 @@ class Document {
   // Returns the item's index.
   int insertItem(int t, mf::SceneItem item, int64_t atUs, int64_t lengthUs = 0);
   void removeItem(int t, int k);
+  // Moves item k of track *t to track `to` at `startUs` (or right after the item playing there,
+  // moving later ones along), keeping its id and settings; transitions joining it go. The track
+  // must take the item (visual items on video tracks, audio on audio ones). Sets *t to `to` and
+  // returns the item's index there, or -1 when it can't move.
+  int moveToTrack(int* t, int k, int to, int64_t startUs);
 
   // Moves an item, between the item before it and the one after it. An item joined to the
   // one before it by a transition can't move on its own: it starts where the transition says.
@@ -85,6 +90,11 @@ class Document {
   // Places each item after the one before it: at the transition's overlap when joined, else
   // no earlier than its end (moving it, and so later items, along).
   void normalize(int t);
+  // Puts the item on track t at atUs, or right after the item playing there (later items move
+  // along); a transition between its new neighbors goes. Returns its index.
+  int place(int t, mf::SceneItem item, int64_t atUs);
+  // Takes item k out of track t, with the transitions joining it.
+  mf::SceneItem takeItem(int t, int k);
   std::string newId(const char* prefix);
 
   std::map<std::string, int64_t> lengthUs_;  // by item id: the file's length (video, audio)

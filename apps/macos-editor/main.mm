@@ -217,6 +217,7 @@ static NSString* timeString(int64_t us) {
   NSMenuItem* fileItem = [bar addItemWithTitle:@"" action:nil keyEquivalent:@""];
   fileItem.submenu = [[NSMenu alloc] initWithTitle:@"File"];
   [fileItem.submenu addItemWithTitle:@"Open…" action:@selector(openDocument:) keyEquivalent:@"o"];
+  [fileItem.submenu addItemWithTitle:@"Close" action:@selector(closeDocument:) keyEquivalent:@"w"];
   [fileItem.submenu addItemWithTitle:@"Save" action:@selector(saveDocument:) keyEquivalent:@"s"];
   [fileItem.submenu addItemWithTitle:@"Save As…" action:@selector(saveDocumentAs:) keyEquivalent:@"S"];  // ⇧⌘S
   [fileItem.submenu addItem:[NSMenuItem separatorItem]];
@@ -500,6 +501,21 @@ static NSString* timeString(int64_t us) {
   [self showFileName];
   [self showStatus:[NSString stringWithFormat:@"Saved %@", url.lastPathComponent] error:NO];
   return YES;
+}
+
+// Closes the project (offering to save its changes) and starts a new, empty one in its place. The
+// files listed in the left pane stay listed.
+- (void)closeDocument:(id)sender {
+  if (![self keepChanges]) return;
+  [_properties orderOut:nil];
+  _doc = editor::Document();
+  _fileURL = nil;
+  _sel = {};
+  [self structureChanged];
+  [self seekTo:0];
+  _window.documentEdited = NO;
+  [self showFileName];
+  [self showStatus:@"" error:NO];
 }
 
 - (void)openDocument:(id)sender {
@@ -812,8 +828,17 @@ struct Dropped {
   [_timeline reload];
   _overlay.needsDisplay = YES;
   [_inspector rebuild];
+  [self rebuildProjectTab];
   [self updatePropertiesTitle];
   [self scheduleReload];
+}
+
+// The Project tab shows the project as it is (e.g. a document's size, just opened). Rebuilt just
+// after this event: one of its own buttons (Add Track) may be what changed the structure.
+- (void)rebuildProjectTab {
+  dispatch_async(dispatch_get_main_queue(), ^{
+    [self->_projectInspector rebuild];
+  });
 }
 
 // An open properties window follows the selection.
@@ -860,7 +885,7 @@ struct Dropped {
   if (_projectSel.track >= 0) {  // the Project tab added a track: select it there, and stay on the project
     _sel = _projectSel;
     _projectSel = {};
-    [_projectInspector rebuild];
+    [self rebuildProjectTab];
   }
   [self structureChanged];
 }

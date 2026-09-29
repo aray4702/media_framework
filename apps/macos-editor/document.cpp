@@ -11,6 +11,7 @@ Document::Document() {
   scene.output.width = 1920;
   scene.output.height = 1080;
   scene.output.fpsNum = 30;
+  scene.output.background = {0.5f, 0.5f, 0.5f, 1};  // gray, so black video and empty canvas look different
   addTrack(true);
 }
 
@@ -69,9 +70,13 @@ int Document::moveTrack(int t, int delta) {
 }
 
 int Document::insertItem(int t, mf::SceneItem it, int64_t atUs, int64_t lengthUs) {
-  std::vector<mf::SceneItem>& items = track(t).items;
   it.id = newId("item");
   if (lengthUs > 0) lengthUs_[it.id] = lengthUs;
+  return place(t, std::move(it), atUs);
+}
+
+int Document::place(int t, mf::SceneItem it, int64_t atUs) {
+  std::vector<mf::SceneItem>& items = track(t).items;
   it.startUs = std::max<int64_t>(0, atUs);
   int k = 0;
   while (k < int(items.size()) && items[k].startUs <= it.startUs) ++k;
@@ -90,7 +95,19 @@ int Document::insertItem(int t, mf::SceneItem it, int64_t atUs, int64_t lengthUs
 
 void Document::removeItem(int t, int k) {
   lengthUs_.erase(item(t, k).id);
+  takeItem(t, k);
+}
+
+int Document::moveToTrack(int* t, int k, int to, int64_t startUs) {
+  if (to == *t || to < 0 || to >= tracks() || track(to).video != (item(*t, k).type != mf::ItemType::Audio)) return -1;
+  mf::SceneItem it = takeItem(*t, k);  // keeps its id, so its file length stays known
+  *t = to;
+  return place(to, std::move(it), startUs);
+}
+
+mf::SceneItem Document::takeItem(int t, int k) {
   std::vector<mf::SceneItem>& items = track(t).items;
+  mf::SceneItem it = std::move(items[k]);
   items.erase(items.begin() + k);
   std::vector<mf::SceneTransition>& xs = track(t).transitions;
   xs.erase(std::remove_if(xs.begin(), xs.end(), [&](const mf::SceneTransition& x) { return x.from == k - 1 || x.from == k; }),
@@ -99,6 +116,7 @@ void Document::removeItem(int t, int k) {
     if (x.from > k) --x.from;
   }
   normalize(t);
+  return it;
 }
 
 void Document::moveItem(int t, int k, int64_t startUs) {

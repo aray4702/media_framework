@@ -1,7 +1,9 @@
 #import "inspector_view.h"
 
+#include <algorithm>
 #include <cmath>
 #include <functional>
+#include <vector>
 
 // Runs a block when its control acts, and another to show the model's current value.
 @interface Binding : NSObject
@@ -201,10 +203,14 @@ using EffectsRef = std::function<mf::SceneEffects&()>;
 }
 
 - (void)popup:(NSString*)title items:(NSArray<NSString*>*)items get:(int (^)(void))get set:(void (^)(int))set {
+  [self popup:title items:items width:kControlWidth get:get set:set];
+}
+
+- (void)popup:(NSString*)title items:(NSArray<NSString*>*)items width:(CGFloat)width get:(int (^)(void))get set:(void (^)(int))set {
   NSPopUpButton* popup = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO];
   popup.controlSize = NSControlSizeSmall;
   [popup addItemsWithTitles:items];
-  [popup.widthAnchor constraintEqualToConstant:kControlWidth].active = YES;
+  [popup.widthAnchor constraintEqualToConstant:width].active = YES;
   [self bind:popup
       action:^(NSPopUpButton* p) {
         set(int(p.indexOfSelectedItem));
@@ -291,18 +297,37 @@ using EffectsRef = std::function<mf::SceneEffects&()>;
   editor::Document* doc = _doc;
   __weak InspectorView* weak = self;
   [self section:@"Project"];
-  static const int sizes[][2] = {{1920, 1080}, {1080, 1920}, {1080, 1080}, {1280, 720}};
+  // Landscape and square, then portrait: 9:16 and 4:5, and typical phone screens (even sizes
+  // only, as the engine needs: the iPhone 15/16 Pro's 1179 × 2556 is odd).
+  struct Size {
+    int width, height;
+    NSString* label;
+  };
+  static const std::vector<Size> presets = {
+      {1920, 1080, @"16:9"},    {1280, 720, @"16:9"},     {1080, 1080, @"1:1"},         {1080, 1350, @"4:5"},
+      {1080, 1920, @"9:16"},    {720, 1280, @"9:16"},     {1080, 2340, @"Android"},     {1080, 2400, @"Android"},
+      {1170, 2532, @"iPhone"},  {1284, 2778, @"iPhone Max"}, {1290, 2796, @"iPhone Pro Max"},
+  };
+  // A size from an opened document that isn't one of these is listed too, as it is.
+  std::vector<Size> sizes = presets;
+  const mf::SceneOutput& now = doc->scene.output;
+  if (std::none_of(sizes.begin(), sizes.end(), [&](const Size& s) { return s.width == now.width && s.height == now.height; })) {
+    sizes.push_back({now.width, now.height, @"this project"});
+  }
+  NSMutableArray* titles = [NSMutableArray array];
+  for (const Size& s : sizes) [titles addObject:[NSString stringWithFormat:@"%d × %d  %@", s.width, s.height, s.label]];
   [self popup:@"Size"
-      items:@[ @"1920 × 1080 (16:9)", @"1080 × 1920 (9:16)", @"1080 × 1080 (1:1)", @"1280 × 720 (16:9)" ]
+      items:titles
+      width:180
       get:^{
-        for (int i = 0; i < 4; ++i) {
-          if (doc->scene.output.width == sizes[i][0] && doc->scene.output.height == sizes[i][1]) return i;
+        for (size_t i = 0; i < sizes.size(); ++i) {
+          if (doc->scene.output.width == sizes[i].width && doc->scene.output.height == sizes[i].height) return int(i);
         }
-        return 0;
+        return -1;
       }
       set:^(int i) {
-        doc->scene.output.width = sizes[i][0];
-        doc->scene.output.height = sizes[i][1];
+        doc->scene.output.width = sizes[i].width;
+        doc->scene.output.height = sizes[i].height;
       }];
   static const int rates[] = {24, 25, 30, 60};
   [self popup:@"Frame rate"

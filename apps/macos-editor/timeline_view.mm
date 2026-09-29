@@ -41,7 +41,9 @@ enum class Drag { None, Seek, Move, TrimStart, TrimEnd };
   Drag _drag;
   CGFloat _downX;
   int64_t _origStartUs, _origDurationUs;
-  mf::SceneTrack _origTrack;  // a start trim applies to the track as it was when the drag began
+  mf::SceneTrack _origTrack;  // a start trim or a move applies to the track as it was when the drag began
+  int _toTrack;               // a move over another track that takes the item: that track, else -1
+  int64_t _toStartUs;         // and where on it the item would land
   BOOL _handles;  // the mouse is near an end of the selected item: its trim handles show
   BOOL _dropping;  // something is dragged over: where it would land shows at _dropAt
   NSPoint _dropAt;
@@ -224,6 +226,7 @@ enum class Drag { None, Seek, Move, TrimStart, TrimEnd };
   NSRectFill(NSMakeRect(px - 0.5, NSMinY(visible), 1.5, NSHeight(visible)));
 
   if (_dropping) [self drawDropMark];
+  if (_drag == Drag::Move && _toTrack >= 0) [self drawLanding];
   [self drawRuler:visible];
 }
 
@@ -454,6 +457,31 @@ enum class Drag { None, Seek, Move, TrimStart, TrimEnd };
   NSRectFill(NSMakeRect(NSMinX(bar), NSMaxY(bar) - 1, NSWidth(bar), 1));
 }
 
+// --- Moving to another track -----------------------------------------------------------------
+
+// Where an item put on track t at `us` lands: there, or right after the item playing then.
+- (int64_t)landingOn:(int)t at:(int64_t)us {
+  const std::vector<mf::SceneItem>& items = _doc->track(t).items;
+  int k = 0;
+  while (k < int(items.size()) && items[k].startUs <= us) ++k;
+  return k > 0 ? std::max(us, items[k - 1].endUs()) : us;
+}
+
+// The moving item's outline, dashed, where it would land on the other track.
+- (void)drawLanding {
+  int r = [self rowOfTrack:_toTrack];
+  CGFloat x0 = [self xOf:_toStartUs], x1 = [self xOf:_toStartUs + _origDurationUs];
+  NSRect box = NSMakeRect(x0, [self rowTop:r] + 4, std::max<CGFloat>(4, x1 - x0), [self rowHeight:r] - 8);
+  NSBezierPath* shape = [NSBezierPath bezierPathWithRoundedRect:box xRadius:5 yRadius:5];
+  [[NSColor.controlAccentColor colorWithAlphaComponent:0.2] setFill];
+  [shape fill];
+  const CGFloat dash[] = {5, 3};
+  [shape setLineDash:dash count:2 phase:0];
+  shape.lineWidth = 2;
+  [NSColor.controlAccentColor setStroke];
+  [shape stroke];
+}
+
 // --- Dropping --------------------------------------------------------------------------------
 
 // Where a drop at _dropAt lands: a line at its time, over its row (or all rows, below them).
@@ -554,6 +582,8 @@ enum class Drag { None, Seek, Move, TrimStart, TrimEnd };
         _drag = Drag::Move;
         _origStartUs = items[k].startUs;
         _origDurationUs = items[k].durationUs;
+        _origTrack = _doc->track(sel.track);
+        _toTrack = -1;
         break;
       }
     }
@@ -572,7 +602,22 @@ enum class Drag { None, Seek, Move, TrimStart, TrimEnd };
   switch (_drag) {
     case Drag::None: return;
     case Drag::Seek: [self.delegate timelineSeek:[self usAt:std::max(p.x, NSMinX(self.visibleRect) + kGutter)]]; return;
-    case Drag::Move: _doc->moveItem(_sel->track, _sel->item, _origStartUs + dUs); break;
+    case Drag::Move: {
+      // Over another track that takes the item: it stays where it was, and where it would land
+      // there shows. Over its own: it moves along it.
+      _doc->track(_sel->track) = _origTrack;
+      int r = [self rowAt:p.y];
+      int to = r >= 0 ? [self trackOfRow:r] : -1;
+      bool visual = _doc->item(_sel->track, _sel->item).type != mf::ItemType::Audio;
+      if (to >= 0 && to != _sel->track && _doc->track(to).video == visual) {
+        _toTrack = to;
+        _toStartUs = [self landingOn:to at:std::max<int64_t>(0, _origStartUs + dUs)];
+      } else {
+        _toTrack = -1;
+        _doc->moveItem(_sel->track, _sel->item, _origStartUs + dUs);
+      }
+      break;
+    }
     case Drag::TrimStart:  // right: shorter. From the drag's start, so dragging back gives the space back
       _doc->track(_sel->track) = _origTrack;
       _doc->trimStart(_sel->track, _sel->item, _origDurationUs - dUs);
@@ -584,6 +629,17 @@ enum class Drag { None, Seek, Move, TrimStart, TrimEnd };
 }
 
 - (void)mouseUp:(NSEvent*)event {
+  if (_drag == Drag::Move && _toTrack >= 0) {  // dropped on another track
+    editor::Selection moved = *_sel;
+    int k = _doc->moveToTrack(&moved.track, moved.item, _toTrack, _toStartUs);
+    _toTrack = -1;
+    if (k >= 0) {
+      moved.item = k;
+      *_sel = moved;
+      [self.delegate timelineSelectionChanged];
+      [self.delegate timelineEdited];
+    }
+  }
   if (_drag == Drag::Move || _drag == Drag::TrimStart || _drag == Drag::TrimEnd) [self reload];  // the length may have changed
   _drag = Drag::None;
   [self mouseMoved:event];

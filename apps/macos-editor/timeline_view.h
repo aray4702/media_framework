@@ -1,21 +1,21 @@
 #pragma once
 
-// The timeline: a ruler, then one row per track with the top layer first, each item as a
-// block at its start and duration, a transition button where two videos or images meet, and the
-// playhead. Clicking a transition button selects that join (Selection::transition). Where a
-// transition overlaps two items, the one underneath shows as a dotted outline.
-// Click an item to select it, or an empty part of a track's row to select the track. The
-// selected item is highlighted with its length before its name and a "…" button at its
-// right end that opens its properties (a selected track has one at the right of its row); near
-// either end it shows handles, which trim it when dragged.
-// The start handle trims into the file: dragged left, the item's start first moves into the free
-// space before it; otherwise (and dragged right) it's a ripple trim, the item keeps its place and
-// the items after it on the track move by as much. Grabbing a handle leaves the
-// playhead where it is. Drag an item to move it. Any other click in the lanes or the ruler
-// moves the playhead there;
-// dragging in the ruler or on empty space scrubs. Space plays and pauses; Delete
-// removes the selection. Audio rows are tinted, and audio items show their waveform. Things dragged over it (types registered by the owner) show where they
-// would land, and the delegate adds them.
+// The timeline: a ruler, then one row per track with the top layer first (audio rows tinted), each
+// item a block at its start and duration (audio items with their waveform), a transition button
+// where two videos or images meet, and the playhead. Where a transition overlaps two items, the
+// one underneath shows as a dotted outline.
+//
+// Click an item to select it (it's drawn in front, with its length and a "…" button for its
+// properties), an empty part of a row to select the track (its "…" is at the row's right), or a
+// transition button to select that join (Selection::transition). Near either end of the selected
+// item, handles trim it: the end one changes its length; the start one trims into the file,
+// dragged left first growing into free space before the item, otherwise a ripple trim that
+// keeps its place and moves the items after it. Drag an item to move it along its track, or
+// onto another track that takes it (a dashed outline shows where it lands). Any other click
+// moves the playhead; dragging in the ruler or on empty space scrubs. Grabbing a handle or a
+// button leaves the playhead where it is. Space plays and pauses; Delete removes the selection.
+// Things dragged over it (types registered by the owner) show where they would land, and the
+// delegate adds them.
 
 #import <AppKit/AppKit.h>
 

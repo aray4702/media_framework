@@ -234,6 +234,36 @@ static void load() {
   checkValid(d);
 }
 
+static void moveToTrack() {
+  Document d;
+  d.addTrack(true);
+  d.addTrack(false);  // audio goes in at 0: the video tracks are now 1 and 2
+  int lower = 1, upper = 2;
+  mf::SceneItem v;
+  v.type = mf::ItemType::Video;
+  v.durationUs = 8 * kS;
+  d.insertItem(lower, v, 0, 10 * kS);                    // [0, 8): its file is 10 s
+  d.insertItem(lower, still(mf::ItemType::Image), 8 * kS);  // [8, 13)
+  mf::SceneTransition x;
+  x.kind = mf::SceneTransitionKind::Crossfade;
+  x.durationUs = kS;
+  d.setTransition(lower, 1, &x);
+  d.insertItem(upper, still(mf::ItemType::Color), 2 * kS);  // [2, 7)
+  std::string id = d.item(lower, 0).id;
+
+  int t = lower;
+  int k = d.moveToTrack(&t, 0, upper, 9 * kS);  // after the color: at 9 s
+  CHECK(t == upper && k == 1 && d.item(upper, 1).id == id && d.item(upper, 1).startUs == 9 * kS);
+  CHECK(d.track(lower).items.size() == 1 && d.track(lower).transitions.empty());  // the crossfade went with it
+  d.setDuration(upper, 1, 20 * kS);  // its file length is still known
+  CHECK(d.item(upper, 1).durationUs == 10 * kS);
+  t = upper;
+  k = d.moveToTrack(&t, 1, lower, 8 * kS);  // onto the image, playing [7, 12) since the crossfade: right after it
+  CHECK(t == lower && k == 1 && d.item(lower, 1).startUs == 12 * kS && d.item(lower, 1).id == id);
+  CHECK(d.moveToTrack(&t, k, 0, 0) == -1 && t == lower);  // not onto an audio track
+  checkValid(d);
+}
+
 static void tracks() {
   Document d;
   int a = d.addTrack(false);
@@ -257,6 +287,7 @@ int main() {
   junctions();
   detach();
   load();
+  moveToTrack();
   tracks();
   std::printf(failures ? "%d failure(s)\n" : "all passed\n", failures);
   return failures ? EXIT_FAILURE : EXIT_SUCCESS;
