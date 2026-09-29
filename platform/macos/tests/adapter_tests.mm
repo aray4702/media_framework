@@ -183,7 +183,7 @@ static void compositorTests() {
 int main(int argc, char** argv) {
   compositorTests();
   if (argc < 2) {
-    std::fprintf(stderr, "usage: %s clip.mp4\n", argv[0]);
+    std::fprintf(stderr, "usage: %s clip.mp4|audio.m4a\n", argv[0]);
     return 2;
   }
   auto demuxer = macos::createDemuxer();
@@ -191,10 +191,13 @@ int main(int argc, char** argv) {
   Result r = demuxer->open(macos::sourceFromPath(argv[1]), &info);
   std::fprintf(stderr, "open: %s duration=%.3fs video=%dx%d frame=%lldus supported=%d audio=%s\n", toString(r),
                info.durationUs / 1e6, info.video.width, info.video.height, (long long)info.video.frameDurationUs,
-               info.video.supported, info.audio ? (info.audio->supported ? "AAC-LC" : "unsupported") : "none");
+               info.video.supported, info.audio ? (info.audio->supported ? "AAC-LC or MP3" : "unsupported") : "none");
   if (r != Result::Ok) return 1;
+  bool video = info.video.width > 0;  // an audio-only file has no video to check
+  CHECK(video || info.audio);
 
   // All frames come out, in strictly increasing PTS order.
+  if (video) {
   auto decoder = macos::createVideoDecoder();
   CHECK(decoder->configure(info.video, [] {}) == Result::Ok);
   int packets = 0, corrupt = 0;
@@ -213,6 +216,15 @@ int main(int argc, char** argv) {
   CHECK(first.key);
   CHECK(first.ptsUs <= target);
   CHECK(target - first.ptsUs <= 10 * 1000000);
+  } else {
+    // Audio only: a seek starts reading at the target.
+    int64_t target = info.durationUs / 2;
+    CHECK(demuxer->seekTo(target) == Result::Ok);
+    Packet first;
+    CHECK(demuxer->read(kAudio, &first) == Result::Ok);
+    std::fprintf(stderr, "audio only: seek %.3fs -> packet %.3fs\n", target / 1e6, first.ptsUs / 1e6);
+    CHECK(std::llabs(first.ptsUs - target) <= 100000);
+  }
 
   // Audio decodes to about the track's duration of PCM.
   if (info.audio && info.audio->supported) {

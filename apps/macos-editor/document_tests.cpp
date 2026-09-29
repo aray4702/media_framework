@@ -85,32 +85,39 @@ static void trimStart() {
   mf::SceneItem v;
   v.type = mf::ItemType::Video;
   v.durationUs = 8 * kS;
-  d.insertItem(0, still(mf::ItemType::Color), 0);   // [0, 5)
-  d.insertItem(0, v, 6 * kS, 8 * kS);               // [6, 14), in 0
+  d.insertItem(0, still(mf::ItemType::Color), 0);        // [0, 5)
+  d.insertItem(0, v, 6 * kS, 8 * kS);                    // [6, 14), in 0: 1 s free before it
   d.insertItem(0, still(mf::ItemType::Color), 15 * kS);  // [15, 20)
   auto at = [&](int k) { return d.item(0, k).startUs; };
+  auto in = [&](int k) { return d.item(0, k).inUs; };
 
-  d.trimStart(0, 1, 6 * kS);  // 2 s cut off its start: it stays, reads the file from 2 s; the next moves back 2 s
-  CHECK(at(1) == 6 * kS && d.item(0, 1).durationUs == 6 * kS && d.item(0, 1).inUs == 2 * kS && at(2) == 13 * kS);
-  d.trimStart(0, 1, 20 * kS);  // longer: at most back to the file's start
-  CHECK(at(1) == 6 * kS && d.item(0, 1).durationUs == 8 * kS && d.item(0, 1).inUs == 0 && at(2) == 15 * kS);
+  d.trimStart(0, 1, 6 * kS);  // 2 s cut off its start: it stays, reads from 2 s; the next moves back
+  CHECK(at(1) == 6 * kS && d.item(0, 1).durationUs == 6 * kS && in(1) == 2 * kS && at(2) == 13 * kS);
+  d.trimStart(0, 1, 7 * kS);  // 1 s longer: into the free second before it; nothing else moves
+  CHECK(at(1) == 5 * kS && d.item(0, 1).durationUs == 7 * kS && in(1) == kS && at(2) == 13 * kS);
+  d.trimStart(0, 1, 20 * kS);  // no space left, and 1 s more of the file: a ripple
+  CHECK(at(1) == 5 * kS && d.item(0, 1).durationUs == 8 * kS && in(1) == 0 && at(2) == 14 * kS);
   d.trimStart(0, 1, 0);  // shorter: at least the shortest item
-  CHECK(d.item(0, 1).durationUs == Document::kMinDurationUs && at(2) == 7100000);
+  CHECK(at(1) == 5 * kS && d.item(0, 1).durationUs == Document::kMinDurationUs && at(2) == 6100000);
   d.trimStart(0, 1, 8 * kS);
-  CHECK(at(2) == 15 * kS);
+  CHECK(at(1) == 5 * kS && in(1) == 0 && at(2) == 14 * kS);
   checkValid(d);
 
   d.trimStart(0, 0, 3 * kS);  // a still: its length only, and the rest moves back
-  CHECK(at(0) == 0 && d.item(0, 0).durationUs == 3 * kS && d.item(0, 0).inUs == 0 && at(1) == 4 * kS && at(2) == 13 * kS);
+  CHECK(at(0) == 0 && d.item(0, 0).durationUs == 3 * kS && in(0) == 0 && at(1) == 3 * kS && at(2) == 12 * kS);
+  d.trimStart(0, 0, 4 * kS);  // at 0 s: no space before it, so a ripple
+  CHECK(at(0) == 0 && d.item(0, 0).durationUs == 4 * kS && at(1) == 4 * kS && at(2) == 13 * kS);
   checkValid(d);
 
   mf::SceneTransition x;
   x.kind = mf::SceneTransitionKind::Crossfade;
   x.durationUs = kS;
-  d.setTransition(0, 1, &x);  // the video now starts at 2 s
-  CHECK(at(1) == 2 * kS && at(2) == 13 * kS);
-  d.trimStart(0, 1, 7 * kS);  // joined: it still keeps its place
-  CHECK(at(1) == 2 * kS && d.item(0, 1).inUs == kS && at(2) == 12 * kS);
+  d.setTransition(0, 1, &x);  // the video now starts at 3 s
+  CHECK(at(1) == 3 * kS && at(2) == 13 * kS);
+  d.trimStart(0, 1, 7 * kS);  // joined: it keeps its place
+  CHECK(at(1) == 3 * kS && in(1) == kS && at(2) == 12 * kS);
+  d.trimStart(0, 1, 8 * kS);  // and grows by a ripple, not into the item before
+  CHECK(at(1) == 3 * kS && in(1) == 0 && at(2) == 13 * kS);
   checkValid(d);
 }
 
@@ -155,6 +162,49 @@ static void transitions() {
   checkValid(d);
 }
 
+static void junctions() {
+  Document d;
+  mf::SceneItem image = still(mf::ItemType::Image);
+  d.insertItem(0, image, 0);                               // [0, 5)
+  d.insertItem(0, image, 5 * kS);                          // [5, 10): meets it
+  d.insertItem(0, image, 11 * kS);                         // [11, 16): a gap
+  d.insertItem(0, still(mf::ItemType::Text), 16 * kS);     // [16, 21): meets it, but text
+  CHECK(!d.junction(0, 0) && d.junction(0, 1) && !d.junction(0, 2) && !d.junction(0, 3) && !d.junction(0, 4));
+  mf::SceneTransition x;
+  x.kind = mf::SceneTransitionKind::Crossfade;
+  x.durationUs = kS;
+  d.setTransition(0, 1, &x);  // overlapping now: still a junction
+  CHECK(d.item(0, 1).startUs == 4 * kS && d.junction(0, 1));
+  checkValid(d);
+}
+
+static void detach() {
+  Document d;
+  mf::SceneItem v;
+  v.type = mf::ItemType::Video;
+  v.src = "clip.mp4";
+  v.durationUs = 8 * kS;
+  v.inUs = kS;
+  d.insertItem(0, v, 2 * kS, 10 * kS);  // [2, 10), from 1 s into the file
+  int video = 0, k = -1;
+  int a = d.detachAudio(&video, 0, &k);
+  CHECK(a == 0 && video == 1 && k == 0);  // a new audio track, below the video one
+  const mf::SceneItem& sound = d.item(a, k);
+  CHECK(sound.type == mf::ItemType::Audio && sound.src == "clip.mp4" && sound.startUs == 2 * kS && sound.durationUs == 8 * kS &&
+        sound.inUs == kS && !sound.mute);
+  CHECK(d.item(video, 0).mute);
+  d.setDuration(a, k, 20 * kS);  // the file's length still limits it: 10 s less 1 s in
+  CHECK(d.item(a, k).durationUs == 9 * kS);
+  int again = -1;
+  d.insertItem(video, v, 20 * kS, 10 * kS);  // a second video, [20, 28): the audio track is free then
+  CHECK(d.detachAudio(&video, 1, &again) == a && again == 1 && video == 1);
+  CHECK(d.detachAudio(&video, 1, &again) == 0 && video == 2);  // busy now: another new audio track
+  int none = 0;
+  d.insertItem(video, still(mf::ItemType::Image), 40 * kS);
+  CHECK(d.detachAudio(&video, 2, &none) == -1);  // not a video
+  checkValid(d);
+}
+
 static void tracks() {
   Document d;
   int a = d.addTrack(false);
@@ -175,6 +225,8 @@ int main() {
   mediaLength();
   trimStart();
   transitions();
+  junctions();
+  detach();
   tracks();
   std::printf(failures ? "%d failure(s)\n" : "all passed\n", failures);
   return failures ? EXIT_FAILURE : EXIT_SUCCESS;

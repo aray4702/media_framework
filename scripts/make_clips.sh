@@ -36,6 +36,10 @@ fi
 ffmpeg -loglevel error -y -f lavfi -i "testsrc2=size=1920x1080:rate=30:duration=$SECONDS_LONG" \
   $X264 -g 30 $MP4 video_only.mp4 && echo clips/video_only.mp4
 
+# Audio only, for audio items: an AAC tone in .m4a, and an MP3 one (44.1 kHz, resampled when mixed).
+ffmpeg -loglevel error -y -f lavfi -i "$(tone $SECONDS_LONG)" $AAC audio_only.m4a && echo clips/audio_only.m4a
+ffmpeg -loglevel error -y -f lavfi -i "$(tone $SECONDS_LONG)" -c:a libmp3lame -b:a 128k -ar 44100 -ac 2 audio_only.mp3 && echo clips/audio_only.mp3
+
 # Audio ends 5 s before the video.
 ffmpeg -loglevel error -y -f lavfi -i "testsrc2=size=1920x1080:rate=30:duration=$SECONDS_LONG" \
   -f lavfi -i "$(tone 5)" $X264 -g 30 $AAC $MP4 audio_short.mp4 && echo clips/audio_short.mp4

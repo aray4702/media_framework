@@ -154,9 +154,9 @@ class SourceStage : public Stage {
         const TrackInfo& a = *rt.info.audio;
         usable = a.supported && a.sampleRate > 0 && a.channels > 0 && lane.audioDecoder->configure(a) == Result::Ok;
       }
-      if (it.type == ItemType::Audio && !usable) return ctx_.fatal(Result::NoDecoder, name + "has no AAC-LC audio track (R9)");
+      if (it.type == ItemType::Audio && !usable) return ctx_.fatal(Result::NoDecoder, name + "has no AAC-LC or MP3 audio track (R9)");
       if (it.type == ItemType::Video && rt.info.audio && !usable && !it.mute) {
-        ctx_.events.onWarning(Warning::AudioUnsupported, name + "audio is not AAC-LC; the item plays silent");
+        ctx_.events.onWarning(Warning::AudioUnsupported, name + "audio is not AAC-LC or MP3; the item plays silent");
       }
       rt.mixAudio = usable && !it.mute;
       if (rt.mixAudio && !firstAudio) firstAudio = std::make_pair(rt.info.audio->sampleRate, rt.info.audio->channels);

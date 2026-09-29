@@ -40,4 +40,8 @@ struct SidebarPayload {
 - (void)rememberFile:(NSString*)path;  // lists it under its tab (Video, Image or Audio)
 - (void)setProjectView:(NSView*)view;  // what the Project tab shows
 - (SidebarPayload)draggedPayload;       // during a drag out of the pane; empty otherwise
+// Shows `view` under `title` in place of the open tab's content, opening the pane if it's
+// collapsed, until hidePanel (or a tab is clicked), which puts back what was there.
+- (void)showPanel:(NSView*)view title:(NSString*)title;
+- (void)hidePanel;
 @end

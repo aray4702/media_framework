@@ -52,7 +52,7 @@ struct Packet {
 };
 
 struct TrackInfo {
-  bool supported = false;  // codec is in MVP scope (H.264 / AAC-LC)
+  bool supported = false;  // codec is in MVP scope (H.264; AAC-LC or MP3)
   int64_t frameDurationUs = 0;
   int width = 0, height = 0;
   bool rotated = false;  // non-identity track matrix (A21)

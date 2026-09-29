@@ -46,7 +46,7 @@ class AvfDemuxer : public IDemuxer {
 
       tracks_[kVideo] = [asset_ tracksWithMediaType:AVMediaTypeVideo].firstObject;
       tracks_[kAudio] = [asset_ tracksWithMediaType:AVMediaTypeAudio].firstObject;
-      if (!tracks_[kVideo]) return Result::UnsupportedFormat;
+      if (!tracks_[kVideo] && !tracks_[kAudio]) return Result::UnsupportedFormat;  // audio only (e.g. .m4a) is fine
       NSArray* trackKeys = @[ @"formatDescriptions", @"minFrameDuration", @"nominalFrameRate", @"preferredTransform" ];
       for (AVAssetTrack* t : tracks_) {
         if (t && !loadKeys(t, trackKeys)) return Result::MalformedMedia;
@@ -54,12 +54,13 @@ class AvfDemuxer : public IDemuxer {
 
       MediaInfo info;
       info.durationUs = toUs(asset_.duration);
-      if (!describeVideo(&info.video)) return Result::MalformedMedia;
+      if (tracks_[kVideo] && !describeVideo(&info.video)) return Result::MalformedMedia;  // none: info.video stays empty
       if (tracks_[kAudio]) {
         TrackInfo a;
         if (describeAudio(&a)) info.audio = a;
         else tracks_[kAudio] = nil;
       }
+      if (!tracks_[kVideo] && !tracks_[kAudio]) return Result::MalformedMedia;
       *out = info;
       return startReader(kCMTimeZero);
     }
@@ -81,6 +82,7 @@ class AvfDemuxer : public IDemuxer {
   }
 
   // AVAssetReader can't seek in place (A13): find the sync sample <= us, start a new reader there.
+  // Without video, the reader starts at us (every AAC packet is a sync sample).
   Result seekTo(int64_t us) override {
     @autoreleasepool {
       CMTime target = CMTimeMake(us, 1000000);
@@ -121,8 +123,8 @@ class AvfDemuxer : public IDemuxer {
     if (!fd) return false;
     const AudioStreamBasicDescription* asbd = CMAudioFormatDescriptionGetStreamBasicDescription(fd);
     if (!asbd) return false;
-    a->supported = asbd->mFormatID == kAudioFormatMPEG4AAC &&
-                   (asbd->mFormatFlags == 0 || asbd->mFormatFlags == kMPEG4Object_AAC_LC);
+    bool aacLc = asbd->mFormatID == kAudioFormatMPEG4AAC && (asbd->mFormatFlags == 0 || asbd->mFormatFlags == kMPEG4Object_AAC_LC);
+    a->supported = aacLc || asbd->mFormatID == kAudioFormatMPEGLayer3;  // the audio decoder handles both
     a->sampleRate = static_cast<int>(asbd->mSampleRate);
     a->channels = static_cast<int>(asbd->mChannelsPerFrame);
     a->format = retainCF(fd);

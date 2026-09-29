@@ -165,6 +165,9 @@ mf::SceneItem textItem(const std::string& text, const char* font, float size) {
   NSMutableArray* _actions;  // ClickAction targets of the current tab's buttons
   NSMutableArray<NSString*>* _files[kTabs];
   SidebarPayload _dragged;
+  NSView* _panel;              // shown by showPanel, over the tabs' content
+  NSString* _panelTitle;
+  BOOL _collapsedUnderPanel;   // the pane was collapsed when the panel opened it
 }
 
 - (instancetype)initWithFrame:(NSRect)frame {
@@ -247,6 +250,12 @@ mf::SceneItem textItem(const std::string& text, const char* font, float size) {
 
 // The open tab's button collapses the pane; any tab's button opens it.
 - (void)tabClicked:(NSButton*)sender {
+  if (_panel) {  // a tab takes the place of the panel
+    [_panel removeFromSuperview];
+    _panel = nil;
+    _collapsedUnderPanel = NO;
+    return [self showTab:Tab(sender.tag)];
+  }
   if (!_collapsed && sender.tag == _tab) return [self setCollapsed:YES];
   if (_collapsed) [self setCollapsed:NO];
   [self showTab:Tab(sender.tag)];
@@ -266,12 +275,41 @@ mf::SceneItem textItem(const std::string& text, const char* font, float size) {
 - (void)setCollapsed:(BOOL)collapsed {
   _collapsed = collapsed;
   _title.hidden = collapsed;
-  _scroll.hidden = collapsed || _tab == kProject;
-  _projectView.hidden = collapsed || _tab != kProject;
+  _scroll.hidden = collapsed || _panel || _tab == kProject;
+  _projectView.hidden = collapsed || _panel || _tab != kProject;
+  _panel.hidden = collapsed;
   _collapseButton.image = [NSImage imageWithSystemSymbolName:collapsed ? @"sidebar.right" : @"sidebar.left"
                                     accessibilityDescription:collapsed ? @"Expand" : @"Collapse"];
   if (collapsed) [self showTab:_tab];  // the open tab is highlighted only while its content shows
   [self.delegate sidebarCollapsedChanged];  // opening: the new width builds the content (setFrameSize)
+}
+
+- (void)showPanel:(NSView*)view title:(NSString*)title {
+  _panelTitle = title;  // first: opening the pane below lays it out, title and all
+  if (_panel != view) {
+    [_panel removeFromSuperview];
+    _panel = view;
+    view.frame = _scroll.frame;
+    view.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    [self addSubview:view];
+  }
+  if (_collapsed) {
+    _collapsedUnderPanel = YES;
+    self.collapsed = NO;
+  }
+  [self showTab:_tab];  // with the panel: no tab highlighted, its content hidden
+}
+
+- (void)hidePanel {
+  if (!_panel) return;
+  [_panel removeFromSuperview];
+  _panel = nil;
+  if (_collapsedUnderPanel) {
+    _collapsedUnderPanel = NO;
+    self.collapsed = YES;
+  } else {
+    [self showTab:_tab];
+  }
 }
 
 - (void)setProjectView:(NSView*)view {
@@ -286,13 +324,14 @@ mf::SceneItem textItem(const std::string& text, const char* font, float size) {
 - (void)showTab:(Tab)tab {
   _tab = tab;
   for (NSButton* b in _tabButtons) {
-    bool on = b.tag == tab && !_collapsed;
+    bool on = b.tag == tab && !_collapsed && !_panel;
     b.layer.backgroundColor = on ? [NSColor.controlAccentColor colorWithAlphaComponent:0.18].CGColor : nil;
     b.contentTintColor = on ? NSColor.controlAccentColor : NSColor.secondaryLabelColor;
   }
-  _title.stringValue = kTabTitles[tab];
-  _scroll.hidden = _collapsed || tab == kProject;
-  _projectView.hidden = _collapsed || tab != kProject;
+  _title.stringValue = _panel ? (_panelTitle ?: @"") : kTabTitles[tab];
+  _scroll.hidden = _collapsed || _panel || tab == kProject;
+  _projectView.hidden = _collapsed || _panel || tab != kProject;
+  _panel.hidden = _collapsed;
   for (NSView* v in _list.arrangedSubviews) [v removeFromSuperview];
   [_actions removeAllObjects];
   if (_collapsed) return;  // built when it opens, at its width

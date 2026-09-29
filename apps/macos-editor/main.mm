@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cmath>
 #include <map>
+#include <set>
 #include <vector>
 
 #include "document.h"
@@ -23,6 +24,7 @@
 #include "preview_overlay.h"
 #include "sidebar_view.h"
 #include "timeline_view.h"
+#include "waveform.h"
 
 // The player draws into its CAMetalLayer. Resized, the last frame keeps its aspect ratio (never
 // stretched) until `resized` has it drawn again at the new size.
@@ -133,6 +135,9 @@ static NSString* timeString(int64_t us) {
   PreviewView* _preview;
   PreviewOverlay* _overlay;  // over the preview: the selection, and editing it there
   std::map<std::string, NSSize> _naturalSizes;  // by src: a video's or image's pixel size
+  std::map<std::string, std::vector<float>> _peaks;  // by src: an audio file's waveform
+  std::set<std::string> _peaksLoading;
+  std::map<std::string, std::string> _audioProblems;  // by src: why a video's audio can't play, or ""
   NSTextField* _placeholder;
   NSButton* _playButton;
   NSTextField* _timeLabel;
@@ -141,6 +146,7 @@ static NSString* timeString(int64_t us) {
   InspectorView* _inspector;
   NSPanel* _properties;  // floating; holds _inspector
   InspectorView* _projectInspector;  // in the left pane's Project tab
+  InspectorView* _transitionInspector;  // in the left pane while a join is selected
   editor::Selection _projectSel;     // always the project, except just after it adds a track
   NSBox* _sideLine;
   PaneHandle* _sideHandle;
@@ -223,6 +229,8 @@ static NSString* timeString(int64_t us) {
   _projectInspector = [[InspectorView alloc] initWithFrame:NSMakeRect(0, 0, 300, 500) document:&_doc selection:&_projectSel];
   _projectInspector.delegate = self;
   [_sidebar setProjectView:_projectInspector];
+  _transitionInspector = [[InspectorView alloc] initWithFrame:NSMakeRect(0, 0, 300, 500) document:&_doc selection:&_sel];
+  _transitionInspector.delegate = self;
   _sideLine = [[NSBox alloc] initWithFrame:NSMakeRect(side, 0, 1, size.height)];
   _sideLine.boxType = NSBoxSeparator;
   _sideLine.autoresizingMask = NSViewHeightSizable;
@@ -293,6 +301,10 @@ static NSString* timeString(int64_t us) {
   _timeline = [[TimelineView alloc] initWithDocument:&_doc selection:&_sel];
   _timeline.delegate = self;
   [_timeline registerForDraggedTypes:@[ SidebarDragType, NSPasteboardTypeFileURL ]];
+  __weak Editor* weakEditor = self;
+  _timeline.peaks = ^const std::vector<float>*(const mf::SceneItem& it) {
+    return weakEditor ? [weakEditor peaksOf:it] : nullptr;
+  };
   scroll.documentView = _timeline;
   [bottom addSubview:scroll];
   NSImageView* zoomIcon = [NSImageView imageViewWithImage:[NSImage imageWithSystemSymbolName:@"plus.magnifyingglass"
@@ -310,6 +322,10 @@ static NSString* timeString(int64_t us) {
   // The properties of the selection, in a floating window shown by the "…" buttons.
   _inspector = [[InspectorView alloc] initWithFrame:NSMakeRect(0, 0, 360, 560) document:&_doc selection:&_sel];
   _inspector.delegate = self;
+  __weak Editor* weakInspectorOwner = self;
+  _inspector.audioProblem = ^NSString*(const mf::SceneItem& it) {
+    return weakInspectorOwner ? [weakInspectorOwner audioProblemOf:it] : nil;
+  };
   _properties = [[NSPanel alloc] initWithContentRect:_inspector.frame
                                            styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable |
                                                      NSWindowStyleMaskUtilityWindow
@@ -342,6 +358,7 @@ static NSString* timeString(int64_t us) {
 - (void)updatePropertiesTitle {
   static NSString* const kinds[] = {@"Video", @"Image", @"Text", @"Color", @"Audio"};
   if (_sel.track < 0) _properties.title = @"Project";
+  else if (_sel.transition) _properties.title = @"Transition";
   else if (_sel.item < 0) _properties.title = _doc.track(_sel.track).video ? @"Video Track" : @"Audio Track";
   else _properties.title = kinds[int(_doc.item(_sel.track, _sel.item).type)];
 }
@@ -482,6 +499,10 @@ static NSString* timeString(int64_t us) {
       [self showStatus:[NSString stringWithFormat:@"%@: no video or audio", path.lastPathComponent] error:YES];
       return NO;
     }
+    if (!video && !info.audio->supported) {  // the engine plays AAC-LC and MP3 (R9)
+      [self showStatus:[NSString stringWithFormat:@"%@: the audio must be AAC or MP3", path.lastPathComponent] error:YES];
+      return NO;
+    }
     it->type = video ? mf::ItemType::Video : mf::ItemType::Audio;
     it->durationUs = *length = info.durationUs;
   }
@@ -577,6 +598,7 @@ struct Dropped {
 
 // Selected in the preview: the timeline and properties follow.
 - (void)overlaySelectionChanged {
+  [self syncTransitionPanel];
   _timeline.needsDisplay = YES;
   [_inspector rebuild];
   [self updatePropertiesTitle];
@@ -585,6 +607,35 @@ struct Dropped {
 - (void)overlayEdited {
   [_inspector refresh];
   [self scheduleReload];
+}
+
+// An audio item's waveform, read once per file in the background; null until it's read.
+- (const std::vector<float>*)peaksOf:(const mf::SceneItem&)it {
+  auto found = _peaks.find(it.src);
+  if (found != _peaks.end()) return &found->second;
+  if (_peaksLoading.insert(it.src).second) {
+    std::string src = it.src;
+    __weak Editor* weak = self;
+    editor::loadPeaks([NSString stringWithUTF8String:src.c_str()], ^(std::vector<float> peaks) {
+      Editor* s = weak;
+      if (!s) return;
+      s->_peaks[src] = std::move(peaks);
+      s->_timeline.needsDisplay = YES;
+    });
+  }
+  return nullptr;
+}
+
+// Why a video file's audio can't play, or nil: read once per file.
+- (NSString*)audioProblemOf:(const mf::SceneItem&)it {
+  auto found = _audioProblems.find(it.src);
+  if (found == _audioProblems.end()) {
+    mf::MediaInfo info;
+    mf::Result r = _platform->createDemuxer()->open(it.source, &info);
+    const char* problem = r != mf::Result::Ok ? "Can't read the file" : !info.audio ? "No audio track" : !info.audio->supported ? "Audio isn't AAC or MP3" : "";
+    found = _audioProblems.emplace(it.src, problem).first;
+  }
+  return found->second.empty() ? nil : [NSString stringWithUTF8String:found->second.c_str()];
 }
 
 // A video's or image's pixel size (upright, for images), read once per file.
@@ -609,7 +660,17 @@ struct Dropped {
 // --- Edits ----------------------------------------------------------------------------------
 
 // Tracks or items were added, removed or moved, or the selection changed.
+// A selected join shows its transition in the left pane; anything else selected hides it. A join
+// that's no longer one (an item moved or removed) is no longer selected.
+- (void)syncTransitionPanel {
+  if (_sel.transition && !(_sel.track < _doc.tracks() && _doc.junction(_sel.track, _sel.item))) _sel = {};
+  if (!_sel.transition) return [_sidebar hidePanel];
+  [_transitionInspector rebuild];
+  [_sidebar showPanel:_transitionInspector title:@"Transition"];
+}
+
 - (void)structureChanged {
+  [self syncTransitionPanel];
   [_timeline reload];
   _overlay.needsDisplay = YES;
   [_inspector rebuild];
@@ -619,6 +680,7 @@ struct Dropped {
 
 // An open properties window follows the selection.
 - (void)timelineSelectionChanged {
+  [self syncTransitionPanel];
   _overlay.needsDisplay = YES;
   [_inspector rebuild];
   [self updatePropertiesTitle];
@@ -647,6 +709,11 @@ struct Dropped {
   [_timeline reload];
   [_inspector refresh];  // both show the project when nothing is selected
   [_projectInspector refresh];
+  [_transitionInspector refresh];
+  if (_sel.transition && !_doc.junction(_sel.track, _sel.item)) {  // e.g. removed between two text items
+    [self syncTransitionPanel];
+    _timeline.needsDisplay = YES;
+  }
   [self scheduleReload];
 }
 
@@ -661,6 +728,10 @@ struct Dropped {
 
 - (void)inspectorDeleteSelection {
   if (_sel.track < 0) return;
+  if (_sel.transition) {  // a join: its transition goes, the join stays selected
+    _doc.setTransition(_sel.track, _sel.item, nullptr);
+    return [self structureChanged];
+  }
   if (_sel.item >= 0) {
     _doc.removeItem(_sel.track, _sel.item);
     _sel.item = -1;

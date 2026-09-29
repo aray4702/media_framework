@@ -101,6 +101,7 @@ using EffectsRef = std::function<mf::SceneEffects&()>;
   [_bindings removeAllObjects];
   if (_sel->track < 0) [self buildProject];
   else if (_sel->item < 0) [self buildTrack:_sel->track];
+  else if (_sel->transition) [self buildTransition:_sel->item track:_sel->track];
   else [self buildItem:_sel->item track:_sel->track];
   [self refresh];
 }
@@ -215,15 +216,25 @@ using EffectsRef = std::function<mf::SceneEffects&()>;
 }
 
 - (void)check:(NSString*)title get:(bool (^)(void))get set:(void (^)(bool))set {
+  [self check:title get:get set:set unavailable:nil];
+}
+
+// With `unavailable`, the box is grayed and off, and the reason shows next to it.
+- (void)check:(NSString*)title get:(bool (^)(void))get set:(void (^)(bool))set unavailable:(NSString*)unavailable {
   NSButton* box = [NSButton checkboxWithTitle:title target:nil action:nil];
+  box.enabled = !unavailable;
   [self bind:box
       action:^(NSButton* b) {
         set(b.state == NSControlStateValueOn);
       }
         sync:^{
-          box.state = get() ? NSControlStateValueOn : NSControlStateValueOff;
+          box.state = !unavailable && get() ? NSControlStateValueOn : NSControlStateValueOff;
         }];
-  [self row:@"" views:@[ box ]];
+  if (!unavailable) return [self row:@"" views:@[ box ]];
+  NSTextField* note = [NSTextField labelWithString:unavailable];
+  note.textColor = NSColor.secondaryLabelColor;
+  note.font = [NSFont systemFontOfSize:11];
+  [self row:@"" views:@[ box, note ]];
 }
 
 - (void)color:(NSString*)title get:(mf::Color (^)(void))get set:(void (^)(const mf::Color&))set {
@@ -491,6 +502,35 @@ using EffectsRef = std::function<mf::SceneEffects&()>;
              }];
   }
 
+  if (media) {  // near the top: whether a video plays its sound is a first thing to check
+    [self section:@"Audio"];
+    // A video's own sound can be muted only when its file has audio that plays.
+    NSString* problem = type == mf::ItemType::Video && self.audioProblem ? self.audioProblem(item()) : nil;
+    [self check:@"Mute"
+            get:^{
+              return item().mute;
+            }
+            set:^(bool on) {
+              item().mute = on;
+            }
+    unavailable:problem];
+    if (!problem) {
+      [self animatable:@"Gain" min:0 max:4 ref:[item]() -> mf::Animatable& { return item().gain; }];
+      [self animatable:@"Pan" min:-1 max:1 ref:[item]() -> mf::Animatable& { return item().pan; }];
+    }
+    if (type == mf::ItemType::Video && !problem) {  // its sound onto an audio track, to edit apart
+      [self buttons:@[ @"Detach Audio" ]
+            actions:@[ ^{
+              InspectorView* s = weak;
+              int video = t, sound = -1;
+              int at = doc->detachAudio(&video, k, &sound);
+              if (at < 0 || !s) return NSBeep();
+              *s->_sel = {at, sound};
+              [s.delegate inspectorSelectionChanged];
+            } ]];
+    }
+  }
+
   if (type == mf::ItemType::Text) [self textItem:item];
   if (type == mf::ItemType::Color) {
     [self color:@"Color"
@@ -529,21 +569,6 @@ using EffectsRef = std::function<mf::SceneEffects&()>;
         }];
     [self effects:[item]() -> mf::SceneEffects& { return item().effects; } title:@"Effects"];
   }
-
-  if (media) {
-    [self section:@"Audio"];
-    [self check:@"Mute"
-            get:^{
-              return item().mute;
-            }
-            set:^(bool on) {
-              item().mute = on;
-            }];
-    [self animatable:@"Gain" min:0 max:4 ref:[item]() -> mf::Animatable& { return item().gain; }];
-    [self animatable:@"Pan" min:-1 max:1 ref:[item]() -> mf::Animatable& { return item().pan; }];
-  }
-
-  if (k > 0) [self transitionInto:k track:t];
 
   [self buttons:@[ @"Delete Item" ] actions:@[ ^{ [weak.delegate inspectorDeleteSelection]; } ]];
 }
@@ -606,9 +631,19 @@ using EffectsRef = std::function<mf::SceneEffects&()>;
           }];
 }
 
-- (void)transitionInto:(int)k track:(int)t {
+// The join of items k - 1 and k: its transition, or none (a cut with no transition).
+- (void)buildTransition:(int)k track:(int)t {
   editor::Document* doc = _doc;
-  [self section:@"Transition from previous"];
+  __weak InspectorView* weak = self;
+  NSString* (^nameOf)(const mf::SceneItem&) = ^NSString*(const mf::SceneItem& it) {
+    if (it.type == mf::ItemType::Text) return [NSString stringWithUTF8String:it.text.c_str()];
+    return it.type == mf::ItemType::Color ? @"Color" : [NSString stringWithUTF8String:it.src.c_str()].lastPathComponent;
+  };
+  NSTextField* between = [NSTextField labelWithString:[NSString stringWithFormat:@"%@  →  %@", nameOf(doc->item(t, k - 1)), nameOf(doc->item(t, k))]];
+  between.lineBreakMode = NSLineBreakByTruncatingMiddle;
+  [between.widthAnchor constraintLessThanOrEqualToConstant:kLabelWidth + kControlWidth + kValueWidth].active = YES;
+  [_stack addArrangedSubview:between];
+  [self section:@"Transition"];
   // Its settings, kept while the transition is off so that turning it on again restores them.
   auto current = [doc, t, k]() {
     mf::SceneTransition x;
@@ -652,6 +687,41 @@ using EffectsRef = std::function<mf::SceneEffects&()>;
              x.durationUs = std::llround(std::max(0.0, v) * kUs);
              doc->setTransition(t, k, &x);
            }];
+  // The easings of §4.3 that have names; any other shows as Linear until changed.
+  static const mf::Easing easings[] = {mf::Easing{}, mf::Easing::bezier(0.42f, 0, 1, 1), mf::Easing::bezier(0, 0, 0.58f, 1),
+                                       mf::Easing::bezier(0.42f, 0, 0.58f, 1)};
+  [self popup:@"Easing"
+      items:@[ @"Linear", @"Ease in", @"Ease out", @"Ease in-out" ]
+      get:^{
+        mf::Easing e = current().easing;
+        for (int i = 1; i < 4; ++i) {
+          const mf::Easing& n = easings[i];
+          if (e.kind == mf::Easing::Kind::Bezier && e.x1 == n.x1 && e.y1 == n.y1 && e.x2 == n.x2 && e.y2 == n.y2) return i;
+        }
+        return 0;
+      }
+      set:^(int i) {
+        if (!doc->transitionInto(t, k)) return;
+        mf::SceneTransition x = current();
+        x.easing = easings[i];
+        doc->setTransition(t, k, &x);
+      }];
+  [self popup:@"Audio"
+      items:@[ @"Equal gain", @"Equal power", @"Cut" ]
+      get:^{
+        return int(current().audio);
+      }
+      set:^(int i) {
+        if (!doc->transitionInto(t, k)) return;
+        mf::SceneTransition x = current();
+        x.audio = mf::AudioFade(i);
+        doc->setTransition(t, k, &x);
+      }];
+  [self buttons:@[ @"Remove Transition" ]
+        actions:@[ ^{
+          doc->setTransition(t, k, nullptr);
+          [weak edited];
+        } ]];
 }
 
 @end

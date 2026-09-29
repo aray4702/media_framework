@@ -101,6 +101,12 @@ void Document::trimStart(int t, int k, int64_t durationUs) {
   it.durationUs -= delta;
   if (media) it.inUs = std::max<int64_t>(0, it.inUs + std::llround(double(delta) * it.speed));
   std::vector<mf::SceneItem>& items = track(t).items;
+  if (delta < 0) {  // longer: into the free space before it first
+    int64_t space = transitionInto(t, k) ? 0 : it.startUs - (k > 0 ? items[k - 1].endUs() : 0);
+    int64_t left = std::min(-delta, std::max<int64_t>(0, space));
+    it.startUs -= left;
+    delta += left;
+  }
   for (size_t j = k + 1; j < items.size(); ++j) items[j].startUs -= delta;
   normalize(t);
 }
@@ -122,6 +128,38 @@ int64_t Document::maxDurationUs(int t, int k) const {
   auto len = lengthUs_.find(it.id);
   if (len == lengthUs_.end()) return int64_t(3600) * 1000000;  // stills: an hour
   return std::max(kMinDurationUs, int64_t(std::llround(double(len->second - it.inUs) / it.speed)));
+}
+
+int Document::detachAudio(int* videoTrack, int k, int* audioItem) {
+  mf::SceneItem sound = item(*videoTrack, k);  // a copy: adding a track moves the tracks
+  if (sound.type != mf::ItemType::Video) return -1;
+  auto len = lengthUs_.find(sound.id);
+  int64_t length = len != lengthUs_.end() ? len->second : 0;
+  int at = -1;
+  for (int t = 0; t < tracks() && at < 0; ++t) {
+    if (track(t).video) continue;
+    bool busy = false;
+    for (const mf::SceneItem& it : track(t).items) busy |= it.startUs < sound.endUs() && it.endUs() > sound.startUs;
+    if (!busy) at = t;
+  }
+  if (at < 0) {
+    at = addTrack(false);
+    if (at < 0) return -1;
+    ++*videoTrack;  // audio tracks go in below the video ones
+  }
+  sound.type = mf::ItemType::Audio;
+  sound.mute = false;
+  *audioItem = insertItem(at, sound, sound.startUs, length);
+  item(*videoTrack, k).mute = true;
+  return at;
+}
+
+bool Document::junction(int t, int k) {
+  if (k < 1 || k >= int(track(t).items.size())) return false;
+  if (transitionInto(t, k)) return true;
+  auto picture = [](const mf::SceneItem& it) { return it.type == mf::ItemType::Video || it.type == mf::ItemType::Image; };
+  const mf::SceneItem &a = item(t, k - 1), &b = item(t, k);
+  return picture(a) && picture(b) && b.startUs == a.endUs();
 }
 
 mf::SceneTransition* Document::transitionInto(int t, int k) {

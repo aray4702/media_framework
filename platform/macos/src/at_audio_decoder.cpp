@@ -1,4 +1,5 @@
-// IAudioDecoder on AudioConverter: AAC-LC packets to S16 interleaved PCM.
+// IAudioDecoder on AudioConverter: AAC-LC or MP3 packets to S16 interleaved PCM, one packet per
+// call (1024 frames for AAC, 1152 for MP3: the format's frames per packet).
 
 #include <AudioToolbox/AudioToolbox.h>
 #include <CoreMedia/CoreMedia.h>

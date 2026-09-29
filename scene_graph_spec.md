@@ -45,7 +45,7 @@ Why a format of our own: OTIO is the standard for moving an edit between tools, 
 | `image` | video | `src` still image (PNG, JPEG, HEIF), decoded once and held | its pixel size |
 | `text` | video | `text` with `style` (§4.5), rasterized once and cached | the rasterized text box |
 | `color` | video | `color` fill | the whole output |
-| `audio` | audio | `src` file's audio track, with `gain` and `pan` | — |
+| `audio` | audio | `src` file's audio track (AAC-LC or MP3; an `.m4a` or `.mp3` file, or a video's), with `gain` and `pan` | — |
 | `transition` | either | joins the item before it to the item after it (§5.3) | — |
 
 **A track shows one item at a time.** Items on a track are in start order and don't overlap, except the two items joined by a transition. Use another track to put things on top of each other, e.g. a logo over video.

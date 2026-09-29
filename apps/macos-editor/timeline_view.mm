@@ -3,10 +3,14 @@
 #include <algorithm>
 #include <cmath>
 
+#include "waveform.h"
+
 namespace {
-constexpr CGFloat kGutter = 10, kRulerHeight = 26, kVideoRow = 50, kAudioRow = 44;
+// Rows hold their items 4 points in from top and bottom: items 28 (video) and 24 (audio) high.
+constexpr CGFloat kGutter = 10, kRulerHeight = 26, kVideoRow = 36, kAudioRow = 32;
 constexpr CGFloat kHandle = 8, kHoverZone = 14;  // trim handles: their width, and how near an end shows them
 constexpr CGFloat kMoreWidth = 24, kMoreHeight = 16;  // the "…" button
+constexpr CGFloat kJunction = 16;                     // the transition button where two items meet
 constexpr double kUs = 1e6;
 
 NSString* nameOf(const mf::SceneItem& it) {
@@ -37,6 +41,7 @@ enum class Drag { None, Seek, Move, TrimStart, TrimEnd };
   Drag _drag;
   CGFloat _downX;
   int64_t _origStartUs, _origDurationUs;
+  mf::SceneTrack _origTrack;  // a start trim applies to the track as it was when the drag began
   BOOL _handles;  // the mouse is near an end of the selected item: its trim handles show
   BOOL _dropping;  // something is dragged over: where it would land shows at _dropAt
   NSPoint _dropAt;
@@ -157,7 +162,7 @@ enum class Drag { None, Seek, Move, TrimStart, TrimEnd };
 
 // Which end of the selected item p is near: -1 the start, +1 the end, 0 neither.
 - (int)edgeAt:(NSPoint)p {
-  if (_sel->track < 0 || _sel->item < 0) return 0;
+  if (_sel->track < 0 || _sel->item < 0 || _sel->transition) return 0;
   NSRect box = [self rectOfItem:_sel->item row:[self rowOfTrack:_sel->track]];
   if (p.y < NSMinY(box) || p.y > NSMaxY(box) || p.x < NSMinX(self.visibleRect) + kGutter) return 0;
   CGFloat zone = std::min(kHoverZone, NSWidth(box) / 3);
@@ -170,15 +175,19 @@ enum class Drag { None, Seek, Move, TrimStart, TrimEnd };
 // at the right of the selected track's row, in view. Empty when nothing is selected or the item
 // is too short.
 - (NSRect)moreButtonRect {
-  if (_sel->track < 0) return NSZeroRect;
+  if (_sel->track < 0 || _sel->transition) return NSZeroRect;
   int r = [self rowOfTrack:_sel->track];
   if (_sel->item < 0) {
     CGFloat top = [self rowTop:r], h = [self rowHeight:r];
     return NSMakeRect(NSMaxX(self.visibleRect) - kMoreWidth - 10, top + (h - kMoreHeight) / 2, kMoreWidth, kMoreHeight);
   }
   NSRect box = [self rectOfItem:_sel->item row:r];
-  if (NSWidth(box) < kMoreWidth + 2 * kHoverZone + 20) return NSZeroRect;
-  return NSMakeRect(NSMaxX(box) - kHoverZone - 2 - kMoreWidth, NSMinY(box) + 4, kMoreWidth, kMoreHeight);
+  CGFloat right = NSMaxX(box) - kHoverZone - 2;
+  if (_doc->junction(_sel->track, _sel->item + 1)) {  // clear of the transition button at its end
+    right = std::min(right, NSMinX([self junctionRect:_sel->item + 1 row:r]) - 4);
+  }
+  if (right - kMoreWidth < NSMinX(box) + kHoverZone + 20) return NSZeroRect;
+  return NSMakeRect(right - kMoreWidth, NSMidY(box) - kMoreHeight / 2, kMoreWidth, kMoreHeight);
 }
 
 - (void)drawMoreButton {
@@ -223,76 +232,174 @@ enum class Drag { None, Seek, Move, TrimStart, TrimEnd };
   const mf::SceneTrack& track = _doc->track(t);
   CGFloat top = [self rowTop:r], h = [self rowHeight:r];
   NSRect lane = NSMakeRect(kGutter, top + 2, self.bounds.size.width - kGutter, h - 4);
-  [[NSColor.labelColor colorWithAlphaComponent:_sel->track == t && _sel->item < 0 ? 0.12 : 0.05] setFill];
+  NSColor* tint = track.video ? NSColor.labelColor : NSColor.systemGreenColor;  // audio rows: greener
+  [[tint colorWithAlphaComponent:(_sel->track == t && _sel->item < 0 ? 0.12 : 0.05) * (track.video ? 1 : 1.6)] setFill];
   [[NSBezierPath bezierPathWithRoundedRect:lane xRadius:4 yRadius:4] fill];
 
+  // The selected item in front of the others (a transition overlaps two items), then the
+  // transition buttons, then its trim handles and "…" button over everything.
+  int chosen = _sel->track == t && _sel->item >= 0 && !_sel->transition ? _sel->item : -1;
+  for (int k = 0; k < int(track.items.size()); ++k) {
+    if (k != chosen) [self drawItem:k row:r selected:false];
+  }
+  if (chosen >= 0) [self drawItem:chosen row:r selected:true];
+  for (const mf::SceneTransition& x : track.transitions) {  // the item underneath an overlap, dotted
+    int a = x.from, b = x.from + 1, under = chosen == a ? b : a;
+    CGFloat x0 = [self xOf:track.items[b].startUs], x1 = [self xOf:track.items[a].endUs()];
+    if (x1 > x0) [self drawHidden:under row:r in:NSMakeRect(x0, [self rowTop:r], x1 - x0, [self rowHeight:r])];
+  }
+  for (int k = 1; k < int(track.items.size()); ++k) {  // where two items meet
+    if (_doc->junction(t, k)) [self drawJunction:k row:r];
+  }
+  if (chosen >= 0 && _handles) [self drawHandles:[self rectOfItem:chosen row:r]];
+  if (_sel->track == t && !_sel->transition) [self drawMoreButton];  // the item's, or the track's
+}
+
+// The part of item k's outline inside `overlap`, dotted: where another item covers it.
+- (void)drawHidden:(int)k row:(int)r in:(NSRect)overlap {
+  NSRect box = NSInsetRect([self rectOfItem:k row:r], 0.75, 0.75);
+  [NSGraphicsContext saveGraphicsState];
+  NSRectClip(overlap);
+  NSBezierPath* outline = [NSBezierPath bezierPathWithRoundedRect:box xRadius:5 yRadius:5];
+  const CGFloat dots[] = {0, 3.5};  // round dots: zero-length dashes with round caps
+  [outline setLineDash:dots count:2 phase:0];
+  outline.lineCapStyle = NSLineCapStyleRound;
+  outline.lineWidth = 1.8;
+  [[NSColor colorWithWhite:0.1 alpha:0.75] setStroke];
+  [outline stroke];
+  [NSGraphicsContext restoreGraphicsState];
+}
+
+// An item's block: its color, waveform (audio), and name; selected, lighter and outlined, with
+// its length before the name.
+- (void)drawItem:(int)k row:(int)r selected:(bool)selected {
+  int t = [self trackOfRow:r];
+  const mf::SceneTrack& track = _doc->track(t);
   NSDictionary* text = @{NSFontAttributeName : [NSFont systemFontOfSize:12 weight:NSFontWeightMedium],
                          NSForegroundColorAttributeName : [NSColor colorWithWhite:0.1 alpha:1]};
-  for (int k = 0; k < int(track.items.size()); ++k) {
-    const mf::SceneItem& it = track.items[k];
-    NSRect box = [self rectOfItem:k row:r];
-    bool selected = _sel->track == t && _sel->item == k;
-    NSColor* fill = colorOf(it.type);
-    if (selected) fill = [fill blendedColorWithFraction:0.25 ofColor:NSColor.whiteColor];
-    if (!track.enabled) fill = [fill colorWithAlphaComponent:0.4];
-    [fill setFill];
-    NSBezierPath* shape = [NSBezierPath bezierPathWithRoundedRect:box xRadius:5 yRadius:5];
-    [shape fill];
-    if (it.type == mf::ItemType::Color) {  // a swatch of its color
-      [[NSColor colorWithSRGBRed:it.color.r green:it.color.g blue:it.color.b alpha:it.color.a] setFill];
-      NSRectFill(NSMakeRect(NSMinX(box) + 6, NSMidY(box) - 6, 12, 12));
-    }
-    [(selected ? NSColor.controlAccentColor : [NSColor colorWithWhite:0 alpha:0.25]) setStroke];
-    shape.lineWidth = selected ? 3 : 1;
-    [shape stroke];
-    // The name starts after the swatch, and after the overlap with the item before (its transition).
-    CGFloat left = NSMinX(box) + (it.type == mf::ItemType::Color ? 24 : selected ? 12 : 8);
-    if (k > 0 && track.items[k - 1].endUs() > it.startUs) left = std::max(left, [self xOf:track.items[k - 1].endUs()] + 6);
-    // Selected: the name at the top, its length at the bottom left.
-    NSRect label = selected ? NSMakeRect(0, NSMinY(box) + 4, 0, 16) : NSInsetRect(box, 0, (box.size.height - 16) / 2);
-    label.size.width = NSMaxX(box) - 4 - left;
-    if (selected && !NSIsEmptyRect([self moreButtonRect])) label.size.width = NSMinX([self moreButtonRect]) - 4 - left;
-    label.origin.x = left;
-    if (label.size.width > 8) {
-      [nameOf(it) drawWithRect:label options:NSStringDrawingUsesLineFragmentOrigin | NSStringDrawingTruncatesLastVisibleLine
-                    attributes:text];
-    }
-    if (selected) {
-      [self drawLength:it.durationUs in:box left:left];
-      if (_handles) [self drawHandles:box];
-      [self drawMoreButton];
-    }
+  const mf::SceneItem& it = track.items[k];
+  NSRect box = [self rectOfItem:k row:r];
+  NSColor* fill = colorOf(it.type);
+  if (selected) fill = [fill blendedColorWithFraction:0.25 ofColor:NSColor.whiteColor];
+  if (!track.enabled) fill = [fill colorWithAlphaComponent:0.4];
+  [fill setFill];
+  NSBezierPath* shape = [NSBezierPath bezierPathWithRoundedRect:box xRadius:5 yRadius:5];
+  [shape fill];
+  if (it.type == mf::ItemType::Color) {  // a swatch of its color
+    [[NSColor colorWithSRGBRed:it.color.r green:it.color.g blue:it.color.b alpha:it.color.a] setFill];
+    NSRectFill(NSMakeRect(NSMinX(box) + 6, NSMidY(box) - 6, 12, 12));
   }
-  if (_sel->track == t && _sel->item < 0) [self drawMoreButton];
-
-  // Transitions: a bow tie over the part where the two items overlap.
-  for (const mf::SceneTransition& x : track.transitions) {
-    const mf::SceneItem& b = track.items[x.from + 1];
-    CGFloat cx = ([self xOf:b.startUs] + [self xOf:track.items[x.from].endUs()]) / 2, cy = top + h / 2, s = 7;
-    NSBezierPath* tie = [NSBezierPath bezierPath];
-    [tie moveToPoint:NSMakePoint(cx - s, cy - s)];
-    [tie lineToPoint:NSMakePoint(cx + s, cy + s)];
-    [tie lineToPoint:NSMakePoint(cx + s, cy - s)];
-    [tie lineToPoint:NSMakePoint(cx - s, cy + s)];
-    [tie closePath];
-    [NSColor.whiteColor setFill];
-    [tie fill];
-    [[NSColor colorWithWhite:0 alpha:0.6] setStroke];
-    [tie stroke];
+  [(selected ? NSColor.controlAccentColor : [NSColor colorWithWhite:0 alpha:0.25]) setStroke];
+  shape.lineWidth = selected ? 3 : 1;
+  [shape stroke];
+  if (it.type == mf::ItemType::Audio && self.peaks) {
+    if (const std::vector<float>* peaks = self.peaks(it)) [self drawWaveform:*peaks of:it in:box];
+  }
+  // The name starts after the swatch, the overlap with the item before (its transition), and
+  // the transition button where it meets that item.
+  CGFloat left = NSMinX(box) + (it.type == mf::ItemType::Color ? 24 : selected ? 12 : 8);
+  if (k > 0 && track.items[k - 1].endUs() > it.startUs) left = std::max(left, [self xOf:track.items[k - 1].endUs()] + 6);
+  if (_doc->junction(t, k)) left = std::max(left, NSMinX(box) + kJunction / 2 + 5);  // clear of the button on the join
+  // Selected: its length first, then the name, on one line.
+  if (selected) left = [self drawLength:it.durationUs in:box left:left];
+  NSRect label = NSInsetRect(box, 0, (box.size.height - 16) / 2);
+  label.size.width = NSMaxX(box) - 4 - left;
+  if (selected && !NSIsEmptyRect([self moreButtonRect])) label.size.width = NSMinX([self moreButtonRect]) - 4 - left;
+  label.origin.x = left;
+  if (label.size.width > 8) {
+    [nameOf(it) drawWithRect:label options:NSStringDrawingUsesLineFragmentOrigin | NSStringDrawingTruncatesLastVisibleLine
+                  attributes:text];
   }
 }
 
-// The item's length in seconds, on a dark tag at the bottom left of its block.
-- (void)drawLength:(int64_t)us in:(NSRect)box left:(CGFloat)left {
+// The transition button between items k - 1 and k: "+" at a cut, a bow tie when a transition is
+// set (filled), ringed while selected.
+- (void)drawJunction:(int)k row:(int)r {
+  int t = [self trackOfRow:r];
+  NSRect b = [self junctionRect:k row:r];
+  bool set = _doc->transitionInto(t, k), selected = _sel->track == t && _sel->item == k && _sel->transition;
+  NSBezierPath* circle = [NSBezierPath bezierPathWithOvalInRect:b];
+  [(set ? NSColor.controlAccentColor : NSColor.whiteColor) setFill];
+  [circle fill];
+  [(selected ? NSColor.labelColor : [NSColor colorWithWhite:0 alpha:0.35]) setStroke];
+  circle.lineWidth = selected ? 2.5 : 1;
+  [circle stroke];
+  NSColor* mark = set ? NSColor.whiteColor : [NSColor colorWithWhite:0.25 alpha:1];
+  CGFloat cx = NSMidX(b), cy = NSMidY(b), s = 4;
+  NSBezierPath* glyph = [NSBezierPath bezierPath];
+  if (set) {  // a bow tie
+    [glyph moveToPoint:NSMakePoint(cx - s, cy - s)];
+    [glyph lineToPoint:NSMakePoint(cx + s, cy + s)];
+    [glyph lineToPoint:NSMakePoint(cx + s, cy - s)];
+    [glyph lineToPoint:NSMakePoint(cx - s, cy + s)];
+    [glyph closePath];
+    [mark setFill];
+    [glyph fill];
+  } else {  // a plus
+    [glyph moveToPoint:NSMakePoint(cx - s, cy)];
+    [glyph lineToPoint:NSMakePoint(cx + s, cy)];
+    [glyph moveToPoint:NSMakePoint(cx, cy - s)];
+    [glyph lineToPoint:NSMakePoint(cx, cy + s)];
+    glyph.lineWidth = 1.8;
+    [mark setStroke];
+    [glyph stroke];
+  }
+}
+
+// Centered on the join: the middle of the overlap when a transition is set, else the cut.
+- (NSRect)junctionRect:(int)k row:(int)r {
+  const mf::SceneTrack& track = _doc->track([self trackOfRow:r]);
+  CGFloat x = ([self xOf:track.items[k].startUs] + [self xOf:track.items[k - 1].endUs()]) / 2;
+  CGFloat y = [self rowTop:r] + [self rowHeight:r] / 2;
+  return NSMakeRect(x - kJunction / 2, y - kJunction / 2, kJunction, kJunction);
+}
+
+// The junction whose button is at p: its row's track and the second item, or NO.
+- (BOOL)junctionAt:(NSPoint)p track:(int*)t item:(int*)k {
+  int r = [self rowAt:p.y];
+  if (r < 0) return NO;
+  *t = [self trackOfRow:r];
+  for (int i = 1; i < int(_doc->track(*t).items.size()); ++i) {
+    NSRect b = [self junctionRect:i row:r];
+    if (_doc->junction(*t, i) && std::hypot(p.x - NSMidX(b), p.y - NSMidY(b)) <= kJunction / 2 + 2) {
+      *k = i;
+      return YES;
+    }
+  }
+  return NO;
+}
+
+// The audio item's waveform across its block: for each 2-point column, the loudest peak of the
+// media time it covers (from `in`, at the item's speed).
+- (void)drawWaveform:(const std::vector<float>&)peaks of:(const mf::SceneItem&)it in:(NSRect)box {
+  NSRect shown = NSIntersectionRect(box, self.visibleRect);
+  CGFloat mid = NSMidY(box), half = NSHeight(box) / 2 - 3;
+  double perPoint = 1e6 / _pixelsPerSecond * it.speed;  // media µs per point
+  [[NSColor colorWithWhite:0 alpha:0.3] setFill];
+  for (CGFloat x = std::floor(NSMinX(shown)); x < NSMaxX(shown); x += 2) {
+    double m0 = it.inUs + (x - NSMinX(box)) * perPoint, m1 = m0 + 2 * perPoint;
+    size_t b0 = size_t(std::max(0.0, m0 * editor::kPeaksPerSecond / 1e6));
+    size_t b1 = std::max(b0 + 1, size_t(std::max(0.0, m1 * editor::kPeaksPerSecond / 1e6)));
+    float peak = 0;
+    for (size_t b = b0; b < b1 && b < peaks.size(); ++b) peak = std::max(peak, peaks[b]);
+    CGFloat h = std::max<CGFloat>(0.5, peak * half);
+    NSRectFillUsingOperation(NSMakeRect(x, mid - h, 1.5, 2 * h), NSCompositingOperationSourceOver);
+  }
+}
+
+// The item's length in seconds, on a dark tag at `left`, centered on the block. Returns where
+// the name goes after it (`left` itself when the block is too short for the tag).
+- (CGFloat)drawLength:(int64_t)us in:(NSRect)box left:(CGFloat)left {
   NSString* length = [NSString stringWithFormat:@"%.1f s", us / kUs];
   NSDictionary* attrs = @{NSFontAttributeName : [NSFont monospacedDigitSystemFontOfSize:10 weight:NSFontWeightSemibold],
                           NSForegroundColorAttributeName : NSColor.whiteColor};
   NSSize size = [length sizeWithAttributes:attrs];
-  NSRect tag = NSMakeRect(left - 3, NSMaxY(box) - size.height - 5, size.width + 6, size.height + 1);
-  if (NSMaxX(tag) > NSMaxX(box) - 4) return;  // too short to show it
+  NSRect tag = NSMakeRect(left - 3, NSMidY(box) - (size.height + 1) / 2, size.width + 6, size.height + 1);
+  if (NSMaxX(tag) > NSMaxX(box) - 4) return left;
   [[NSColor colorWithWhite:0 alpha:0.55] setFill];
   [[NSBezierPath bezierPathWithRoundedRect:tag xRadius:3 yRadius:3] fill];
   [length drawAtPoint:NSMakePoint(NSMinX(tag) + 3, NSMinY(tag) + 0.5) withAttributes:attrs];
+  return NSMaxX(tag) + 6;
 }
 
 // Grips at both ends of the selected item.
@@ -396,9 +503,22 @@ enum class Drag { None, Seek, Move, TrimStart, TrimEnd };
   NSRect visible = self.visibleRect;
   _drag = Drag::None;
   _downX = p.x;
+  // Front first: the selected item's "…", the transition buttons (their handles hide under the
+  // mouse), its trim zones, then the items.
   NSRect more = [self moreButtonRect];
   if (NSPointInRect(p, NSInsetRect(more, -2, -2))) {  // "…": the properties, and the playhead stays
     [self.delegate timelineShowProperties:more];
+    return;
+  }
+  int jt, jk;
+  if ([self junctionAt:p track:&jt item:&jk]) {  // select the join; the playhead stays
+    editor::Selection sel{jt, jk, true};
+    if (sel != *_sel) {
+      *_sel = sel;
+      _handles = NO;
+      self.needsDisplay = YES;
+      [self.delegate timelineSelectionChanged];
+    }
     return;
   }
   if (int edge = [self edgeAt:p]) {  // a handle of the selected item: trim, and the playhead stays
@@ -406,6 +526,7 @@ enum class Drag { None, Seek, Move, TrimStart, TrimEnd };
     _drag = edge < 0 ? Drag::TrimStart : Drag::TrimEnd;
     _origStartUs = it.startUs;
     _origDurationUs = it.durationUs;
+    _origTrack = _doc->track(_sel->track);
     return;
   }
   // Any other click moves the playhead there, whatever else it does.
@@ -423,7 +544,10 @@ enum class Drag { None, Seek, Move, TrimStart, TrimEnd };
     if (inLanes) {
       _drag = Drag::Seek;  // on no item: dragging scrubs, like in the ruler
       const std::vector<mf::SceneItem>& items = _doc->track(sel.track).items;
-      for (int k = int(items.size()) - 1; k >= 0; --k) {  // a transition's second item is on top
+      int chosen = _sel->track == sel.track && _sel->item >= 0 && !_sel->transition ? _sel->item : -1;
+      for (int i = int(items.size()); i >= 0; --i) {  // the selected item first (in front), then the later on top
+        int k = i == int(items.size()) ? chosen : i;
+        if (k < 0 || (i < int(items.size()) && k == chosen)) continue;
         NSRect box = [self rectOfItem:k row:r];
         if (!NSPointInRect(p, box)) continue;
         sel.item = k;
@@ -434,7 +558,7 @@ enum class Drag { None, Seek, Move, TrimStart, TrimEnd };
       }
     }
   }
-  if (sel.track != _sel->track || sel.item != _sel->item) {
+  if (sel != *_sel) {
     *_sel = sel;
     _handles = NO;
     self.needsDisplay = YES;
@@ -449,7 +573,10 @@ enum class Drag { None, Seek, Move, TrimStart, TrimEnd };
     case Drag::None: return;
     case Drag::Seek: [self.delegate timelineSeek:[self usAt:std::max(p.x, NSMinX(self.visibleRect) + kGutter)]]; return;
     case Drag::Move: _doc->moveItem(_sel->track, _sel->item, _origStartUs + dUs); break;
-    case Drag::TrimStart: _doc->trimStart(_sel->track, _sel->item, _origDurationUs - dUs); break;  // right: shorter
+    case Drag::TrimStart:  // right: shorter. From the drag's start, so dragging back gives the space back
+      _doc->track(_sel->track) = _origTrack;
+      _doc->trimStart(_sel->track, _sel->item, _origDurationUs - dUs);
+      break;
     case Drag::TrimEnd: _doc->setDuration(_sel->track, _sel->item, _origDurationUs + dUs); break;
   }
   self.needsDisplay = YES;
@@ -462,9 +589,18 @@ enum class Drag { None, Seek, Move, TrimStart, TrimEnd };
   [self mouseMoved:event];
 }
 
+// Near an end of the selected item, its trim handles show; over a transition button they don't
+// (the button takes the click).
 - (void)mouseMoved:(NSEvent*)event {
   if (_drag != Drag::None) return;
-  [self showHandles:[self edgeAt:[self convertPoint:event.locationInWindow fromView:nil]] != 0];
+  NSPoint p = [self convertPoint:event.locationInWindow fromView:nil];
+  int t, k;
+  if ([self junctionAt:p track:&t item:&k]) {
+    [self showHandles:NO];
+    [NSCursor.pointingHandCursor set];
+    return;
+  }
+  [self showHandles:[self edgeAt:p] != 0];
 }
 
 - (void)mouseExited:(NSEvent*)event {

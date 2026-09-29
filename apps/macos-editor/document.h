@@ -13,8 +13,10 @@
 namespace editor {
 
 struct Selection {
-  int track = -1;  // -1: nothing (the project)
-  int item = -1;   // -1: the track itself
+  int track = -1;           // -1: nothing (the project)
+  int item = -1;            // -1: the track itself
+  bool transition = false;  // the join into `item` from the one before it, not the item
+  bool operator!=(const Selection& o) const { return track != o.track || item != o.item || transition != o.transition; }
 };
 
 class Document {
@@ -50,14 +52,23 @@ class Document {
   void moveItem(int t, int k, int64_t startUs);
   // Up to the start of the next item, and within the file for video and audio.
   void setDuration(int t, int k, int64_t durationUs);
-  // Changes the item's length at its start (a ripple trim): it keeps its place on the timeline,
-  // video and audio play from later (or earlier) in the file, and the items after it on the
-  // track move by the same amount. Not back past the file's start.
+  // Changes the item's length at its start; video and audio play from later (or earlier) in the
+  // file, never back past its start. Longer, the start first moves left into the free space
+  // before the item (none when a transition joins it to the one before); past that, and when
+  // shorter, it's a ripple trim: the start stays and the items after it move by as much.
   void trimStart(int t, int k, int64_t durationUs);
   void setIn(int t, int k, int64_t inUs);
   void setSpeed(int t, int k, double speed);
   int64_t maxDurationUs(int t, int k) const;
 
+  // Copies video item k's sound (same file, `in`, speed and time) onto the lowest audio track
+  // free for its time, or a new one, and mutes the video. Returns the new item's track and sets
+  // *audioItem, or -1: not a video item, or 16 tracks already. *videoTrack follows the video
+  // item when a new audio track shifts the tracks.
+  int detachAudio(int* videoTrack, int k, int* audioItem);
+  // Whether items k - 1 and k of track t meet where a transition can go: they have one, or the
+  // second starts where the first ends and both are videos or images.
+  bool junction(int t, int k);
   // The transition from item k - 1 into item k, or null.
   mf::SceneTransition* transitionInto(int t, int k);
   // Adds, changes or removes (kind empty) the transition into item k (k >= 1).

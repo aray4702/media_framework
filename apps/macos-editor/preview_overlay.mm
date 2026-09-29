@@ -176,7 +176,7 @@ void setConstant(mf::Animatable& a, double v) {
 
 // The selected item's box, when it's visible at the playhead.
 - (bool)selectedBox:(Box*)box {
-  return _sel->track >= 0 && _sel->item >= 0 && [self visible:_sel->track item:_sel->item] &&
+  return _sel->track >= 0 && _sel->item >= 0 && !_sel->transition && [self visible:_sel->track item:_sel->item] &&
          [self box:box ofTrack:_sel->track item:_sel->item];
 }
 
@@ -333,7 +333,7 @@ void setConstant(mf::Animatable& a, double v) {
         }
       }
     }
-    if (sel.track != _sel->track || sel.item != _sel->item) {
+    if (sel != *_sel) {
       *_sel = sel;
       self.needsDisplay = YES;
       [self.delegate overlaySelectionChanged];
@@ -362,7 +362,7 @@ void setConstant(mf::Animatable& a, double v) {
 }
 
 - (void)mouseDragged:(NSEvent*)event {
-  if (_drag == Drag::None || _sel->item < 0) return;
+  if (_drag == Drag::None || _sel->item < 0 || _sel->transition) return;
   NSPoint p = [self convertPoint:event.locationInWindow fromView:nil];
   mf::SceneItem& it = _doc->item(_sel->track, _sel->item);
   mf::SceneTransform& tr = it.transform;
