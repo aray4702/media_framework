@@ -376,8 +376,8 @@ class Reader {
     }
     if (t == "video") {
       if (const Value* a = v.find("audio")) {
-        if (!object(*a, path + ".audio", {"mute", "gain"}) || !boolean(a->find("mute"), path + ".audio.mute", &out->mute) ||
-            !animatable(a->find("gain"), path + ".audio.gain", &out->gain)) {
+        if (!object(*a, path + ".audio", {"mute", "gain", "pan"}) || !boolean(a->find("mute"), path + ".audio.mute", &out->mute) ||
+            !animatable(a->find("gain"), path + ".audio.gain", &out->gain) || !animatable(a->find("pan"), path + ".audio.pan", &out->pan)) {
           return false;
         }
       }
@@ -603,7 +603,216 @@ struct Checker {
   }
 };
 
+// --- Writing: the inverse of Reader ----------------------------------------------------------------
+
+class Writer {
+ public:
+  explicit Writer(const std::function<std::string(const std::string&)>& srcFor) : srcFor_(srcFor) {}
+
+  json::Value document(const Scene& s) {
+    json::Value doc = json::object();
+    json::add(&doc, "version", json::number(1));
+    json::Value o = json::object();
+    json::add(&o, "width", json::number(s.output.width));
+    json::add(&o, "height", json::number(s.output.height));
+    json::add(&o, "fps", s.output.fpsDen == 1 ? json::number(s.output.fpsNum)
+                                               : json::string(std::to_string(s.output.fpsNum) + "/" + std::to_string(s.output.fpsDen)));
+    json::add(&o, "sampleRate", json::number(s.output.sampleRate));
+    json::add(&o, "channels", json::number(s.output.channels));
+    json::add(&o, "background", color(s.output.background));
+    json::add(&doc, "output", o);
+    json::Value tracks = json::array();
+    for (const SceneTrack& t : s.tracks) tracks.array.push_back(track(t));
+    json::add(&doc, "tracks", tracks);
+    return doc;
+  }
+
+ private:
+  // 6 significant digits: what a float holds, and plenty for positions, levels and angles.
+  static json::Value num(double d) {
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%.6g", d);
+    return json::number(std::strtod(buf, nullptr));
+  }
+  static json::Value seconds(int64_t us) { return json::number(double(us) / 1e6); }
+
+  static json::Value color(const Color& c) {
+    auto byte = [](float f) { return int(std::lround(std::clamp(f, 0.0f, 1.0f) * 255)); };
+    char buf[16];
+    if (byte(c.a) == 255) std::snprintf(buf, sizeof(buf), "#%02x%02x%02x", byte(c.r), byte(c.g), byte(c.b));
+    else std::snprintf(buf, sizeof(buf), "#%02x%02x%02x%02x", byte(c.r), byte(c.g), byte(c.b), byte(c.a));
+    return json::string(buf);
+  }
+
+  static json::Value easing(const Easing& e) {
+    if (e.kind == Easing::Kind::Linear) return json::string("linear");
+    if (e.kind == Easing::Kind::Hold) return json::string("hold");
+    struct Named {
+      const char* name;
+      float x1, y1, x2, y2;
+    };
+    for (const Named& n : {Named{"easeIn", 0.42f, 0, 1, 1}, Named{"easeOut", 0, 0, 0.58f, 1}, Named{"easeInOut", 0.42f, 0, 0.58f, 1}}) {
+      if (e.x1 == n.x1 && e.y1 == n.y1 && e.x2 == n.x2 && e.y2 == n.y2) return json::string(n.name);
+    }
+    json::Value b = json::object();
+    json::add(&b, "cubicBezier", json::array({num(e.x1), num(e.y1), num(e.x2), num(e.y2)}));
+    return b;
+  }
+
+  static bool isDefault(const Animatable& a, double value) { return !a.animated() && a.value == value; }
+
+  static json::Value animatable(const Animatable& a) {
+    if (!a.animated()) return num(a.value);
+    json::Value v = json::object();
+    json::Value keys = json::array();
+    for (const Keyframe& k : a.keys) {
+      json::Value key = json::array({seconds(k.timeUs), num(k.value)});
+      if (k.easing) key.array.push_back(easing(*k.easing));
+      keys.array.push_back(key);
+    }
+    json::add(&v, "keys", keys);
+    if (a.easing.kind != Easing::Kind::Linear) json::add(&v, "easing", easing(a.easing));
+    return v;
+  }
+
+  // Adds `key` unless the value is its default.
+  static void addAnim(json::Value* o, const char* key, const Animatable& a, double byDefault) {
+    if (!isDefault(a, byDefault)) json::add(o, key, animatable(a));
+  }
+
+  static json::Value effects(const SceneEffects& e) {
+    json::Value list = json::array();
+    if (e.crop) {
+      json::Value c = json::object();
+      json::add(&c, "type", json::string("crop"));
+      addAnim(&c, "left", e.cropLeft, 0);
+      addAnim(&c, "top", e.cropTop, 0);
+      addAnim(&c, "right", e.cropRight, 0);
+      addAnim(&c, "bottom", e.cropBottom, 0);
+      list.array.push_back(c);
+    }
+    if (e.chromaKey) {
+      json::Value c = json::object();
+      json::add(&c, "type", json::string("chromaKey"));
+      json::add(&c, "color", color(e.keyColor));
+      json::add(&c, "tolerance", num(e.keyTolerance));
+      json::add(&c, "softness", num(e.keySoftness));
+      list.array.push_back(c);
+    }
+    if (e.colorAdjust) {
+      json::Value c = json::object();
+      json::add(&c, "type", json::string("colorAdjust"));
+      addAnim(&c, "brightness", e.brightness, 0);
+      addAnim(&c, "contrast", e.contrast, 1);
+      addAnim(&c, "saturation", e.saturation, 1);
+      list.array.push_back(c);
+    }
+    if (e.blur) {
+      json::Value c = json::object();
+      json::add(&c, "type", json::string("blur"));
+      json::add(&c, "radius", animatable(e.blurRadius));
+      list.array.push_back(c);
+    }
+    return list;
+  }
+
+  json::Value item(const SceneItem& it) {
+    static const char* const types[] = {"video", "image", "text", "color", "audio"};
+    json::Value v = json::object();
+    json::add(&v, "type", json::string(types[int(it.type)]));
+    if (!it.id.empty()) json::add(&v, "id", json::string(it.id));
+    json::add(&v, "start", seconds(it.startUs));
+    json::add(&v, "duration", seconds(it.durationUs));
+    bool media = it.type == ItemType::Video || it.type == ItemType::Audio;
+    if (media || it.type == ItemType::Image) json::add(&v, "src", json::string(srcFor_ ? srcFor_(it.src) : it.src));
+    if (media && it.inUs) json::add(&v, "in", seconds(it.inUs));
+    if (media && it.speed != 1) json::add(&v, "speed", num(it.speed));
+    if (it.type == ItemType::Text) {
+      json::add(&v, "text", json::string(it.text));
+      const TextStyle& s = it.style;
+      static const TextStyle defaults;
+      json::Value style = json::object();
+      if (s.font != defaults.font) json::add(&style, "font", json::string(s.font));
+      if (s.size != defaults.size) json::add(&style, "size", num(s.size));
+      if (!(s.color == defaults.color)) json::add(&style, "color", color(s.color));
+      if (s.align != defaults.align) json::add(&style, "align", json::string(s.align == TextAlign::Left ? "left" : "right"));
+      if (s.hasBox) json::add(&style, "box", color(s.box));
+      if (s.maxWidth != defaults.maxWidth) json::add(&style, "maxWidth", num(s.maxWidth));
+      if (!style.object.empty()) json::add(&v, "style", style);
+    }
+    if (it.type == ItemType::Color) json::add(&v, "color", color(it.color));
+    if (it.type != ItemType::Audio) {
+      const SceneTransform& t = it.transform;
+      json::Value tr = json::object();
+      addAnim(&tr, "x", t.x, 0.5);
+      addAnim(&tr, "y", t.y, 0.5);
+      if (t.anchorX != 0.5f || t.anchorY != 0.5f) json::add(&tr, "anchor", json::array({num(t.anchorX), num(t.anchorY)}));
+      addAnim(&tr, "scale", t.scale, 1);
+      addAnim(&tr, "rotation", t.rotation, 0);
+      if (!tr.object.empty()) json::add(&v, "transform", tr);
+      addAnim(&v, "opacity", it.opacity, 1);
+      static const char* const blends[] = {"normal", "add", "multiply", "screen"};
+      if (it.blend != Blend::Normal) json::add(&v, "blend", json::string(blends[int(it.blend)]));
+      static const char* const fits[] = {"contain", "cover", "fill", "none"};
+      if (it.fit != Fit::Contain) json::add(&v, "fit", json::string(fits[int(it.fit)]));
+      if (it.effects.any()) json::add(&v, "effects", effects(it.effects));
+    }
+    if (it.type == ItemType::Video) {
+      json::Value a = json::object();
+      if (it.mute) json::add(&a, "mute", json::boolean(true));
+      addAnim(&a, "gain", it.gain, 1);
+      addAnim(&a, "pan", it.pan, 0);
+      if (!a.object.empty()) json::add(&v, "audio", a);
+    }
+    if (it.type == ItemType::Audio) {
+      addAnim(&v, "gain", it.gain, 1);
+      addAnim(&v, "pan", it.pan, 0);
+    }
+    return v;
+  }
+
+  static json::Value transition(const SceneTransition& x) {
+    static const char* const kinds[] = {"cut", "crossfade", "push", "slide", "wipe"};
+    static const char* const directions[] = {"left", "right", "up", "down"};
+    static const char* const fades[] = {"equalGain", "equalPower", "cut"};
+    json::Value v = json::object();
+    json::add(&v, "type", json::string("transition"));
+    if (!x.id.empty()) json::add(&v, "id", json::string(x.id));
+    json::add(&v, "kind", json::string(kinds[int(x.kind)]));
+    if (x.direction != Direction::Left) json::add(&v, "direction", json::string(directions[int(x.direction)]));
+    json::add(&v, "duration", seconds(x.durationUs));
+    if (x.easing.kind != Easing::Kind::Linear) json::add(&v, "easing", easing(x.easing));
+    if (x.audio != AudioFade::EqualGain) json::add(&v, "audio", json::string(fades[int(x.audio)]));
+    return v;
+  }
+
+  json::Value track(const SceneTrack& t) {
+    json::Value v = json::object();
+    if (!t.id.empty()) json::add(&v, "id", json::string(t.id));
+    json::add(&v, "kind", json::string(t.video ? "video" : "audio"));
+    if (!t.enabled) json::add(&v, "enabled", json::boolean(false));
+    if (t.video && t.opacity != 1) json::add(&v, "opacity", num(t.opacity));
+    if (!t.video && t.gain != 1) json::add(&v, "gain", num(t.gain));
+    if (t.video && t.effects.any()) json::add(&v, "effects", effects(t.effects));
+    json::Value items = json::array();
+    for (size_t k = 0; k < t.items.size(); ++k) {
+      items.array.push_back(item(t.items[k]));
+      for (const SceneTransition& x : t.transitions) {  // a transition sits between the items it joins
+        if (x.from == int(k)) items.array.push_back(transition(x));
+      }
+    }
+    json::add(&v, "items", items);
+    return v;
+  }
+
+  const std::function<std::string(const std::string&)>& srcFor_;
+};
+
 }  // namespace
+
+std::string serializeScene(const Scene& scene, const std::function<std::string(const std::string&)>& srcFor) {
+  return json::write(Writer(srcFor).document(scene));
+}
 
 Result parseScene(const std::string& text, const SourceResolver& resolve, Scene* out, std::string* error) {
   json::Value doc;

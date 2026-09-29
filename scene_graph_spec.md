@@ -41,7 +41,7 @@ Why a format of our own: OTIO is the standard for moving an edit between tools, 
 
 | `type` | Track | Source | Natural size |
 | --- | --- | --- | --- |
-| `video` | video | `src` file: video track, plus its audio (the `audio` field: `mute`, `gain`) | the decoded frame's pixel size |
+| `video` | video | `src` file: video track, plus its audio (the `audio` field: `mute`, `gain`, `pan`) | the decoded frame's pixel size |
 | `image` | video | `src` still image (PNG, JPEG, HEIF), decoded once and held | its pixel size |
 | `text` | video | `text` with `style` (§4.5), rasterized once and cached | the rasterized text box |
 | `color` | video | `color` fill | the whole output |
@@ -220,12 +220,12 @@ Compatibility: `version` changes only for changes that alter rendering. New opti
 
 ## 7. Implementation
 
-The engine plays and exports scenes: `Player::open(const Scene&, ...)`, `Exporter::start(const Scene&, ...)`, and `mf::macos::loadScene(path, ...)`, which reads a document and resolves each `src` relative to it. `Player::open(const MediaSource&, ...)` plays one file as a scene of one video item with duration 0 and an output taken from the file.
+The engine plays and exports scenes: `Player::open(const Scene&, ...)`, `Exporter::start(const Scene&, ...)`, and `mf::macos::loadScene(path, ...)`, which reads a document and resolves each `src` relative to it. `serializeScene(scene, srcFor)` writes one: the inverse of `parseScene`, with fields at their defaults left out and each `src` mapped by `srcFor` (the editor writes paths inside the document's folder relative to it). `Player::open(const MediaSource&, ...)` plays one file as a scene of one video item with duration 0 and an output taken from the file.
 
 | Part | Where |
 | --- | --- |
 | JSON reader (strict RFC 8259, key order kept, depth limit) | [core/src/json.cpp](core/src/json.cpp) |
-| Parsing, the schema's checks, rules R1–R8 and R12, keyframes and easing | [core/src/scene.cpp](core/src/scene.cpp) |
+| Parsing, the schema's checks, rules R1–R8 and R12, keyframes and easing; writing documents | [core/src/scene.cpp](core/src/scene.cpp) |
 | Lanes and "what is visible at `t`" (transition offsets, clips, fades; audio fades) | [core/src/layout.cpp](core/src/layout.cpp) |
 | Per-item frame selection; `composeAt(t)` evaluates every visible item into a `ComposedLayer`, and a track that is combined on its own into a `ComposedGroup` (its effects, opacity, blend) | [core/src/composition.cpp](core/src/composition.cpp) |
 | Audio mix: every sounding item, resampled and sped up by reading at its media time | `AudioStage` in [core/src/pipeline.cpp](core/src/pipeline.cpp) |

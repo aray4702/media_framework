@@ -1,6 +1,7 @@
 #include "document.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <limits>
 
@@ -11,6 +12,32 @@ Document::Document() {
   scene.output.height = 1080;
   scene.output.fpsNum = 30;
   addTrack(true);
+}
+
+void Document::load(mf::Scene loaded) {
+  scene = std::move(loaded);
+  lengthUs_.clear();
+  // New ids are a prefix and a number: start past every number an id here ends with.
+  nextId_ = 1;
+  auto see = [&](const std::string& id) {
+    size_t digits = id.size();
+    while (digits > 0 && std::isdigit(static_cast<unsigned char>(id[digits - 1]))) --digits;
+    if (digits < id.size() && id.size() - digits <= 9) nextId_ = std::max(nextId_, std::stoi(id.substr(digits)) + 1);
+  };
+  for (const mf::SceneTrack& t : scene.tracks) {
+    see(t.id);
+    for (const mf::SceneItem& it : t.items) see(it.id);
+    for (const mf::SceneTransition& x : t.transitions) see(x.id);
+  }
+  for (mf::SceneTrack& t : scene.tracks) {
+    if (t.id.empty()) t.id = newId("track");
+    for (mf::SceneItem& it : t.items) {
+      if (it.id.empty()) it.id = newId("item");
+    }
+    for (mf::SceneTransition& x : t.transitions) {
+      if (x.id.empty()) x.id = newId("transition");
+    }
+  }
 }
 
 bool Document::empty() const {

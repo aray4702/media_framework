@@ -618,6 +618,10 @@
             "gain": {
               "$ref": "#/$defs/animatable",
               "default": 1
+            },
+            "pan": {
+              "$ref": "#/$defs/animatable",
+              "default": 0
             }
           }
         }

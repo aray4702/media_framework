@@ -141,4 +141,10 @@ Result parseScene(const std::string& json, const SourceResolver&, Scene* out, st
 // Rules that need the length of an item with duration 0 are checked once it is probed.
 Result validateScene(const Scene&, std::string* error);
 
+// The scene as a document (the inverse of parseScene): fields at their defaults are left out,
+// times are seconds to the microsecond, other numbers keep 6 significant digits. `srcFor` maps
+// each item's src to what the document says (e.g. a path relative to the document's folder);
+// none keeps it as it is. Metadata isn't kept in a Scene, so none is written.
+std::string serializeScene(const Scene&, const std::function<std::string(const std::string& src)>& srcFor = {});
+
 }  // namespace mf

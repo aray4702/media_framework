@@ -160,6 +160,7 @@ static NSString* timeString(int64_t us) {
   std::unique_ptr<mf::Player> _player;
   int _generation;
   BOOL _reloadPending;
+  NSURL* _fileURL;  // the scene document this was opened from or saved to; nil: never saved
   BOOL _redrawPending;
   int64_t _playheadUs;
   int64_t _seekOnReadyUs;  // -1: none
@@ -178,9 +179,23 @@ static NSString* timeString(int64_t us) {
 - (void)applicationDidFinishLaunching:(NSNotification*)note {
   [self buildMenu];
   [self buildWindow];
-  for (NSString* path in _initialFiles) [self addFile:path];
+  bool media = false;  // loose media makes a new, unsaved project; a document opens as saved
+  for (NSString* path in _initialFiles) {
+    if ([path.pathExtension caseInsensitiveCompare:@"json"] == NSOrderedSame) {
+      [self openURL:[NSURL fileURLWithPath:path]];
+    } else {
+      [self addFile:path];
+      media = true;
+    }
+  }
   [self structureChanged];
+  _window.documentEdited = media;
   [NSTimer scheduledTimerWithTimeInterval:1.0 / 30 target:self selector:@selector(tick) userInfo:nil repeats:YES];
+}
+
+// Unsaved changes are offered a save before quitting.
+- (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication*)app {
+  return [self keepChanges] ? NSTerminateNow : NSTerminateCancel;
 }
 
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication*)app {
@@ -201,6 +216,10 @@ static NSString* timeString(int64_t us) {
   [appItem.submenu addItemWithTitle:@"Quit Media Editor" action:@selector(terminate:) keyEquivalent:@"q"];
   NSMenuItem* fileItem = [bar addItemWithTitle:@"" action:nil keyEquivalent:@""];
   fileItem.submenu = [[NSMenu alloc] initWithTitle:@"File"];
+  [fileItem.submenu addItemWithTitle:@"Open…" action:@selector(openDocument:) keyEquivalent:@"o"];
+  [fileItem.submenu addItemWithTitle:@"Save" action:@selector(saveDocument:) keyEquivalent:@"s"];
+  [fileItem.submenu addItemWithTitle:@"Save As…" action:@selector(saveDocumentAs:) keyEquivalent:@"S"];  // ⇧⌘S
+  [fileItem.submenu addItem:[NSMenuItem separatorItem]];
   [fileItem.submenu addItemWithTitle:@"Add Media…" action:@selector(addMedia:) keyEquivalent:@"i"];
   // Standard editing commands, so that text fields take copy and paste.
   NSMenuItem* editItem = [bar addItemWithTitle:@"" action:nil keyEquivalent:@""];
@@ -218,7 +237,7 @@ static NSString* timeString(int64_t us) {
                                                   NSWindowStyleMaskResizable | NSWindowStyleMaskMiniaturizable
                                           backing:NSBackingStoreBuffered
                                             defer:NO];
-  _window.title = @"Media Editor";
+  [self showFileName];
   _window.minSize = NSMakeSize(900, 600);
   NSView* content = _window.contentView;
   NSSize size = content.bounds.size;
@@ -419,6 +438,119 @@ static NSString* timeString(int64_t us) {
 - (void)showStatus:(NSString*)text error:(BOOL)error {
   _status.stringValue = text;
   _status.textColor = error ? NSColor.systemRedColor : NSColor.secondaryLabelColor;
+}
+
+// --- Saving and opening ---------------------------------------------------------------------
+
+- (void)showFileName {
+  _window.title = _fileURL ? _fileURL.lastPathComponent : @"Untitled";
+  _window.representedURL = _fileURL;  // the title's proxy icon
+}
+
+// Before the scene is replaced or the app quits: with unsaved changes, asks to save them.
+// NO: the user cancelled (or the save didn't happen).
+- (BOOL)keepChanges {
+  if (!_window.documentEdited || _doc.empty()) return YES;
+  NSAlert* alert = [NSAlert new];
+  alert.messageText = [NSString stringWithFormat:@"Save the changes to “%@”?", _fileURL ? _fileURL.lastPathComponent : @"Untitled"];
+  alert.informativeText = @"Your changes will be lost if you don't save them.";
+  [alert addButtonWithTitle:@"Save"];
+  [alert addButtonWithTitle:@"Cancel"];
+  [alert addButtonWithTitle:@"Don't Save"];
+  switch ([alert runModal]) {
+    case NSAlertFirstButtonReturn: return [self save:NO];
+    case NSAlertThirdButtonReturn: return YES;
+    default: return NO;
+  }
+}
+
+- (void)saveDocument:(id)sender {
+  [self save:NO];
+}
+
+- (void)saveDocumentAs:(id)sender {
+  [self save:YES];
+}
+
+// Writes the scene document (scene_graph_spec.md): media paths inside the document's folder are
+// written relative to it, so the folder can move as a whole; others stay absolute.
+- (BOOL)save:(BOOL)askWhere {
+  NSURL* url = _fileURL;
+  if (askWhere || !url) {
+    NSSavePanel* panel = [NSSavePanel savePanel];
+    panel.allowedContentTypes = @[ UTTypeJSON ];
+    panel.nameFieldStringValue = _fileURL ? _fileURL.lastPathComponent : @"Untitled.json";
+    if ([panel runModal] != NSModalResponseOK) return NO;
+    url = panel.URL;
+  }
+  // Compared with symlinks resolved: /tmp and /private/tmp are one folder.
+  auto resolved = [](NSString* path) { return std::string([NSURL fileURLWithPath:path].URLByResolvingSymlinksInPath.path.UTF8String); };
+  std::string folder = resolved(url.URLByDeletingLastPathComponent.path) + "/";
+  std::string text = mf::serializeScene(_doc.scene, [&](const std::string& src) {
+    std::string full = resolved([NSString stringWithUTF8String:src.c_str()]);
+    return full.compare(0, folder.size(), folder) == 0 ? full.substr(folder.size()) : src;
+  });
+  NSError* error = nil;
+  if (![[NSData dataWithBytes:text.data() length:text.size()] writeToURL:url options:NSDataWritingAtomic error:&error]) {
+    [[NSAlert alertWithError:error] runModal];
+    return NO;
+  }
+  _fileURL = url;
+  _window.documentEdited = NO;
+  [self showFileName];
+  [self showStatus:[NSString stringWithFormat:@"Saved %@", url.lastPathComponent] error:NO];
+  return YES;
+}
+
+- (void)openDocument:(id)sender {
+  if (![self keepChanges]) return;
+  NSOpenPanel* panel = [NSOpenPanel openPanel];
+  panel.allowedContentTypes = @[ UTTypeJSON ];
+  if ([panel runModal] == NSModalResponseOK) [self openURL:panel.URL];
+}
+
+// Reads a scene document; `src` paths are relative to its folder unless absolute. Each item's
+// src becomes the full path, video and audio files are opened for their lengths (and, for an
+// item "to the end of the file", its duration), and the media is listed in the left pane.
+- (void)openURL:(NSURL*)url {
+  mf::Scene scene;
+  std::string error;
+  if (mf::macos::loadScene(url.path.UTF8String, &scene, &error) != mf::Result::Ok) {
+    NSAlert* alert = [NSAlert new];
+    alert.messageText = [NSString stringWithFormat:@"“%@” can't be opened.", url.lastPathComponent];
+    alert.informativeText = [NSString stringWithUTF8String:error.c_str()];
+    [alert runModal];
+    return;
+  }
+  _doc.load(std::move(scene));
+  NSMutableArray<NSString*>* problems = [NSMutableArray array];
+  for (mf::SceneTrack& track : _doc.scene.tracks) {
+    for (mf::SceneItem& it : track.items) {
+      if (it.src.empty()) continue;
+      NSString* path = ((__bridge NSURL*)it.source.native.get()).path;
+      it.src = path.UTF8String;
+      if (it.type != mf::ItemType::Video && it.type != mf::ItemType::Audio) {
+        [_sidebar rememberFile:path];
+        continue;
+      }
+      mf::MediaInfo info;
+      if (_platform->createDemuxer()->open(it.source, &info) != mf::Result::Ok || info.durationUs <= 0) {
+        [problems addObject:path.lastPathComponent];
+        continue;
+      }
+      _doc.setLength(it.id, info.durationUs);
+      if (it.toEnd()) it.durationUs = std::max<int64_t>(editor::Document::kMinDurationUs, std::llround(double(info.durationUs - it.inUs) / it.speed));
+      [_sidebar rememberFile:path];
+    }
+  }
+  _fileURL = url;
+  _sel = {};
+  [self structureChanged];
+  [self seekTo:0];
+  _window.documentEdited = NO;
+  [self showFileName];
+  [self showStatus:problems.count ? [NSString stringWithFormat:@"Can't open %@", [problems componentsJoinedByString:@", "]] : @""
+             error:problems.count > 0];
 }
 
 // --- Adding items ---------------------------------------------------------------------------
@@ -755,6 +887,7 @@ struct Dropped {
 // Reopens the player a moment after the first of a burst of edits, e.g. while a slider moves.
 // Every edit comes through here: the Export tab's summary (size, rate, length) follows too.
 - (void)scheduleReload {
+  _window.documentEdited = YES;  // something changed since the last save or open
   [_exportView refresh];
   if (_reloadPending) return;
   _reloadPending = YES;

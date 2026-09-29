@@ -27,6 +27,12 @@ class Document {
 
   Document();
 
+  // Takes a scene read from a document. Items, tracks and transitions without an id get one, and
+  // new ids never repeat one it has. File lengths are forgotten: setLength() them again.
+  void load(mf::Scene scene);
+  // A video or audio item's file length, which limits its duration and trims.
+  void setLength(const std::string& itemId, int64_t lengthUs) { lengthUs_[itemId] = lengthUs; }
+
   mf::Scene scene;
   mf::VideoFilter filter;  // the player's global filter
 

@@ -68,8 +68,9 @@ def check_item(item, where, errors):
     for name, value in item.get("transform", {}).items():
         if name in ("x", "y", "scale", "rotation"):
             check_animatable(name, value, duration, f"{where}.transform", errors)
-    if "audio" in item and "gain" in item["audio"]:
-        check_animatable("gain", item["audio"]["gain"], duration, f"{where}.audio", errors)
+    for name in ("gain", "pan"):
+        if name in item.get("audio", {}):
+            check_animatable(name, item["audio"][name], duration, f"{where}.audio", errors)
     check_effects(item, duration, where, errors)
 
 

@@ -205,6 +205,35 @@ static void detach() {
   checkValid(d);
 }
 
+static void load() {
+  Document d;
+  mf::Scene s;
+  mf::SceneTrack t;
+  t.id = "clip7";  // numbered like the editor's own ids
+  mf::SceneItem a = still(mf::ItemType::Color), b = still(mf::ItemType::Color);
+  a.id = "item41";
+  b.startUs = 5 * kS;  // no id
+  t.items = {a, b};
+  mf::SceneTransition x;
+  x.from = 0;
+  x.kind = mf::SceneTransitionKind::Cut;
+  t.transitions = {x};
+  s.tracks = {t};
+  d.load(s);
+  CHECK(d.tracks() == 1 && d.track(0).id == "clip7" && d.item(0, 0).id == "item41");
+  CHECK(d.item(0, 1).id == "item42" && d.track(0).transitions[0].id == "transition43");  // past 41
+  int k = d.insertItem(0, still(mf::ItemType::Text), 20 * kS);
+  CHECK(d.item(0, k).id == "item44");
+  mf::SceneItem v;
+  v.type = mf::ItemType::Video;
+  v.durationUs = 10 * kS;
+  k = d.insertItem(0, v, 30 * kS);  // its length unknown until set
+  d.setLength(d.item(0, k).id, 6 * kS);
+  d.setDuration(0, k, 10 * kS);
+  CHECK(d.item(0, k).durationUs == 6 * kS);
+  checkValid(d);
+}
+
 static void tracks() {
   Document d;
   int a = d.addTrack(false);
@@ -227,6 +256,7 @@ int main() {
   transitions();
   junctions();
   detach();
+  load();
   tracks();
   std::printf(failures ? "%d failure(s)\n" : "all passed\n", failures);
   return failures ? EXIT_FAILURE : EXIT_SUCCESS;

@@ -29,4 +29,16 @@ struct Value {
 // Strict RFC 8259 JSON, nesting at most 64 deep. On failure returns false and says where.
 bool parse(const std::string& text, Value* out, std::string* error);
 
+// Values to write.
+Value number(double);
+Value string(const std::string&);
+Value boolean(bool);
+Value array(std::vector<Value> items = {});
+Value object();  // add members with add()
+void add(Value* object, const std::string& key, Value value);
+
+// JSON text, indented by two spaces; an array of plain values (numbers, strings, booleans)
+// stays on one line. Numbers print with up to 15 significant digits.
+std::string write(const Value&);
+
 }  // namespace mf::json

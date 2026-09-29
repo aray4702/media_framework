@@ -2,6 +2,7 @@
 
 #include <cctype>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 
 namespace mf::json {
@@ -263,6 +264,122 @@ class Parser {
 bool parse(const std::string& text, Value* out, std::string* error) {
   *out = Value{};
   return Parser(text).parseDocument(out, error);
+}
+
+// --- Writing ----------------------------------------------------------------------------------
+
+Value number(double d) {
+  Value v;
+  v.type = Value::Type::Number;
+  v.number = d;
+  return v;
+}
+
+Value string(const std::string& s) {
+  Value v;
+  v.type = Value::Type::String;
+  v.string = s;
+  return v;
+}
+
+Value boolean(bool b) {
+  Value v;
+  v.type = Value::Type::Bool;
+  v.boolean = b;
+  return v;
+}
+
+Value array(std::vector<Value> items) {
+  Value v;
+  v.type = Value::Type::Array;
+  v.array = std::move(items);
+  return v;
+}
+
+Value object() {
+  Value v;
+  v.type = Value::Type::Object;
+  return v;
+}
+
+void add(Value* object, const std::string& key, Value value) { object->object.emplace_back(key, std::move(value)); }
+
+namespace {
+
+void writeString(const std::string& s, std::string* out) {
+  *out += '"';
+  for (unsigned char c : s) {
+    switch (c) {
+      case '"': *out += "\\\""; break;
+      case '\\': *out += "\\\\"; break;
+      case '\n': *out += "\\n"; break;
+      case '\r': *out += "\\r"; break;
+      case '\t': *out += "\\t"; break;
+      default:
+        if (c < 0x20) {
+          char buf[8];
+          std::snprintf(buf, sizeof(buf), "\\u%04x", c);
+          *out += buf;
+        } else {
+          *out += char(c);  // UTF-8 passes through
+        }
+    }
+  }
+  *out += '"';
+}
+
+void writeValue(const Value& v, int depth, std::string* out) {
+  std::string indent(size_t(depth) * 2, ' '), inner(size_t(depth + 1) * 2, ' ');
+  switch (v.type) {
+    case Value::Type::Null: *out += "null"; break;
+    case Value::Type::Bool: *out += v.boolean ? "true" : "false"; break;
+    case Value::Type::Number: {
+      char buf[32];
+      if (v.number == std::floor(v.number) && std::fabs(v.number) < 1e15) std::snprintf(buf, sizeof(buf), "%.0f", v.number);
+      else std::snprintf(buf, sizeof(buf), "%.15g", v.number);
+      *out += buf;
+      break;
+    }
+    case Value::Type::String: writeString(v.string, out); break;
+    case Value::Type::Array: {
+      bool plain = true;
+      for (const Value& e : v.array) plain &= !e.isArray() && !e.isObject();
+      *out += '[';
+      for (size_t k = 0; k < v.array.size(); ++k) {
+        if (plain) {
+          *out += k ? ", " : "";
+        } else {
+          *out += k ? ",\n" : "\n";
+          *out += inner;
+        }
+        writeValue(v.array[k], depth + 1, out);
+      }
+      if (!plain && !v.array.empty()) *out += "\n" + indent;
+      *out += ']';
+      break;
+    }
+    case Value::Type::Object: {
+      *out += '{';
+      for (size_t k = 0; k < v.object.size(); ++k) {
+        *out += k ? ",\n" : "\n";
+        *out += inner;
+        writeString(v.object[k].first, out);
+        *out += ": ";
+        writeValue(v.object[k].second, depth + 1, out);
+      }
+      if (!v.object.empty()) *out += "\n" + indent;
+      *out += '}';
+      break;
+    }
+  }
+}
+
+}  // namespace
+
+std::string write(const Value& v) {
+  std::string out;
+  writeValue(v, 0, &out);
+  return out + "\n";
 }
 
 }  // namespace mf::json

@@ -826,6 +826,118 @@ TEST(scene_parses_the_example_document) {
   CHECK(!scene.tracks[3].video && scene.tracks[3].gain == 0.8f);
 }
 
+// Saving: parse → serialize → parse → serialize gives the same text, and the values survive.
+static std::string reserialized(const std::string& text, Scene* scene) {
+  std::string error;
+  CHECK(parseScene(text, [](const std::string&) { return MediaSource{}; }, scene, &error) == Result::Ok);
+  if (!error.empty()) std::fprintf(stderr, "  %s\n", error.c_str());
+  return serializeScene(*scene);
+}
+
+TEST(scene_serializes_the_example_documents_back) {
+  std::string dir = std::string(__FILE__).substr(0, std::string(__FILE__).rfind("core/tests/")) + "schema/examples/";
+  for (const char* name : {"two_clips_logo_title.json", "demo_clips.json"}) {
+    std::ifstream file(dir + name);
+    std::stringstream text;
+    text << file.rdbuf();
+    Scene original, saved;
+    std::string first = reserialized(text.str(), &original);
+    std::string second = reserialized(first, &saved);
+    CHECK(first == second);
+    CHECK_EQ(saved.tracks.size(), original.tracks.size());
+    CHECK_EQ(saved.durationUs(), original.durationUs());
+    for (size_t t = 0; t < original.tracks.size(); ++t) {
+      CHECK_EQ(saved.tracks[t].items.size(), original.tracks[t].items.size());
+      CHECK_EQ(saved.tracks[t].transitions.size(), original.tracks[t].transitions.size());
+    }
+  }
+}
+
+TEST(scene_serializes_every_field_back) {
+  Scene s;
+  s.output = {1080, 1920, 30000, 1001, 44100, 1, {0.1f, 0.2f, 0.3f, 0.5f}};
+  SceneTrack v;
+  v.id = "main";
+  v.opacity = 0.8f;
+  v.effects.blur = true;
+  v.effects.blurRadius = Animatable(0.02);
+  SceneItem a, b;
+  a.type = b.type = ItemType::Video;
+  a.id = "a";
+  a.src = "/clips/a.mp4";
+  a.durationUs = 4000000;
+  a.inUs = 1500000;
+  a.speed = 2;
+  a.mute = true;
+  a.pan = Animatable(-0.5);
+  a.transform.anchorX = 0;
+  a.transform.x.keys = {{0, 0.25, Easing::bezier(0.1f, 0.2f, 0.3f, 0.4f)}, {2000000, 0.75, Easing{Easing::Kind::Hold}}, {4000000, 0.5, std::nullopt}};
+  a.transform.x.easing = Easing::bezier(0.42f, 0, 0.58f, 1);
+  a.effects.crop = a.effects.chromaKey = a.effects.colorAdjust = true;
+  a.effects.cropLeft = Animatable(0.1);
+  a.effects.keyColor = {0, 1, 0, 1};
+  a.effects.saturation = Animatable(1.4);
+  b.id = "b";
+  b.src = "/clips/b.mp4";
+  b.startUs = 3000000;
+  b.durationUs = 5000000;
+  b.blend = Blend::Screen;
+  b.fit = Fit::Cover;
+  v.items = {a, b};
+  SceneTransition x;
+  x.from = 0;
+  x.kind = SceneTransitionKind::Wipe;
+  x.direction = Direction::Up;
+  x.durationUs = 1000000;
+  x.easing = Easing::bezier(0, 0, 0.58f, 1);
+  x.audio = AudioFade::EqualPower;
+  v.transitions = {x};
+  SceneTrack words;
+  words.enabled = false;
+  SceneItem t;
+  t.type = ItemType::Text;
+  t.text = "Say \"hi\"\nto 🌈";
+  t.durationUs = 33333;
+  t.style.font = "Georgia";
+  t.style.hasBox = true;
+  t.style.align = TextAlign::Right;
+  t.opacity.keys = {{0, 0, std::nullopt}, {33333, 1, std::nullopt}};
+  words.items = {t};
+  SceneTrack sound;
+  sound.video = false;
+  sound.gain = 1.5f;
+  SceneItem m;
+  m.type = ItemType::Audio;
+  m.src = "/music/m.mp3";
+  m.durationUs = 8000000;
+  m.gain = Animatable(0.5);
+  sound.items = {m};
+  s.tracks = {sound, v, words};
+  CHECK(validateScene(s, nullptr) == Result::Ok);
+
+  std::string first = serializeScene(s, [](const std::string& src) { return src.substr(1); });  // as a relative path
+  Scene back;
+  std::string second = reserialized(first, &back);
+  CHECK(second == serializeScene(s, [](const std::string& src) { return src.substr(1); }));
+  CHECK(back.output.fpsNum == 30000 && back.output.fpsDen == 1001 && back.output.sampleRate == 44100 && back.output.channels == 1);
+  CHECK(back.output.background.a > 0.49f && back.output.background.a < 0.51f);
+  CHECK(!back.tracks[0].video && back.tracks[0].gain == 1.5f && back.tracks[0].items[0].src == "music/m.mp3");
+  const SceneItem& ba = back.tracks[1].items[0];
+  CHECK(ba.src == "clips/a.mp4" && ba.inUs == 1500000 && ba.speed == 2 && ba.mute && ba.pan.value == -0.5);
+  CHECK_EQ(ba.transform.x.keys.size(), size_t(3));
+  CHECK(ba.transform.x.keys[0].easing && ba.transform.x.keys[0].easing->x2 == 0.3f);
+  CHECK(ba.transform.x.keys[1].easing && ba.transform.x.keys[1].easing->kind == Easing::Kind::Hold && !ba.transform.x.keys[2].easing);
+  CHECK(ba.transform.x.easing.x1 == 0.42f && ba.transform.anchorX == 0);
+  CHECK(ba.effects.crop && ba.effects.chromaKey && ba.effects.colorAdjust && ba.effects.saturation.value == 1.4);
+  CHECK(back.tracks[1].items[1].blend == Blend::Screen && back.tracks[1].items[1].fit == Fit::Cover);
+  CHECK(back.tracks[1].effects.blur && back.tracks[1].opacity == 0.8f);
+  const SceneTransition& bx = back.tracks[1].transitions[0];
+  CHECK(bx.kind == SceneTransitionKind::Wipe && bx.direction == Direction::Up && bx.audio == AudioFade::EqualPower && bx.easing.x2 == 0.58f);
+  const SceneItem& bt = back.tracks[2].items[0];
+  CHECK(!back.tracks[2].enabled && bt.text == "Say \"hi\"\nto 🌈" && bt.durationUs == 33333);
+  CHECK(bt.style.font == "Georgia" && bt.style.hasBox && bt.style.align == TextAlign::Right && bt.opacity.keys.size() == 2);
+}
+
 TEST(scene_rejects_invalid_documents_with_a_reason) {
   const std::string red = R"("type": "color", "color": "#ff0000")";
   struct Case {
