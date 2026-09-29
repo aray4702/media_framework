@@ -240,10 +240,10 @@ TEST(player_opens_at_a_start_position) {
   CHECK(h.player->state() == State::Ready);
   CHECK_EQ(h.listener.firstFrames, 1);
   CHECK(h.listener.seeks.empty());
-  int64_t expected = 37 * 1000000 / 30;  // last frame at or before 1.25 s
   CHECK_EQ(h.platform.display->shown.size(), size_t(1));
-  CHECK_EQ(h.lastShown(), expected);
-  CHECK_EQ(h.player->positionUs(), expected);
+  CHECK_EQ(h.lastShown(), 1250000);  // composed at the start position
+  CHECK_EQ(h.player->positionUs(), 1250000);
+  CHECK_EQ(h.lastComposed().layers[0].frame.ptsUs, 37 * 1000000 / 30);  // the picture: last frame at or before it
 }
 
 // A start past the end shows the last frame.
@@ -261,7 +261,8 @@ TEST(player_open_past_the_end_shows_the_last_frame) {
   CHECK(h.player->open(scene, RenderTarget{}, OutputDriver::Auto, nullptr, 9000000) == Result::Ok);
   h.run(50);
   CHECK(h.player->state() == State::Ready);
-  CHECK_EQ(h.lastShown(), 59 * 1000000 / 30);
+  CHECK_EQ(h.lastShown(), h.player->durationUs() - 1);  // composed at the clamped end
+  CHECK_EQ(h.lastComposed().layers[0].frame.ptsUs, 59 * 1000000 / 30);  // the picture is the last frame
 }
 
 TEST(player_rejects_calls_in_wrong_state) {
@@ -326,10 +327,10 @@ TEST(player_seeks_to_exact_frame) {
   CHECK(h.player->seek(1250000) == Result::Ok);
   h.run(50);
   CHECK_EQ(h.listener.seeks.size(), size_t(1));
-  int64_t expected = 37 * 1000000 / 30;  // last frame at or before 1.25 s
-  CHECK_EQ(h.listener.seeks.back(), expected);
-  CHECK_EQ(h.lastShown(), expected);
-  CHECK_EQ(h.player->positionUs(), expected);
+  CHECK_EQ(h.listener.seeks.back(), 1250000);  // composed at the seek target
+  CHECK_EQ(h.lastShown(), 1250000);
+  CHECK_EQ(h.player->positionUs(), 1250000);
+  CHECK_EQ(h.lastComposed().layers[0].frame.ptsUs, 37 * 1000000 / 30);  // the picture: last frame at or before it
   CHECK(h.player->metrics().decodeOnly > 0);
 }
 
@@ -529,7 +530,7 @@ TEST(composition_open_at_a_later_image_shows_it) {
   SceneItem v;
   v.type = ItemType::Video;
   video.items = {v};
-  for (int64_t start : {0, 7000000, 13300000}) {
+  for (int64_t start : {0, 7000000, 13300100}) {  // the last one starts between video frames
     SceneItem image;
     image.type = ItemType::Image;
     image.startUs = start;
@@ -537,12 +538,14 @@ TEST(composition_open_at_a_later_image_shows_it) {
     stickers.items.push_back(image);
   }
   scene.tracks = {video, stickers};
-  CHECK(h.player->open(scene, RenderTarget{}, OutputDriver::Vsync, nullptr, 13300000) == Result::Ok);
+  CHECK(h.player->open(scene, RenderTarget{}, OutputDriver::Vsync, nullptr, 13300100) == Result::Ok);
   h.run(300);
   CHECK(h.player->state() == State::Ready);
   const ComposedFrame& f = h.lastComposed();
-  CHECK_EQ(f.ptsUs, 13300000);
-  CHECK_EQ(f.layers.size(), size_t(2));
+  CHECK_EQ(f.ptsUs, 13300100);  // composed at the open time, between frames
+  CHECK_EQ(f.layers.size(), size_t(2));  // the video, and the image that starts there
+  CHECK_EQ(f.layers[0].frame.ptsUs, 399 * 1000000 / 30);  // the picture is the frame before it
+  CHECK(f.layers[1].kind == ComposedLayer::Kind::Image);
 }
 
 TEST(composition_plays_through_a_transition_with_an_audio_crossfade) {

@@ -316,9 +316,11 @@ class CompositionStage : public Stage, private CompositionOutput {
     ended_ = true;
   }
 
-  // Exact seek (§4), for every driver that starts with one: the leading item's last frame at
-  // or before the target (its first frame, if none is), with every other visible item as it is
-  // at that time. While a newer seek is pending (scrubbing), shows whatever is decoded.
+  // Exact seek (§4), for every driver that starts with one. The picture is the leading item's
+  // last frame at or before the target (its first frame, if none is). The frame is composed at
+  // the target, so a still that starts there is on that picture. A frame that falls after the
+  // target is composed at its own time. While a newer seek is pending (scrubbing), shows
+  // whatever is decoded, at that frame's time.
   Progress seekStep() {
     FrameSampler& s = sampler_;
     bool scrub = ctx_.hasPendingSeek();
@@ -341,7 +343,8 @@ class CompositionStage : public Stage, private CompositionOutput {
       s.advanceAll(*t);
       if (!s.allExactAt(*t) && !scrub) return Progress::idle();
     }
-    int64_t at = t.value_or(targetUs_);
+    int64_t at = targetUs_;
+    if (t && (*t > targetUs_ || scrub)) at = *t;  // after the target, or a scrub keyframe
     ComposedFrame out = s.composeAt(at);
     bool missingVideo = false;
     for (int i : s.videoAt(at)) missingVideo |= !s.frameOf(i);
