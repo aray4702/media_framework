@@ -42,6 +42,9 @@ enum class Drag { None, Seek, Move, TrimStart, TrimEnd };
   CGFloat _downX;
   int64_t _origStartUs, _origDurationUs;
   mf::SceneTrack _origTrack;  // a start trim or a move applies to the track as it was when the drag began
+  bool _recording;            // a voice-over is being recorded: shown from _recordStartUs
+  int64_t _recordStartUs, _recordUs;
+  std::vector<float> _recordLevels;  // one per 1/10 s
   int _toTrack;               // a move over another track that takes the item: that track, else -1
   int64_t _toStartUs;         // and where on it the item would land
   BOOL _handles;  // the mouse is near an end of the selected item: its trim handles show
@@ -227,6 +230,7 @@ enum class Drag { None, Seek, Move, TrimStart, TrimEnd };
 
   if (_dropping) [self drawDropMark];
   if (_drag == Drag::Move && _toTrack >= 0) [self drawLanding];
+  if (_recording) [self drawRecording];
   [self drawRuler:visible];
 }
 
@@ -455,6 +459,65 @@ enum class Drag { None, Seek, Move, TrimStart, TrimEnd };
   [handle fill];
   [NSColor.separatorColor setFill];
   NSRectFill(NSMakeRect(NSMinX(bar), NSMaxY(bar) - 1, NSWidth(bar), 1));
+}
+
+// --- Recording a voice-over -----------------------------------------------------------------
+
+- (void)showRecordingFrom:(int64_t)startUs length:(int64_t)lengthUs levels:(const std::vector<float>&)levels {
+  _recording = true;
+  _recordStartUs = startUs;
+  _recordUs = lengthUs;
+  _recordLevels = levels;
+  CGFloat bottom = [self rowTop:_doc->tracks()] + kAudioRow;  // room for a new track's row
+  if (self.frame.size.height < bottom) [self setFrameSize:NSMakeSize(self.frame.size.width, bottom)];
+  CGFloat end = [self xOf:startUs + lengthUs];
+  if (end + 40 > self.frame.size.width) [self reload];  // wider as it grows
+  self.needsDisplay = YES;
+}
+
+- (void)hideRecording {
+  _recording = false;
+  _recordLevels.clear();
+  [self reload];
+}
+
+// The recording so far: a red block with its levels, where it will go.
+- (void)drawRecording {
+  int t = _doc->freeTrack(false, _recordStartUs, _recordStartUs + std::max<int64_t>(1, _recordUs));
+  int r = t >= 0 ? [self rowOfTrack:t] : _doc->tracks();  // none free: a new track, below the others
+  CGFloat top = [self rowTop:r], h = t >= 0 ? [self rowHeight:r] : kAudioRow;
+  NSColor* red = NSColor.systemRedColor;
+  if (t < 0) {  // the row the new track will have
+    NSRect lane = NSMakeRect(kGutter, top + 2, self.bounds.size.width - kGutter, h - 4);
+    NSBezierPath* shape = [NSBezierPath bezierPathWithRoundedRect:lane xRadius:4 yRadius:4];
+    [[red colorWithAlphaComponent:0.06] setFill];
+    [shape fill];
+    const CGFloat dash[] = {4, 3};
+    [shape setLineDash:dash count:2 phase:0];
+    [[red colorWithAlphaComponent:0.4] setStroke];
+    [shape stroke];
+  }
+  CGFloat x0 = [self xOf:_recordStartUs], x1 = std::max(x0 + 3, [self xOf:_recordStartUs + _recordUs]);
+  NSRect box = NSMakeRect(x0, top + 4, x1 - x0, h - 8);
+  NSBezierPath* block = [NSBezierPath bezierPathWithRoundedRect:box xRadius:5 yRadius:5];
+  [[red colorWithAlphaComponent:0.3] setFill];
+  [block fill];
+  // The levels: a bar per 1/10 s, centered like the waveforms.
+  [NSGraphicsContext saveGraphicsState];
+  [block addClip];
+  [[red colorWithAlphaComponent:0.85] setFill];
+  CGFloat step = _pixelsPerSecond / 10, mid = NSMidY(box), half = NSHeight(box) / 2 - 3;
+  for (size_t i = 0; i < _recordLevels.size(); ++i) {
+    CGFloat level = std::max<CGFloat>(0.04, _recordLevels[i]);
+    NSRectFill(NSMakeRect(x0 + i * step, mid - level * half, std::max<CGFloat>(1, step - 1), 2 * level * half));
+  }
+  [NSGraphicsContext restoreGraphicsState];
+  [red setStroke];
+  block.lineWidth = 1.5;
+  [block stroke];
+  NSString* label = t >= 0 ? @"● Recording" : @"● Recording  (new audio track)";
+  NSDictionary* attrs = @{NSFontAttributeName : [NSFont systemFontOfSize:11 weight:NSFontWeightSemibold], NSForegroundColorAttributeName : red};
+  [label drawAtPoint:NSMakePoint(x1 + 6, NSMidY(box) - 7) withAttributes:attrs];
 }
 
 // --- Moving to another track -----------------------------------------------------------------

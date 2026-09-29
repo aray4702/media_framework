@@ -45,8 +45,10 @@ class Player {
   ~Player();
 
   // Returns at once; probing runs on T1. The scene is validated here (InvalidArgument, with
-  // `error` saying why); media problems arrive later through onError.
-  Result open(const Scene&, const RenderTarget&, OutputDriver = OutputDriver::Auto, std::string* error = nullptr);
+  // `error` saying why); media problems arrive later through onError. The first frame shown (on
+  // Ready) is the one at `startUs`, clamped to the timeline; no frame at 0 is shown before it.
+  Result open(const Scene&, const RenderTarget&, OutputDriver = OutputDriver::Auto, std::string* error = nullptr,
+              int64_t startUs = 0);
   Result open(const MediaSource&, const RenderTarget&);  // a scene of one video, to the end of the file
   Result play();
   Result pause();

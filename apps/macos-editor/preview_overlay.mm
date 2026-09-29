@@ -81,6 +81,7 @@ void setConstant(mf::Animatable& a, double v) {
   Box _box;       // the selected item's, when the drag started
   double _x0, _y0, _scale0, _rotation0, _crop0;
   BOOL _dropping;  // something is dragged over
+  NSCache<NSString*, NSImage*>* _images;  // by path, for drawing provisionally
   NSTextField* _editor;       // over a text item while its words are edited
   editor::Selection _edited;  // that item
   std::string _before;        // its text before, for Escape
@@ -90,6 +91,7 @@ void setConstant(mf::Animatable& a, double v) {
   if ((self = [super initWithFrame:frame])) {
     _doc = doc;
     _sel = selection;
+    _images = [NSCache new];
     self.wantsLayer = YES;  // drawn over the preview's Metal layer
   }
   return self;
@@ -217,7 +219,84 @@ void setConstant(mf::Animatable& a, double v) {
 
 // --- Drawing --------------------------------------------------------------------------------
 
+- (void)setProvisional:(BOOL)provisional {
+  _provisional = provisional;
+  self.needsDisplay = YES;
+}
+
+// The selected item as the player will draw it: its image (cropped), text (in its style, on its
+// box) or color, in its box, rotated and at its opacity. Effects and blend modes are left to the
+// player's frame, which follows in a moment.
+- (void)drawProvisional {
+  Box b;
+  if (![self selectedBox:&b]) return;
+  const mf::SceneItem& it = _doc->item(_sel->track, _sel->item);
+  int64_t local = _timeUs - it.startUs;
+  double k = [self viewScale];
+  NSPoint anchor = [self toView:b.anchor];
+  NSRect box = NSMakeRect(-b.ax * b.w * k, -b.ay * b.h * k, b.w * k, b.h * k);  // about the anchor
+  [NSGraphicsContext saveGraphicsState];
+  NSAffineTransform* place = [NSAffineTransform transform];
+  [place translateXBy:anchor.x yBy:anchor.y];
+  [place rotateByRadians:b.rad];
+  [place concat];
+  CGContextSetAlpha(NSGraphicsContext.currentContext.CGContext, std::clamp(it.opacity.at(local), 0.0, 1.0));
+  switch (it.type) {
+    case mf::ItemType::Image: {
+      NSImage* image = [self imageAt:it.src];
+      const mf::SceneEffects& e = it.effects;
+      double u0 = e.crop ? e.cropLeft.at(local) : 0, v0 = e.crop ? e.cropTop.at(local) : 0;
+      NSSize size = image.size;
+      NSRect from = NSMakeRect(u0 * size.width, (1 - v0 - b.visibleV) * size.height, b.visibleU * size.width, b.visibleV * size.height);
+      [image drawInRect:box fromRect:from operation:NSCompositingOperationSourceOver fraction:1 respectFlipped:YES hints:nil];
+      break;
+    }
+    case mf::ItemType::Text: {
+      const mf::TextStyle& style = it.style;
+      CGFloat points = style.size * _doc->scene.output.height * k / 1.2;
+      if (style.hasBox) {
+        [[NSColor colorWithSRGBRed:style.box.r green:style.box.g blue:style.box.b alpha:style.box.a] setFill];
+        CGFloat pad = style.size * _doc->scene.output.height * k * 0.3;
+        [[NSBezierPath bezierPathWithRoundedRect:box xRadius:pad yRadius:pad] fill];
+      }
+      NSFont* font = style.font == "system"        ? [NSFont systemFontOfSize:points]
+                     : style.font == "system-bold" ? [NSFont boldSystemFontOfSize:points]
+                                                   : [NSFont fontWithName:[NSString stringWithUTF8String:style.font.c_str()] size:points];
+      NSMutableParagraphStyle* paragraph = [NSMutableParagraphStyle new];
+      paragraph.alignment = style.align == mf::TextAlign::Left ? NSTextAlignmentLeft
+                            : style.align == mf::TextAlign::Right ? NSTextAlignmentRight : NSTextAlignmentCenter;
+      NSDictionary* attrs = @{
+        NSFontAttributeName : font ?: [NSFont systemFontOfSize:points],
+        NSForegroundColorAttributeName : [NSColor colorWithSRGBRed:style.color.r green:style.color.g blue:style.color.b alpha:style.color.a],
+        NSParagraphStyleAttributeName : paragraph,
+      };
+      NSString* text = [NSString stringWithUTF8String:it.text.c_str()];
+      NSRect inside = NSInsetRect(box, style.hasBox ? style.size * _doc->scene.output.height * k * 0.3 : 2, 0);
+      NSRect used = [text boundingRectWithSize:NSMakeSize(inside.size.width, CGFLOAT_MAX) options:NSStringDrawingUsesLineFragmentOrigin attributes:attrs];
+      inside.origin.y = NSMidY(box) - used.size.height / 2;  // centered in its box, as rasterized
+      inside.size.height = used.size.height;
+      [text drawWithRect:inside options:NSStringDrawingUsesLineFragmentOrigin attributes:attrs];
+      break;
+    }
+    case mf::ItemType::Color:
+      [[NSColor colorWithSRGBRed:it.color.r green:it.color.g blue:it.color.b alpha:it.color.a] setFill];
+      NSRectFillUsingOperation(box, NSCompositingOperationSourceOver);
+      break;
+    default: break;  // a video: its frames come from the player
+  }
+  [NSGraphicsContext restoreGraphicsState];
+}
+
+// Images read once per file, for drawing provisionally.
+- (NSImage*)imageAt:(const std::string&)src {
+  NSString* path = [NSString stringWithUTF8String:src.c_str()];
+  NSImage* image = [_images objectForKey:path];
+  if (!image && (image = [[NSImage alloc] initWithContentsOfFile:path])) [_images setObject:image forKey:path];
+  return image;
+}
+
 - (void)drawRect:(NSRect)dirty {
+  if (_provisional) [self drawProvisional];
   if (_dropping) {  // the canvas, where a drop would go
     const mf::SceneOutput& o = _doc->scene.output;
     double k = [self viewScale];

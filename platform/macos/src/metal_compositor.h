@@ -25,9 +25,19 @@ class MetalCompositor {
  public:
   ~MetalCompositor();
   bool init(id<MTLDevice> device, MTLPixelFormat format);
+  // How the canvas goes into a target of another aspect ratio. By default it's letterboxed with
+  // black edges (the display); an export can fill its bands with the scene's background, or fill
+  // the target and crop the canvas, keeping the part at cropX / cropY (0 left or top, 1 right or
+  // bottom).
+  struct Framing {
+    bool fill = false;
+    float cropX = 0.5f, cropY = 0.5f;
+    bool backgroundBands = false;
+  };
   // Encodes the frame into `target`. The surfaces it reads stay alive until `cmd` completes.
   // Call from one thread at a time.
-  void encode(const ComposedFrame&, id<MTLTexture> target, id<MTLCommandBuffer> cmd);
+  void encode(const ComposedFrame&, id<MTLTexture> target, id<MTLCommandBuffer> cmd, const Framing& framing);
+  void encode(const ComposedFrame& c, id<MTLTexture> target, id<MTLCommandBuffer> cmd) { encode(c, target, cmd, Framing{}); }
 
  private:
   enum Source { kNv12, kRgba, kColor, kSources };

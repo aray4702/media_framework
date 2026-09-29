@@ -23,6 +23,9 @@
 @interface PreviewOverlay : NSView <NSTextFieldDelegate>
 @property(nonatomic, weak) id<PreviewOverlayDelegate> delegate;
 @property(nonatomic) int64_t timeUs;  // the playhead: what's visible, and animated values
+// Draws the selected item itself (an image, text or color) until the player's frame shows it:
+// a newly added item appears at once instead of after the player reopens.
+@property(nonatomic) BOOL provisional;
 // The pixel size of a video or image item's source; zero when unknown.
 @property(nonatomic, copy) NSSize (^naturalSize)(const mf::SceneItem& item);
 - (instancetype)initWithFrame:(NSRect)frame document:(editor::Document*)doc selection:(editor::Selection*)selection;

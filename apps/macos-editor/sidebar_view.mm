@@ -284,6 +284,15 @@ mf::SceneItem textItem(const std::string& text, const char* font, float size) {
   [self.delegate sidebarCollapsedChanged];  // opening: the new width builds the content (setFrameSize)
 }
 
+// The Audio tab's record button follows. Rebuilt just after this event: the button being
+// clicked may be what started or stopped the recording.
+- (void)setRecording:(BOOL)recording {
+  _recording = recording;
+  dispatch_async(dispatch_get_main_queue(), ^{
+    if (self->_tab == kAudio && !self->_collapsed) [self showTab:kAudio];
+  });
+}
+
 - (void)showPanel:(NSView*)view title:(NSString*)title {
   _panelTitle = title;  // first: opening the pane below lays it out, title and all
   if (_panel != view) {
@@ -394,7 +403,7 @@ mf::SceneItem textItem(const std::string& text, const char* font, float size) {
     SidebarPayload p = payload();
     if (p.empty()) return NSBeep();
     if (p.file) [weak.delegate sidebarAddFile:p.file];
-    else [weak.delegate sidebarAddItem:p.item overlay:p.overlay];
+    else [weak.delegate sidebarAddItem:p.item];
   };
   [_actions addObject:action];
   DragButton* b = image ? [DragButton buttonWithTitle:title image:image target:action action:@selector(fire:)]
@@ -463,6 +472,20 @@ mf::SceneItem textItem(const std::string& text, const char* font, float size) {
                               }];
   import.controlSize = NSControlSizeLarge;
   [_list addArrangedSubview:import];
+  if (tab == kAudio) {  // a voice-over: recorded over the video, from the playhead
+    NSImage* symbol = [[NSImage imageWithSystemSymbolName:_recording ? @"stop.circle.fill" : @"mic.circle.fill" accessibilityDescription:nil]
+        imageWithSymbolConfiguration:[NSImageSymbolConfiguration configurationWithHierarchicalColor:NSColor.systemRedColor]];
+    NSButton* record = [self button:_recording ? @"Stop Recording" : @"Record Voice-over"
+                              image:symbol
+                                run:^{
+                                  [weak.delegate sidebarRecordVoiceOver];
+                                }];
+    record.controlSize = NSControlSizeLarge;
+    [_list addArrangedSubview:record];
+    [self hint:_recording ? @"Recording from the microphone while the video plays. Stop to add it to the timeline."
+                          : @"Plays the video from the playhead while you speak; the recording is added there, on an audio track."];
+    [self heading:@"Audio files"];
+  }
   if (_files[tab].count == 0) {
     [self hint:[NSString stringWithFormat:@"Imported %@ are listed here. Click one to add it at the playhead, or drag it to the "
                                           @"preview or the timeline.", kinds[tab]]];
@@ -516,7 +539,9 @@ mf::SceneItem textItem(const std::string& text, const char* font, float size) {
   panel.allowedContentTypes = @[ tab == kImage ? UTTypeImage : tab == kAudio ? UTTypeAudio : UTTypeMovie ];
   panel.allowsMultipleSelection = YES;
   if ([panel runModal] != NSModalResponseOK) return;
-  for (NSURL* url in panel.URLs) [self.delegate sidebarAddFile:url.path];  // it remembers the ones it adds
+  NSMutableArray<NSString*>* paths = [NSMutableArray array];
+  for (NSURL* url in panel.URLs) [paths addObject:url.path];
+  [self.delegate sidebarAddFiles:paths];  // it remembers the ones it adds
 }
 
 - (void)buildStickers {
@@ -531,7 +556,7 @@ mf::SceneItem textItem(const std::string& text, const char* font, float size) {
                          SidebarPayload p;
                          NSString* path = stickerFile(*sticker);
                          if (!path) return p;
-                         p.hasItem = p.overlay = true;
+                         p.hasItem = true;
                          p.item.type = mf::ItemType::Image;
                          p.item.src = path.UTF8String;
                          p.item.fit = mf::Fit::None;
@@ -555,7 +580,7 @@ mf::SceneItem textItem(const std::string& text, const char* font, float size) {
                                                   image:nil
                                                 payload:^{
                                                   SidebarPayload p;
-                                                  p.hasItem = p.overlay = true;
+                                                  p.hasItem = true;
                                                   p.item = textItem(emoji.UTF8String, "system", 0.16f);
                                                   return p;
                                                 }];
@@ -586,7 +611,7 @@ mf::SceneItem textItem(const std::string& text, const char* font, float size) {
                          image:nil
                        payload:^{
                          SidebarPayload out;
-                         out.hasItem = out.overlay = true;
+                         out.hasItem = true;
                          out.item = textItem(preset->text, preset->font, preset->size);
                          if (preset->caption) {  // bottom center, on a dark box
                            out.item.style.hasBox = true;

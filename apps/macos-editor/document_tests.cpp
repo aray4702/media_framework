@@ -34,6 +34,17 @@ static mf::SceneItem still(mf::ItemType type) {
   return it;
 }
 
+static void freeTrack() {
+  Document d;  // a video track at 0
+  CHECK(d.freeTrack(false, 0, kS) == -1);  // no audio track yet
+  int a = d.addTrack(false);               // at 0; the video track is now 1
+  d.insertItem(a, still(mf::ItemType::Audio), 2 * kS);  // [2, 7)
+  CHECK(d.freeTrack(false, 0, 2 * kS) == a && d.freeTrack(false, 7 * kS, 9 * kS) == a);  // just before, just after
+  CHECK(d.freeTrack(false, 6 * kS, 8 * kS) == -1);
+  int b = d.addTrack(false);  // at 0 again: the first audio track is now 1
+  CHECK(b == 0 && d.freeTrack(false, 6 * kS, 8 * kS) == 0 && d.freeTrack(true, 6 * kS, 8 * kS) == 2);
+}
+
 static void insertAndRemove() {
   Document d;
   int t = 0;
@@ -288,6 +299,7 @@ int main() {
   detach();
   load();
   moveToTrack();
+  freeTrack();
   tracks();
   std::printf(failures ? "%d failure(s)\n" : "all passed\n", failures);
   return failures ? EXIT_FAILURE : EXIT_SUCCESS;

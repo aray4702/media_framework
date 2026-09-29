@@ -24,8 +24,9 @@ class Exporter {
   static std::unique_ptr<Exporter> create(PlatformFactory&, ExportListener*);
   ~Exporter();
 
-  // Returns at once; probing, decoding and encoding run on the pipeline threads. Size and frame
-  // rate come from scene.output (which must set them); `settings` gives the bitrates.
+  // Returns at once; probing, decoding and encoding run on the pipeline threads. The frame rate
+  // comes from scene.output (which must set its size and rate); the frame size is the settings'
+  // frameWidth × frameHeight, or else scene.output's; `settings` gives the bitrates.
   Result start(const Scene&, const ExportTarget&, const ExportSettings& settings = {}, std::string* error = nullptr);
   Result shutdown();  // cancels an export in progress and joins the threads; idempotent
 

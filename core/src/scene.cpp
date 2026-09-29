@@ -463,6 +463,7 @@ class Reader {
       if (!track(tracks->array[k], "tracks[" + std::to_string(k) + "]", &t)) return false;
       out->tracks.push_back(std::move(t));
     }
+    if (const Value* m = v.find("metadata")) out->metadata = json::write(*m);
     return true;
   }
 
@@ -624,6 +625,8 @@ class Writer {
     json::Value tracks = json::array();
     for (const SceneTrack& t : s.tracks) tracks.array.push_back(track(t));
     json::add(&doc, "tracks", tracks);
+    json::Value metadata;
+    if (!s.metadata.empty() && json::parse(s.metadata, &metadata, nullptr)) json::add(&doc, "metadata", metadata);
     return doc;
   }
 

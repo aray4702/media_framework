@@ -32,7 +32,7 @@ struct Player::Impl : PipelineEvents {
 
   // --- API (owner thread) ---
 
-  Result open(const Scene& scene, const RenderTarget& target, OutputDriver driver, std::string* error) {
+  Result open(const Scene& scene, const RenderTarget& target, OutputDriver driver, std::string* error, int64_t startUs) {
     if (validateScene(scene, error) != Result::Ok) return Result::InvalidArgument;
     {
       std::lock_guard<std::mutex> lock(stateMu);
@@ -44,6 +44,7 @@ struct Player::Impl : PipelineEvents {
     ctx.driver = driver == OutputDriver::LeadingClip ? Driver::LeadingClip : Driver::Vsync;
     ctx.autoDriver = driver == OutputDriver::Auto;
     ctx.scene = scene;
+    ctx.startUs = std::max<int64_t>(0, startUs);
     ctx.metrics.startTtff(ctx.hostClock.nowNs());
     ctx.openRequested = true;
     ctx.wake(StageId::Source);
@@ -226,8 +227,8 @@ std::unique_ptr<Player> Player::create(PlatformFactory& factory, PlayerListener*
 Player::Player(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
 Player::~Player() = default;
 
-Result Player::open(const Scene& s, const RenderTarget& t, OutputDriver d, std::string* error) {
-  return impl_->onOwner() ? impl_->open(s, t, d, error) : Result::WrongThread;
+Result Player::open(const Scene& s, const RenderTarget& t, OutputDriver d, std::string* error, int64_t startUs) {
+  return impl_->onOwner() ? impl_->open(s, t, d, error, startUs) : Result::WrongThread;
 }
 Result Player::open(const MediaSource& s, const RenderTarget& t) {
   Scene scene;

@@ -25,7 +25,7 @@ Why a format of our own: OTIO is the standard for moving an edit between tools, 
 
 - **`output`** fixes the render size and frame rate. It is the export size. Playback aspect-fits it into the view, and draws at the display's rate with the vsync driver (mvp_spec.md §2.5).
 - **`tracks`** (1 to 16): video tracks are composited **in order, the first at the bottom**. Audio tracks, and the audio of video items, are summed.
-- **`metadata`**, on the document, a track or an item, is free-form. It is ignored when rendering and kept on OTIO round trips.
+- **`metadata`**, on the document, a track or an item, is free-form. It is ignored when rendering and kept on OTIO round trips. The engine keeps the document's when it saves a scene; the editor keeps its playhead there, as `"editor": {"playhead": seconds}`.
 - **Positions and sizes** are fractions of the output (0 to 1 from the top-left), so a document renders the same at any output size.
 
 ## 2. Time

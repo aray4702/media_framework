@@ -95,9 +95,20 @@ enum class OutputDriver {
 // Export output (§2.5). Frames are composed at n / fps and written with the platform encoder.
 enum class VideoCodec { H264, HEVC };
 
+// How a scene goes into a frame of another aspect ratio: all of it, with bands of its background
+// color along the short side (Fit), or covering the frame, cropped along the long side (Fill).
+enum class FrameFit { Fit, Fill };
+
 struct ExportSettings {
-  int width = 1920, height = 1080;  // set from the scene's output by Exporter::start
-  int fps = 30;                      // likewise
+  int width = 1920, height = 1080;  // set by Exporter::start: the frame size below, or the scene's output size
+  int fps = 30;                      // set from the scene's output by Exporter::start
+  // The file's frame size; 0: the scene's output size. The scene is still composed at its own
+  // size and then scaled to this (by frameFit when the aspect ratio differs), so every item keeps
+  // its size relative to the frame, including items at their natural pixel size (fit none).
+  int frameWidth = 0, frameHeight = 0;
+  FrameFit frameFit = FrameFit::Fit;
+  // Fill: which part stays where the scene is cut, 0 (left, top) to 1 (right, bottom); 0.5 centers.
+  float cropX = 0.5f, cropY = 0.5f;
   int videoBitrate = 10000000;
   int audioBitrate = 192000;
   VideoCodec codec = VideoCodec::H264;  // the container comes from the target (Mac OS: the file's extension)

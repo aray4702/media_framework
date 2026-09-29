@@ -178,9 +178,10 @@ class SourceStage : public Stage {
     int channels = o.channels > 0 ? o.channels : firstAudio ? std::min(2, firstAudio->second) : 2;
     if (audio) ctx_.ring.open(rate, channels, rate / 5);  // 200 ms
     if (ctx_.driver == Driver::Export) {
-      ExportSettings s = ctx_.exportSettings;
-      s.width = ctx_.width;
-      s.height = ctx_.height;
+      ExportSettings s = ctx_.exportSettings;  // frames are composed at ctx_.width × height, then scaled to the frame size
+      bool framed = s.frameWidth > 0 && s.frameHeight > 0;
+      s.width = framed ? s.frameWidth : ctx_.width;
+      s.height = framed ? s.frameHeight : ctx_.height;
       s.fps = int(std::lround(double(ctx_.fpsNum) / ctx_.fpsDen));
       ctx_.exportSettings = s;
       Result r = ctx_.exportSink->open(ctx_.exportTarget, s, audio ? rate : 0, audio ? channels : 0);
@@ -200,7 +201,8 @@ class SourceStage : public Stage {
     ctx_.master.setAudio(audio);
     ctx_.durationUs = layout().durationUs();
     ctx_.probed = true;
-    ctx_.requestSeek(0);  // preroll the first frame (A16)
+    // Preroll the first frame (A16), at the start position: a frame, so before the end.
+    ctx_.requestSeek(std::min<int64_t>(ctx_.startUs, std::max<int64_t>(0, ctx_.durationUs - 1)));
   }
 
   // Each lane starts at its first item that hasn't ended by the target: the one playing, or

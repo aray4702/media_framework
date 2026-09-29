@@ -1,10 +1,11 @@
 // A small video editor on the media framework. Left, the whole height: tabs of things to add
 // (video, images, stickers, emojis, text, audio). Right of it: the preview of the scene with
 // play/pause and the time, then the timeline (tracks and their items). The properties of the
-// selection open in a floating window from its "…" button. The document is an mf::Scene; after each edit the player reopens it at the same
-// time (the player has no live scene update), a moment after the last change.
+// selection open in a floating window from its "…" button. The document is an mf::Scene; after
+// each edit the player reopens it at the same time (the player has no live scene update), a
+// moment after the last change. A voice-over records the microphone while the video plays.
 //
-//   mf_editor [file ...]   adds the files (video, image, audio) to the timeline
+//   mf_editor [file ...]   adds the files (video, image, audio) to the timeline; a .json opens
 
 #import <AppKit/AppKit.h>
 #import <ImageIO/ImageIO.h>
@@ -25,6 +26,7 @@
 #include "preview_overlay.h"
 #include "sidebar_view.h"
 #include "timeline_view.h"
+#include "voice_recorder.h"
 #include "waveform.h"
 
 // The player draws into its CAMetalLayer. Resized, the last frame keeps its aspect ratio (never
@@ -121,6 +123,28 @@ class Listener : public mf::PlayerListener {
 // handle drags it in. Dragged narrower than kSidebarShut, it collapses to its tabs.
 static constexpr CGFloat kSidebarWidth = 380, kSidebarMin = 280, kSidebarMax = 640, kSidebarShut = 180;
 
+// The editor's part of a document's metadata: {"editor": {"playhead": seconds}}.
+static int64_t savedPlayheadUs(const std::string& metadata) {
+  NSData* data = [NSData dataWithBytes:metadata.data() length:metadata.size()];
+  id doc = metadata.empty() ? nil : [NSJSONSerialization JSONObjectWithData:data options:NSJSONReadingFragmentsAllowed error:nil];
+  id editor = [doc isKindOfClass:NSDictionary.class] ? doc[@"editor"] : nil;
+  id playhead = [editor isKindOfClass:NSDictionary.class] ? editor[@"playhead"] : nil;
+  if (![playhead isKindOfClass:NSNumber.class] || !std::isfinite([playhead doubleValue])) return -1;
+  return std::llround([playhead doubleValue] * 1e6);
+}
+
+// The metadata with the editor's playhead set, keeping everything else in it.
+static std::string withPlayhead(const std::string& metadata, int64_t us) {
+  NSData* data = [NSData dataWithBytes:metadata.data() length:metadata.size()];
+  id doc = metadata.empty() ? nil : [NSJSONSerialization JSONObjectWithData:data options:NSJSONReadingMutableContainers | NSJSONReadingFragmentsAllowed error:nil];
+  NSMutableDictionary* all = [doc isKindOfClass:NSMutableDictionary.class] ? doc : [NSMutableDictionary dictionary];
+  NSMutableDictionary* editor = [all[@"editor"] isKindOfClass:NSMutableDictionary.class] ? all[@"editor"] : [NSMutableDictionary dictionary];
+  editor[@"playhead"] = @(us / 1e6);
+  all[@"editor"] = editor;
+  NSData* out = [NSJSONSerialization dataWithJSONObject:all options:NSJSONWritingSortedKeys error:nil];
+  return out ? std::string((const char*)out.bytes, out.length) : metadata;
+}
+
 static NSString* timeString(int64_t us) {
   int64_t tenths = us / 100000;
   return [NSString stringWithFormat:@"%lld:%02lld.%lld", tenths / 600, tenths / 10 % 60, tenths % 10];
@@ -160,11 +184,19 @@ static NSString* timeString(int64_t us) {
   std::unique_ptr<mf::Player> _player;
   int _generation;
   BOOL _reloadPending;
+  int _reloadToken;  // the reload waiting, if any: a newer token cancels it
   NSURL* _fileURL;  // the scene document this was opened from or saved to; nil: never saved
   BOOL _redrawPending;
   int64_t _playheadUs;
-  int64_t _seekOnReadyUs;  // -1: none
+  int64_t _seekOnReadyUs;  // -1: none; else where the playhead is while the player opens
+  int64_t _openedAtUs;     // the frame the player was opened at (its first frame)
   BOOL _playAfterSeek;
+
+  VoiceRecorder* _recorder;  // a voice-over
+  NSURL* _voiceURL;          // the file it's recorded into
+  int64_t _voiceStartUs;     // the playhead when it started: where it goes on the timeline
+  NSTimer* _voiceTimer;      // shows the recording as it goes, every 1/10 s
+  std::vector<float> _voiceLevels;  // the input level of each 1/10 s
 }
 
 - (instancetype)initWithFiles:(NSArray<NSString*>*)files {
@@ -179,17 +211,16 @@ static NSString* timeString(int64_t us) {
 - (void)applicationDidFinishLaunching:(NSNotification*)note {
   [self buildMenu];
   [self buildWindow];
-  bool media = false;  // loose media makes a new, unsaved project; a document opens as saved
+  // A document opens as saved; loose media makes a new, unsaved project, one file after another.
+  NSMutableArray<NSString*>* media = [NSMutableArray array];
   for (NSString* path in _initialFiles) {
-    if ([path.pathExtension caseInsensitiveCompare:@"json"] == NSOrderedSame) {
-      [self openURL:[NSURL fileURLWithPath:path]];
-    } else {
-      [self addFile:path];
-      media = true;
-    }
+    if ([path.pathExtension caseInsensitiveCompare:@"json"] == NSOrderedSame) [self openURL:[NSURL fileURLWithPath:path]];
+    else [media addObject:path];
   }
+  [self addFiles:media];
+  _sel = {};
   [self structureChanged];
-  _window.documentEdited = media;
+  _window.documentEdited = media.count > 0;
   [NSTimer scheduledTimerWithTimeInterval:1.0 / 30 target:self selector:@selector(tick) userInfo:nil repeats:YES];
 }
 
@@ -441,6 +472,95 @@ static NSString* timeString(int64_t us) {
   _status.textColor = error ? NSColor.systemRedColor : NSColor.secondaryLabelColor;
 }
 
+// --- Voice-over -----------------------------------------------------------------------------
+
+- (void)sidebarRecordVoiceOver {
+  if (_recorder.recording) [self stopVoiceOver];
+  else [self startVoiceOver];
+}
+
+// Where a recording goes: next to the project when it's saved (so it moves with it), else in
+// ~/Movies/Media Editor.
+- (NSURL*)newVoiceOverURL {
+  NSURL* folder = _fileURL ? _fileURL.URLByDeletingLastPathComponent
+                           : [[NSFileManager.defaultManager URLsForDirectory:NSMoviesDirectory inDomains:NSUserDomainMask].firstObject
+                                 URLByAppendingPathComponent:@"Media Editor"];
+  NSDateFormatter* format = [NSDateFormatter new];
+  format.dateFormat = @"yyyy-MM-dd 'at' HH.mm.ss";
+  return [folder URLByAppendingPathComponent:[NSString stringWithFormat:@"Voice-over %@.m4a", [format stringFromDate:NSDate.date]]];
+}
+
+- (void)startVoiceOver {
+  if (!_recorder) _recorder = [VoiceRecorder new];
+  [_recorder requestAccess:^(BOOL granted) {
+    if (granted) return [self beginVoiceOver];
+    NSAlert* alert = [NSAlert new];
+    alert.messageText = @"The microphone isn't available to Media Editor.";
+    alert.informativeText = @"Allow it in System Settings › Privacy & Security › Microphone (for the app the editor runs from, "
+                            @"such as Terminal), then record again.";
+    [alert runModal];
+  }];
+}
+
+// Records from the playhead, playing the video along so the voice can follow it.
+- (void)beginVoiceOver {
+  NSURL* url = [self newVoiceOverURL];
+  NSString* error = nil;
+  if (![_recorder startInto:url error:&error]) return [self showStatus:[@"Can't record: " stringByAppendingString:error] error:YES];
+  _voiceURL = url;
+  _voiceStartUs = _playheadUs;
+  if (_player && _player->state() != mf::State::Play) [self togglePlay:nil];
+  _sidebar.recording = YES;
+  _voiceLevels.clear();
+  __weak Editor* weak = self;
+  _voiceTimer = [NSTimer scheduledTimerWithTimeInterval:0.1
+                                                repeats:YES
+                                                  block:^(NSTimer*) {
+                                                    [weak showRecordingProgress];
+                                                  }];
+  [self showRecordingProgress];
+}
+
+// The recording so far, in the timeline (a growing block with its levels) and the status line.
+- (void)showRecordingProgress {
+  int64_t us = int64_t(_recorder.seconds * 1e6);
+  if (_recorder.recording && _voiceLevels.size() < size_t(us / 100000 + 1)) _voiceLevels.push_back(_recorder.level);
+  [_timeline showRecordingFrom:_voiceStartUs length:us levels:_voiceLevels];
+  [self showStatus:[NSString stringWithFormat:@"● Recording voice-over  %@", timeString(us)] error:YES];
+}
+
+- (void)stopVoiceOver {
+  if (!_recorder.recording) return;
+  [_voiceTimer invalidate];
+  _voiceTimer = nil;
+  NSTimeInterval seconds = [_recorder stop];
+  if (_player && _player->state() == mf::State::Play) _player->pause();
+  _sidebar.recording = NO;
+  [_timeline hideRecording];
+  [self showStatus:@"" error:NO];
+  if (seconds < 0.2) {  // a click, not a recording
+    [[NSFileManager defaultManager] removeItemAtURL:_voiceURL error:nil];
+    return [self showStatus:@"The voice-over was too short to keep." error:NO];
+  }
+  [self addVoiceOver:_voiceURL at:_voiceStartUs];
+}
+
+// A recording onto the timeline at `startUs`, on the lowest audio track free for it (or a new
+// one), selected.
+- (void)addVoiceOver:(NSURL*)url at:(int64_t)startUs {
+  mf::SceneItem it;
+  int64_t length;
+  if (![self item:&it fromFile:url.path lengthUs:&length]) return;  // it says why
+  int t = _doc.freeTrack(false, startUs, startUs + it.durationUs);
+  if (t < 0) t = _doc.addTrack(false);
+  if (t < 0) return [self showStatus:@"At most 16 tracks" error:YES];
+  int k = _doc.insertItem(t, std::move(it), startUs, length);
+  _sel = {t, k};
+  [self structureChanged];
+  [self showStatus:[NSString stringWithFormat:@"Voice-over added: %@ (%.1f s)", url.lastPathComponent, _doc.item(t, k).durationUs / 1e6]
+             error:NO];
+}
+
 // --- Saving and opening ---------------------------------------------------------------------
 
 - (void)showFileName {
@@ -451,6 +571,7 @@ static NSString* timeString(int64_t us) {
 // Before the scene is replaced or the app quits: with unsaved changes, asks to save them.
 // NO: the user cancelled (or the save didn't happen).
 - (BOOL)keepChanges {
+  [self stopVoiceOver];  // a recording in progress is kept: it goes on the timeline, a change to save
   if (!_window.documentEdited || _doc.empty()) return YES;
   NSAlert* alert = [NSAlert new];
   alert.messageText = [NSString stringWithFormat:@"Save the changes to “%@”?", _fileURL ? _fileURL.lastPathComponent : @"Untitled"];
@@ -487,6 +608,7 @@ static NSString* timeString(int64_t us) {
   // Compared with symlinks resolved: /tmp and /private/tmp are one folder.
   auto resolved = [](NSString* path) { return std::string([NSURL fileURLWithPath:path].URLByResolvingSymlinksInPath.path.UTF8String); };
   std::string folder = resolved(url.URLByDeletingLastPathComponent.path) + "/";
+  _doc.scene.metadata = withPlayhead(_doc.scene.metadata, _playheadUs);
   std::string text = mf::serializeScene(_doc.scene, [&](const std::string& src) {
     std::string full = resolved([NSString stringWithUTF8String:src.c_str()]);
     return full.compare(0, folder.size(), folder) == 0 ? full.substr(folder.size()) : src;
@@ -511,8 +633,8 @@ static NSString* timeString(int64_t us) {
   _doc = editor::Document();
   _fileURL = nil;
   _sel = {};
+  [self movePlayhead:0];
   [self structureChanged];
-  [self seekTo:0];
   _window.documentEdited = NO;
   [self showFileName];
   [self showStatus:@"" error:NO];
@@ -561,8 +683,13 @@ static NSString* timeString(int64_t us) {
   }
   _fileURL = url;
   _sel = {};
+  if (_player) {  // not seeking this one to the saved playhead: it still shows the last project
+    _player->shutdown();
+    _player.reset();
+  }
+  [self movePlayhead:std::max<int64_t>(0, savedPlayheadUs(_doc.scene.metadata))];
   [self structureChanged];
-  [self seekTo:0];
+  [self reloadNow];  // opens at the saved playhead
   _window.documentEdited = NO;
   [self showFileName];
   [self showStatus:problems.count ? [NSString stringWithFormat:@"Can't open %@", [problems componentsJoinedByString:@", "]] : @""
@@ -571,49 +698,55 @@ static NSString* timeString(int64_t us) {
 
 // --- Adding items ---------------------------------------------------------------------------
 
-// The selected track if it takes this kind of item, else the top track that does, else a new one.
-- (int)trackFor:(bool)video {
-  if (_sel.track >= 0 && _doc.track(_sel.track).video == video) return _sel.track;
-  for (int t = _doc.tracks() - 1; t >= 0; --t) {
-    if (_doc.track(t).video == video) return t;
+// Where a new item goes with its left edge at `at`: on a track free for its whole length there,
+// so nothing moves. A picture goes on the highest video track above every track in use then, so
+// it shows in front; sound on the lowest free audio track. Else on a new track (-1: 16 already).
+- (int)trackForNew:(const mf::SceneItem&)it at:(int64_t)at {
+  int64_t end = at + std::max<int64_t>(1, it.durationUs);
+  if (it.type == mf::ItemType::Audio) {
+    int t = _doc.freeTrack(false, at, end);
+    return t >= 0 ? t : _doc.addTrack(false);
   }
-  return _doc.addTrack(video);
-}
-
-// For an item drawn over the others: the highest video track free at the playhead for the
-// item's length, above any track in use then, else a new track on top.
-- (int)overlayTrackFor:(int64_t)durationUs {
   int free = -1;
   for (int t = _doc.tracks() - 1; t >= 0; --t) {
     if (!_doc.track(t).video) continue;
-    bool busy = false;
-    for (const mf::SceneItem& it : _doc.track(t).items) busy |= it.startUs < _playheadUs + durationUs && it.endUs() > _playheadUs;
+    bool busy = std::any_of(_doc.track(t).items.begin(), _doc.track(t).items.end(),
+                            [&](const mf::SceneItem& other) { return other.startUs < end && other.endUs() > at; });
     if (busy) break;
     free = t;
   }
   return free >= 0 ? free : _doc.addTrack(true);
 }
 
-- (void)insert:(mf::SceneItem)item video:(bool)video lengthUs:(int64_t)length {
-  [self insert:std::move(item) onTrack:[self trackFor:video] lengthUs:length];
-}
-
-- (void)insert:(mf::SceneItem)item onTrack:(int)t lengthUs:(int64_t)length {
-  if (t < 0) return [self showStatus:@"At most 16 tracks" error:YES];
-  int k = _doc.insertItem(t, std::move(item), _playheadUs, length);
+// Adds the item with its left edge at `at` (see trackForNew) and selects it: at the playhead, it
+// shows in the preview at once. Returns where it ends, or -1 when it can't go in.
+- (int64_t)place:(mf::SceneItem)item at:(int64_t)at lengthUs:(int64_t)length {
+  int t = [self trackForNew:item at:at];
+  if (t < 0) {
+    [self showStatus:@"At most 16 tracks" error:YES];
+    return -1;
+  }
+  int k = _doc.insertItem(t, std::move(item), at, length);
   _sel = {t, k};
   [self structureChanged];
+  // Shown at once: drawn over the preview until the reopened player's frame has it.
+  _overlay.provisional = YES;
+  [self reloadNow];
+  return _doc.item(t, k).endUs();
 }
 
 - (void)sidebarAddFile:(NSString*)path {
   [self addFile:path];
 }
 
-- (void)sidebarAddItem:(const mf::SceneItem&)item overlay:(BOOL)overlay {
+- (void)sidebarAddFiles:(NSArray<NSString*>*)paths {
+  [self addFiles:paths];
+}
+
+- (void)sidebarAddItem:(const mf::SceneItem&)item {
   mf::SceneItem it = item;
   if (!it.src.empty()) it.source = mf::macos::sourceFromPath(it.src);  // stickers: a PNG file
-  if (overlay) [self insert:std::move(it) onTrack:[self overlayTrackFor:it.durationUs] lengthUs:0];
-  else [self insert:std::move(it) video:true lengthUs:0];
+  [self place:std::move(it) at:_playheadUs lengthUs:0];
 }
 
 - (void)addMedia:(id)sender {
@@ -621,13 +754,26 @@ static NSString* timeString(int64_t us) {
   panel.allowedContentTypes = @[ UTTypeMovie, UTTypeImage, UTTypeAudio ];
   panel.allowsMultipleSelection = YES;
   if ([panel runModal] != NSModalResponseOK) return;
-  for (NSURL* url in panel.URLs) [self addFile:url.path];
+  NSMutableArray<NSString*>* paths = [NSMutableArray array];
+  for (NSURL* url in panel.URLs) [paths addObject:url.path];
+  [self addFiles:paths];
 }
 
 - (void)addFile:(NSString*)path {
-  mf::SceneItem it;
-  int64_t length;
-  if ([self item:&it fromFile:path lengthUs:&length]) [self insert:it video:it.type != mf::ItemType::Audio lengthUs:length];
+  [self addFiles:@[ path ]];
+}
+
+// Files from the playhead: the first starts there, each next one where the one before ends.
+- (void)addFiles:(NSArray<NSString*>*)paths {
+  int64_t at = _playheadUs;
+  for (NSString* path in paths) {
+    mf::SceneItem it;
+    int64_t length;
+    if (![self item:&it fromFile:path lengthUs:&length]) continue;  // it says why
+    int64_t end = [self place:std::move(it) at:at lengthUs:length];
+    if (end < 0) break;
+    at = end;
+  }
 }
 
 // A file as an item, listed in the left pane: an image, or a video or audio item as long as
@@ -665,12 +811,11 @@ static NSString* timeString(int64_t us) {
 
 // --- Drag and drop --------------------------------------------------------------------------
 
-// What's dropped, as items: the left pane's (one), or files from the Finder. `overlay`: the
-// item goes over the others; `length`: a video's or audio file's.
+// What's dropped, as items: the left pane's (one), or files from the Finder. `length`: a
+// video's or audio file's.
 struct Dropped {
   mf::SceneItem item;
   int64_t length = 0;
-  bool overlay = false;
 };
 
 - (std::vector<Dropped>)droppedItems:(id<NSDraggingInfo>)info {
@@ -683,7 +828,6 @@ struct Dropped {
     if (p.hasItem) {
       d.item = p.item;
       if (!d.item.src.empty()) d.item.source = mf::macos::sourceFromPath(d.item.src);  // stickers: a PNG file
-      d.overlay = p.overlay;
       out.push_back(d);
     }
     return out;
@@ -715,23 +859,21 @@ struct Dropped {
   return !items.empty();
 }
 
-// On the preview: at the playhead, over the others, placed where it's dropped. A video stays
-// centered (it fills the output), a color goes in sequence (it would cover everything), and
-// audio goes on an audio track.
+// On the preview: from the playhead, in front (see place), one after another; an image, text or
+// sticker centered where it's dropped. A video stays centered (it fills the output), and a color
+// fills it anyway.
 - (BOOL)overlayDrop:(id<NSDraggingInfo>)info at:(NSPoint)position {
   std::vector<Dropped> items = [self droppedItems:info];
+  int64_t at = _playheadUs;
   for (Dropped& d : items) {
     mf::ItemType type = d.item.type;
-    if (type == mf::ItemType::Audio || type == mf::ItemType::Color) {
-      [self insert:std::move(d.item) video:type != mf::ItemType::Audio lengthUs:d.length];
-      continue;
-    }
-    if (type != mf::ItemType::Video) {
+    if (type == mf::ItemType::Image || type == mf::ItemType::Text) {
       d.item.transform.x = mf::Animatable(position.x);
       d.item.transform.y = mf::Animatable(position.y);
     }
-    int64_t duration = d.item.durationUs;
-    [self insert:std::move(d.item) onTrack:[self overlayTrackFor:duration] lengthUs:d.length];
+    int64_t end = [self place:std::move(d.item) at:at lengthUs:d.length];
+    if (end < 0) break;
+    at = end;
   }
   return !items.empty();
 }
@@ -751,6 +893,7 @@ struct Dropped {
 
 // Selected in the preview: the timeline and properties follow.
 - (void)overlaySelectionChanged {
+  _overlay.provisional = NO;
   [self syncTransitionPanel];
   _timeline.needsDisplay = YES;
   [_inspector rebuild];
@@ -843,6 +986,7 @@ struct Dropped {
 
 // An open properties window follows the selection.
 - (void)timelineSelectionChanged {
+  _overlay.provisional = NO;
   [_overlay stopEditing];
   [self syncTransitionPanel];
   _overlay.needsDisplay = YES;
@@ -916,10 +1060,22 @@ struct Dropped {
   [_exportView refresh];
   if (_reloadPending) return;
   _reloadPending = YES;
+  int token = ++_reloadToken;
   dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 120 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+    if (token != self->_reloadToken) return;  // reloaded already (reloadNow)
     self->_reloadPending = NO;
     [self reloadPlayer];
   });
+}
+
+// Reopens the player at once, dropping a reload still waiting: for a new item, which shouldn't
+// wait on a burst of edits that isn't coming.
+- (void)reloadNow {
+  _window.documentEdited = YES;
+  [_exportView refresh];
+  _reloadPending = NO;
+  ++_reloadToken;
+  [self reloadPlayer];
 }
 
 - (void)reloadPlayer {
@@ -939,31 +1095,45 @@ struct Dropped {
   _listener = std::make_unique<Listener>(self, _generation);
   _player = mf::Player::create(*_platform, _listener.get());
   std::string error;
-  mf::Result r = _player->open(_doc.scene, mf::macos::targetFromView((__bridge void*)_preview), mf::OutputDriver::Vsync, &error);
+  // Opened at the playhead: its first frame is the one there, with none at 0 before it.
+  _openedAtUs = _seekOnReadyUs = std::min(_playheadUs, std::max<int64_t>(0, _doc.scene.durationUs() - 1));
+  mf::Result r = _player->open(_doc.scene, mf::macos::targetFromView((__bridge void*)_preview), mf::OutputDriver::Vsync, &error, _openedAtUs);
   if (r != mf::Result::Ok) {
     _player.reset();
+    _seekOnReadyUs = -1;
     [self updatePlayButton:NO];
     return [self showStatus:[NSString stringWithFormat:@"%s", error.c_str()] error:YES];
   }
   _player->setFilter(_doc.filter);
   [self showStatus:@"" error:NO];
-  _seekOnReadyUs = std::min(_playheadUs, std::max<int64_t>(0, _doc.scene.durationUs() - 1));
   _playAfterSeek = wasPlaying;
 }
 
 - (void)player:(int)generation state:(mf::State)state {
   if (generation != _generation) return;
-  if (state == mf::State::Ready && _seekOnReadyUs >= 0) {  // first ready after opening: go back to the playhead
-    _player->seek(_seekOnReadyUs);
+  if (state == mf::State::Ready && _seekOnReadyUs >= 0) {  // first ready after opening, at _openedAtUs
+    int64_t target = _seekOnReadyUs;
     _seekOnReadyUs = -1;
+    if (target != _openedAtUs) {  // the playhead moved while it opened: follow it
+      _player->seek(target);
+    } else {
+      [self shownAfterOpening];
+    }
   }
-  [self updatePlayButton:state == mf::State::Play];
+  [self updatePlayButton:_player->state() == mf::State::Play];
+}
+
+// The player's frame shows the scene as it is now, at the playhead.
+- (void)shownAfterOpening {
+  _overlay.provisional = NO;
+  if (!_playAfterSeek) return;
+  _playAfterSeek = NO;
+  _player->play();
 }
 
 - (void)player:(int)generation seekCompleted:(int64_t)ptsUs {
-  if (generation != _generation || !_playAfterSeek) return;
-  _playAfterSeek = NO;
-  _player->play();
+  if (generation != _generation) return;
+  [self shownAfterOpening];
 }
 
 - (void)player:(int)generation failed:(NSString*)reason {
@@ -987,16 +1157,24 @@ struct Dropped {
 }
 
 // Seeking needs a paused player (A4): a seek while playing pauses.
+// The playhead goes up to the timeline's end (where an added item then starts); the player, which
+// has no frame there, shows the last one.
 - (void)seekTo:(int64_t)us {
-  _playheadUs = std::clamp<int64_t>(us, 0, std::max<int64_t>(0, _doc.scene.durationUs() - 1));
-  _timeline.playheadUs = _playheadUs;
-  _overlay.timeUs = _playheadUs;
+  [self movePlayhead:us];
+  int64_t frame = std::min(_playheadUs, std::max<int64_t>(0, _doc.scene.durationUs() - 1));
   if (!_player || _seekOnReadyUs >= 0) {
-    if (_seekOnReadyUs >= 0) _seekOnReadyUs = _playheadUs;
+    if (_seekOnReadyUs >= 0) _seekOnReadyUs = frame;
     return;
   }
   if (_player->state() == mf::State::Play) _player->pause();
-  _player->seek(_playheadUs);
+  _player->seek(frame);
+}
+
+// Moves the playhead alone: the player's next open (or seek) goes there.
+- (void)movePlayhead:(int64_t)us {
+  _playheadUs = std::clamp<int64_t>(us, 0, std::max<int64_t>(0, _doc.scene.durationUs()));
+  _timeline.playheadUs = _playheadUs;
+  _overlay.timeUs = _playheadUs;
 }
 
 - (void)tick {

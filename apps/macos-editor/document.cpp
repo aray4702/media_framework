@@ -175,18 +175,23 @@ int64_t Document::maxDurationUs(int t, int k) const {
   return std::max(kMinDurationUs, int64_t(std::llround(double(len->second - it.inUs) / it.speed)));
 }
 
+int Document::freeTrack(bool video, int64_t startUs, int64_t endUs) const {
+  for (int t = 0; t < int(scene.tracks.size()); ++t) {
+    const std::vector<mf::SceneItem>& items = scene.tracks[t].items;
+    if (scene.tracks[t].video != video) continue;
+    if (std::none_of(items.begin(), items.end(), [&](const mf::SceneItem& it) { return it.startUs < endUs && it.endUs() > startUs; })) {
+      return t;
+    }
+  }
+  return -1;
+}
+
 int Document::detachAudio(int* videoTrack, int k, int* audioItem) {
   mf::SceneItem sound = item(*videoTrack, k);  // a copy: adding a track moves the tracks
   if (sound.type != mf::ItemType::Video) return -1;
   auto len = lengthUs_.find(sound.id);
   int64_t length = len != lengthUs_.end() ? len->second : 0;
-  int at = -1;
-  for (int t = 0; t < tracks() && at < 0; ++t) {
-    if (track(t).video) continue;
-    bool busy = false;
-    for (const mf::SceneItem& it : track(t).items) busy |= it.startUs < sound.endUs() && it.endUs() > sound.startUs;
-    if (!busy) at = t;
-  }
+  int at = freeTrack(false, sound.startUs, sound.endUs());
   if (at < 0) {
     at = addTrack(false);
     if (at < 0) return -1;

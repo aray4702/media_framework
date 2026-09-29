@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Embedded in the mf_editor executable (it has no app bundle): macOS asks for the microphone
+     with this description when a voice-over is first recorded. -->
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key>
+  <string>com.mediaframework.editor</string>
+  <key>CFBundleName</key>
+  <string>Media Editor</string>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>Media Editor records your voice-overs from the microphone.</string>
+</dict>
+</plist>

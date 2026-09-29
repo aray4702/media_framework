@@ -73,6 +73,8 @@ class Document {
   void setSpeed(int t, int k, double speed);
   int64_t maxDurationUs(int t, int k) const;
 
+  // The lowest track of that kind (video or audio) with nothing in [startUs, endUs), or -1.
+  int freeTrack(bool video, int64_t startUs, int64_t endUs) const;
   // Copies video item k's sound (same file, `in`, speed and time) onto the lowest audio track
   // free for its time, or a new one, and mutes the video. Returns the new item's track and sets
   // *audioItem, or -1: not a video item, or 16 tracks already. *videoTrack follows the video

@@ -1,9 +1,11 @@
 #pragma once
 
 // The Export tab: renders the scene into video files with mf::Exporter. It lists outputs, each
-// with a format (MP4 or MOV, H.264 or HEVC), a resolution (the project's, or a standard height at
-// the project's aspect ratio), a frame rate (the project's, or a standard one) and a quality
-// (which sets the bitrate); Add Output adds one. Export… asks for a name once and writes one file
+// with a format (MP4 or MOV, H.264 or HEVC), a resolution (the project's, a standard height at
+// the project's aspect ratio, or a fixed size such as a phone's), for another aspect ratio a
+// framing (Fit: all of it, with bands of the background; Fill: cropped, at a crop position), a
+// frame rate (the project's, or a standard one) and a quality (which sets the bitrate); Add
+// Output adds one. Export… asks for a name once and writes one file
 // per output, one after another, with progress and Cancel, then Show in Finder. The editor's own
 // preview keeps working meanwhile.
 

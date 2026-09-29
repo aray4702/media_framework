@@ -31,8 +31,9 @@ struct Exporter::Impl : PipelineEvents {
       if (error) *error = "output: export needs a size and frame rate";
       return Result::InvalidArgument;
     }
-    settings.width = scene.output.width;  // the scene's size and rate, the settings' bitrates
-    settings.height = scene.output.height;
+    bool framed = settings.frameWidth > 0 && settings.frameHeight > 0;  // else the scene's size
+    settings.width = framed ? settings.frameWidth : scene.output.width;
+    settings.height = framed ? settings.frameHeight : scene.output.height;
     settings.fps = std::max(1, int(std::lround(double(scene.output.fpsNum) / scene.output.fpsDen)));
     if (!valid(settings)) return Result::InvalidArgument;
     if (started || stopped) return Result::InvalidState;

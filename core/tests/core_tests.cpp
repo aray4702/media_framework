@@ -223,6 +223,47 @@ TEST(player_open_is_async_and_prerolls_first_frame) {
   CHECK(h.player->metrics().ttffMs >= 0);
 }
 
+// Opened at a start position, the only frame shown is the one there: none at 0 before it.
+TEST(player_opens_at_a_start_position) {
+  fake::Harness h;
+  Scene scene;
+  scene.output.width = scene.output.height = 0;
+  scene.output.fpsNum = 0;
+  scene.output.sampleRate = scene.output.channels = 0;
+  SceneTrack track;
+  SceneItem item;
+  item.type = ItemType::Video;
+  track.items.push_back(item);
+  scene.tracks.push_back(track);
+  CHECK(h.player->open(scene, RenderTarget{}, OutputDriver::Auto, nullptr, 1250000) == Result::Ok);
+  h.run(50);
+  CHECK(h.player->state() == State::Ready);
+  CHECK_EQ(h.listener.firstFrames, 1);
+  CHECK(h.listener.seeks.empty());
+  int64_t expected = 37 * 1000000 / 30;  // last frame at or before 1.25 s
+  CHECK_EQ(h.platform.display->shown.size(), size_t(1));
+  CHECK_EQ(h.lastShown(), expected);
+  CHECK_EQ(h.player->positionUs(), expected);
+}
+
+// A start past the end shows the last frame.
+TEST(player_open_past_the_end_shows_the_last_frame) {
+  fake::Harness h;
+  Scene scene;
+  scene.output.width = scene.output.height = 0;
+  scene.output.fpsNum = 0;
+  scene.output.sampleRate = scene.output.channels = 0;
+  SceneTrack track;
+  SceneItem item;
+  item.type = ItemType::Video;
+  track.items.push_back(item);
+  scene.tracks.push_back(track);
+  CHECK(h.player->open(scene, RenderTarget{}, OutputDriver::Auto, nullptr, 9000000) == Result::Ok);
+  h.run(50);
+  CHECK(h.player->state() == State::Ready);
+  CHECK_EQ(h.lastShown(), 59 * 1000000 / 30);
+}
+
 TEST(player_rejects_calls_in_wrong_state) {
   fake::Harness h;
   CHECK(h.player->play() == Result::InvalidState);
@@ -475,6 +516,33 @@ TEST(composition_seek_into_a_transition_shows_both_clips) {
   CHECK_EQ(f.layers[1].frame.item, 1);  // incoming, 0.5 s into it
   CHECK_EQ(f.layers[1].frame.ptsUs, 500000);
   CHECK(f.layers[1].offsetX == 0.5f);
+}
+
+// Opened at a time in a later image of a track, like a sticker added at the playhead after
+// others: the first frame has it.
+TEST(composition_open_at_a_later_image_shows_it) {
+  fake::Clip clip;
+  clip.durationUs = 40000000;
+  fake::Harness h(clip);
+  Scene scene;
+  SceneTrack video, stickers;
+  SceneItem v;
+  v.type = ItemType::Video;
+  video.items = {v};
+  for (int64_t start : {0, 7000000, 13300000}) {
+    SceneItem image;
+    image.type = ItemType::Image;
+    image.startUs = start;
+    image.durationUs = 5000000;
+    stickers.items.push_back(image);
+  }
+  scene.tracks = {video, stickers};
+  CHECK(h.player->open(scene, RenderTarget{}, OutputDriver::Vsync, nullptr, 13300000) == Result::Ok);
+  h.run(300);
+  CHECK(h.player->state() == State::Ready);
+  const ComposedFrame& f = h.lastComposed();
+  CHECK_EQ(f.ptsUs, 13300000);
+  CHECK_EQ(f.layers.size(), size_t(2));
 }
 
 TEST(composition_plays_through_a_transition_with_an_audio_crossfade) {
@@ -913,6 +981,7 @@ TEST(scene_serializes_every_field_back) {
   m.gain = Animatable(0.5);
   sound.items = {m};
   s.tracks = {sound, v, words};
+  s.metadata = "{\"editor\": {\"playhead\": 2.5}, \"tags\": [\"a\", \"b\"]}";
   CHECK(validateScene(s, nullptr) == Result::Ok);
 
   std::string first = serializeScene(s, [](const std::string& src) { return src.substr(1); });  // as a relative path
@@ -922,6 +991,7 @@ TEST(scene_serializes_every_field_back) {
   CHECK(back.output.fpsNum == 30000 && back.output.fpsDen == 1001 && back.output.sampleRate == 44100 && back.output.channels == 1);
   CHECK(back.output.background.a > 0.49f && back.output.background.a < 0.51f);
   CHECK(!back.tracks[0].video && back.tracks[0].gain == 1.5f && back.tracks[0].items[0].src == "music/m.mp3");
+  CHECK(back.metadata.find("\"playhead\": 2.5") != std::string::npos && back.metadata.find("\"tags\"") != std::string::npos);
   const SceneItem& ba = back.tracks[1].items[0];
   CHECK(ba.src == "clips/a.mp4" && ba.inUs == 1500000 && ba.speed == 2 && ba.mute && ba.pan.value == -0.5);
   CHECK_EQ(ba.transform.x.keys.size(), size_t(3));
@@ -1219,6 +1289,27 @@ TEST(scene_export_uses_the_output_size_and_rate) {
   CHECK_EQ(sink.video.size(), size_t(30));  // 1 s at 29.97 fps
   CHECK_EQ(sink.video[29].ptsUs, int64_t{29} * 1001 * 1000000 / 30000);
   CHECK_EQ(sink.video[0].height, 360);
+}
+
+TEST(export_scales_the_scene_to_the_frame_size) {
+  fake::ExportHarness h(clips(1, 2000000));
+  Scene scene = sceneFrom(doc(R"({"type": "video", "src": "clip0", "start": 0, "duration": 1})",
+                              R"({"width": 640, "height": 360, "fps": 30})"));
+  ExportSettings settings;
+  settings.frameWidth = 320;
+  settings.frameHeight = 180;
+  CHECK(h.exporter->start(scene, ExportTarget{}, settings) == Result::Ok);
+  h.run(20000);
+  CHECK_EQ(h.listener.completed, 1);
+  fake::ExportSink& sink = *h.platform.exportSink;
+  CHECK_EQ(sink.settings.width, 320);  // the file's frames
+  CHECK_EQ(sink.settings.height, 180);
+  CHECK_EQ(sink.video[0].width, 640);  // composed at the scene's size, which the sink scales
+  CHECK_EQ(sink.video[0].height, 360);
+
+  fake::ExportHarness odd(clips(1, 2000000));
+  settings.frameWidth = 321;  // frames need even sizes
+  CHECK(odd.exporter->start(scene, ExportTarget{}, settings) == Result::InvalidArgument);
 }
 
 TEST(scene_open_reports_invalid_scenes_and_too_many_lanes) {

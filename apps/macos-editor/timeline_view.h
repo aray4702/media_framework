@@ -44,4 +44,9 @@
 @property(nonatomic, copy) const std::vector<float>* (^peaks)(const mf::SceneItem& item);
 - (instancetype)initWithDocument:(editor::Document*)doc selection:(editor::Selection*)selection;
 - (void)reload;  // the tracks or items changed: resize and redraw
+// A voice-over being recorded, from startUs and lengthUs long so far, with the input level of
+// each 1/10 s: a red block that grows on the audio track it will go on (the lowest free for it),
+// or on a "new audio track" row below the others when none is.
+- (void)showRecordingFrom:(int64_t)startUs length:(int64_t)lengthUs levels:(const std::vector<float>&)levels;
+- (void)hideRecording;
 @end

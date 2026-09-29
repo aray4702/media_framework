@@ -61,11 +61,13 @@ class MetalDisplay : public IDisplay {
     layer_ = (CAMetalLayer*)view.layer;
     device_ = MTLCreateSystemDefaultDevice();
     if (!device_) return Result::InvalidArgument;
-    layer_.device = device_;
-    layer_.pixelFormat = MTLPixelFormatBGRA8Unorm;
-    layer_.framebufferOnly = YES;
-    layer_.maximumDrawableCount = 3;
-    layer_.allowsNextDrawableTimeout = YES;
+    // Set only what differs: a layer reused by a new display (a player reopened on the same
+    // view) keeps its drawables.
+    if (layer_.device != device_) layer_.device = device_;
+    if (layer_.pixelFormat != MTLPixelFormatBGRA8Unorm) layer_.pixelFormat = MTLPixelFormatBGRA8Unorm;
+    if (!layer_.framebufferOnly) layer_.framebufferOnly = YES;
+    if (layer_.maximumDrawableCount != 3) layer_.maximumDrawableCount = 3;
+    if (!layer_.allowsNextDrawableTimeout) layer_.allowsNextDrawableTimeout = YES;
     queue_ = [device_ newCommandQueue];
 
     if (!compositor_.init(device_, layer_.pixelFormat)) return Result::InvalidArgument;
@@ -143,7 +145,21 @@ class MetalDisplay : public IDisplay {
       }
     }
     for (int64_t pts : late) sink_->report(pts, 0);
-    if (show) draw(*show);
+    if (show) {
+      draw(*show);
+      // The first frame is drawn again on the next vsync, unless a newer one comes: the first
+      // present on a layer just taken over can be lost, and paused (a player opened at a time)
+      // it may be the only frame, which would leave the last display's frame on screen.
+      if (!drewFirst_) {
+        drewFirst_ = true;
+        again_ = std::move(show);
+      } else {
+        again_.reset();
+      }
+    } else if (again_) {
+      draw(*again_, false);
+      again_.reset();
+    }
   }
 
   static int64_t hostNs(uint64_t hostTime) {
@@ -155,12 +171,12 @@ class MetalDisplay : public IDisplay {
     return static_cast<int64_t>(hostTime * tb.numer / tb.denom);
   }
 
-  void draw(const Pending& p) {
+  void draw(const Pending& p, bool report = true) {
     @autoreleasepool {
       const ComposedFrame& c = p.frame;
       id<CAMetalDrawable> drawable = [layer_ nextDrawable];
       if (!drawable) {
-        sink_->report(c.ptsUs, 0);
+        if (report) sink_->report(c.ptsUs, 0);
         return;
       }
       id<MTLCommandBuffer> cmd = [queue_ commandBuffer];
@@ -168,7 +184,7 @@ class MetalDisplay : public IDisplay {
 
       int64_t pts = c.ptsUs;
       std::shared_ptr<Sink> sink = sink_;
-      [drawable addPresentedHandler:^(id<MTLDrawable> d) {
+      if (report) [drawable addPresentedHandler:^(id<MTLDrawable> d) {
         sink->report(pts, d.presentedTime > 0 ? static_cast<int64_t>(d.presentedTime * 1e9) : 0);  // 0: dropped
       }];
       [cmd presentDrawable:drawable];
@@ -189,6 +205,10 @@ class MetalDisplay : public IDisplay {
 
   std::mutex mu_;
   std::deque<Pending> pending_;
+
+  // Display-link thread.
+  bool drewFirst_ = false;
+  std::optional<Pending> again_;  // the first frame, drawn once more
 };
 
 }  // namespace

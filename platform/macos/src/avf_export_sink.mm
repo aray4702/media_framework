@@ -36,6 +36,10 @@ class AvfExportSink : public IExportSink {
 
   Result open(const ExportTarget& target, const ExportSettings& s, int sampleRate, int channels) override {
     @autoreleasepool {
+      framing_.fill = s.frameFit == FrameFit::Fill;
+      framing_.cropX = s.cropX;
+      framing_.cropY = s.cropY;
+      framing_.backgroundBands = true;  // a file's bands are part of the picture: the scene's background
       NSURL* url = (__bridge NSURL*)target.native.get();
       if (!url) return Result::InvalidArgument;
       [[NSFileManager defaultManager] removeItemAtURL:url error:nil];
@@ -192,7 +196,7 @@ class AvfExportSink : public IExportSink {
       bool ok = target != nullptr;
       if (ok) {
         id<MTLCommandBuffer> cmd = [queue_ commandBuffer];
-        compositor_.encode(f, CVMetalTextureGetTexture(target), cmd);
+        compositor_.encode(f, CVMetalTextureGetTexture(target), cmd, framing_);
         [cmd commit];
         [cmd waitUntilCompleted];  // on this queue only; the pipeline threads never wait
         ok = cmd.status == MTLCommandBufferStatusCompleted && waitReady(videoInput_) &&
@@ -236,6 +240,7 @@ class AvfExportSink : public IExportSink {
   id<MTLCommandQueue> queue_ = nil;
   CVMetalTextureCacheRef cache_ = nullptr;
   MetalCompositor compositor_;  // video queue only
+  MetalCompositor::Framing framing_;  // the scene into frames of the file's size
 
   dispatch_queue_t videoQueue_ = nullptr, audioQueue_ = nullptr;
   dispatch_semaphore_t finished_ = dispatch_semaphore_create(0);

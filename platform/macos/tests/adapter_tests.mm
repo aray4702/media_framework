@@ -180,8 +180,64 @@ static void compositorTests() {
                f[0], f[1], f[2], r[1][0], r[2][0]);
 }
 
+// The 64 × 32 canvas (red left half, green background) into a target of another size.
+static std::vector<Rgb> renderFramed(id<MTLDevice> device, int tw, int th, const macos::MetalCompositor::Framing& framing,
+                                     std::initializer_list<std::pair<int, int>> points) {
+  ComposedFrame frame;
+  frame.width = 64;
+  frame.height = 32;
+  frame.background = {0, 1, 0, 1};
+  frame.layers = {colorLayer({1, 0, 0, 1}, 1, -1, Blend::Normal, -0.5f)};  // the left half
+  macos::MetalCompositor compositor;
+  CHECK(compositor.init(device, MTLPixelFormatBGRA8Unorm));
+  MTLTextureDescriptor* d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                                               width:NSUInteger(tw)
+                                                                              height:NSUInteger(th)
+                                                                           mipmapped:NO];
+  d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+  d.storageMode = MTLStorageModeShared;
+  id<MTLTexture> target = [device newTextureWithDescriptor:d];
+  id<MTLCommandBuffer> cmd = [[device newCommandQueue] commandBuffer];
+  compositor.encode(frame, target, cmd, framing);
+  [cmd commit];
+  [cmd waitUntilCompleted];
+  std::vector<Rgb> out;
+  for (auto [x, y] : points) {
+    uint8_t bgra[4];
+    [target getBytes:bgra bytesPerRow:NSUInteger(tw) * 4 fromRegion:MTLRegionMake2D(NSUInteger(x), NSUInteger(y), 1, 1) mipmapLevel:0];
+    out.push_back({bgra[2] / 255.f, bgra[1] / 255.f, bgra[0] / 255.f});
+  }
+  return out;
+}
+
+// A 2:1 canvas into a square target: fit shows it all between bands (black, or the background),
+// fill covers the target and crops the sides, keeping the part the crop position says.
+static void framingTests() {
+  id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+  if (!device) return;
+  const Rgb red{1, 0, 0}, green{0, 1, 0}, black{0, 0, 0};
+  macos::MetalCompositor::Framing fit;
+  std::vector<Rgb> a = renderFramed(device, 32, 32, fit, {{16, 2}, {4, 16}, {28, 16}});  // canvas 32 × 16 in rows 8 to 24
+  CHECK(near(a[0], black) && near(a[1], red) && near(a[2], green));
+  fit.backgroundBands = true;
+  CHECK(near(renderFramed(device, 32, 32, fit, {{16, 2}})[0], green));  // an export's bands: the background
+  macos::MetalCompositor::Framing fill;
+  fill.fill = true;
+  std::vector<Rgb> c = renderFramed(device, 32, 32, fill, {{4, 16}, {28, 16}, {4, 1}});  // canvas x 16 to 48: the middle
+  CHECK(near(c[0], red) && near(c[1], green) && near(c[2], red));  // no band: the top row is canvas
+  fill.cropX = 0;  // the left edge
+  std::vector<Rgb> l = renderFramed(device, 32, 32, fill, {{4, 16}, {28, 16}});
+  CHECK(near(l[0], red) && near(l[1], red));
+  fill.cropX = 1;  // the right edge
+  std::vector<Rgb> r = renderFramed(device, 32, 32, fill, {{4, 16}, {28, 16}});
+  CHECK(near(r[0], green) && near(r[1], green));
+  std::fprintf(stderr, "framing: fit band %.0f,%.0f,%.0f  fill center %.0f/%.0f  left %.0f  right %.0f\n", a[0][0], a[0][1], a[0][2],
+               c[0][0], c[1][1], l[1][0], r[0][1]);
+}
+
 int main(int argc, char** argv) {
   compositorTests();
+  framingTests();
   if (argc < 2) {
     std::fprintf(stderr, "usage: %s clip.mp4|audio.m4a\n", argv[0]);
     return 2;

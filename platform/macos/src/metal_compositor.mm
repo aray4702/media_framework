@@ -400,11 +400,16 @@ bool MetalCompositor::combine(const ComposedFrame& c, int g, const std::vector<P
   return true;
 }
 
-void MetalCompositor::encode(const ComposedFrame& c, id<MTLTexture> target, id<MTLCommandBuffer> cmd) {
+void MetalCompositor::encode(const ComposedFrame& c, id<MTLTexture> target, id<MTLCommandBuffer> cmd, const Framing& framing) {
   double tw = target.width, th = target.height;
   double W = c.width > 0 ? c.width : tw, H = c.height > 0 ? c.height : th;
-  double scale = std::min(tw / W, th / H);  // letterbox the canvas into the target
-  MTLViewport viewport{(tw - W * scale) / 2, (th - H * scale) / 2, W * scale, H * scale, 0, 1};
+  // Fit: the whole canvas, centered, with spare room on one side. Fill: the canvas covers the
+  // target and runs past it on one side, by as much as the crop position says.
+  double scale = framing.fill ? std::max(tw / W, th / H) : std::min(tw / W, th / H);
+  double spareX = tw - W * scale, spareY = th - H * scale;  // fit: 0 or more; fill: 0 or less
+  double atX = framing.fill ? std::clamp(double(framing.cropX), 0.0, 1.0) : 0.5;
+  double atY = framing.fill ? std::clamp(double(framing.cropY), 0.0, 1.0) : 0.5;
+  MTLViewport viewport{spareX * atX, spareY * atY, W * scale, H * scale, 0, 1};
 
   auto textures = std::make_shared<std::vector<CVMetalTextureRef>>();
   std::vector<Prepared> prepared(c.layers.size());
@@ -426,7 +431,9 @@ void MetalCompositor::encode(const ComposedFrame& c, id<MTLTexture> target, id<M
   MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
   pass.colorAttachments[0].texture = target;
   pass.colorAttachments[0].loadAction = MTLLoadActionClear;
-  pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);  // letterbox bars
+  const Color& bg = c.background;  // the bands: black, or the scene's background (premultiplied, as drawn)
+  pass.colorAttachments[0].clearColor = framing.backgroundBands ? MTLClearColorMake(bg.r * bg.a, bg.g * bg.a, bg.b * bg.a, bg.a)
+                                                                : MTLClearColorMake(0, 0, 0, 1);
   pass.colorAttachments[0].storeAction = MTLStoreActionStore;
   id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:pass];
   [enc setViewport:viewport];

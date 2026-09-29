@@ -97,6 +97,7 @@ struct Context {
   ExportTarget exportTarget;
   ExportSettings exportSettings;
   Scene scene;  // T1 fills in the durations of items that play to the end of their file
+  int64_t startUs = 0;  // where the preroll goes: the first frame shown
   std::atomic<bool> openRequested{false};
 
   // Written by T1 while probing, before any packet exists; read-only once `probed` is set.

@@ -37,7 +37,20 @@ const Format kFormats[] = {
     {@"MOV (H.264)", @"mov", mf::VideoCodec::H264, @"H.264"},
     {@"MOV (HEVC)", @"mov", mf::VideoCodec::HEVC, @"HEVC"},
 };
-const int kHeights[] = {0, 2160, 1080, 720, 480};  // 0: the project's size; else the shorter side
+// The project's size; a height for the shorter side at the project's aspect ratio; or a fixed
+// size (as in the Project tab), whatever its aspect ratio.
+struct Resolution {
+  int shorter;  // at the project's aspect ratio (0: not)
+  int width, height;
+  NSString* label;
+};
+const Resolution kResolutions[] = {
+    {0, 0, 0, nil},  // the project's
+    {2160, 0, 0, nil},          {1080, 0, 0, nil},          {720, 0, 0, nil},          {480, 0, 0, nil},
+    {0, 1920, 1080, @"16:9"},   {0, 1280, 720, @"16:9"},    {0, 1080, 1080, @"1:1"},   {0, 1080, 1350, @"4:5"},
+    {0, 1080, 1920, @"9:16"},   {0, 720, 1280, @"9:16"},    {0, 1080, 2340, @"Android"}, {0, 1080, 2400, @"Android"},
+    {0, 1170, 2532, @"iPhone"}, {0, 1284, 2778, @"iPhone Max"}, {0, 1290, 2796, @"iPhone Pro Max"},
+};
 const int kRates[] = {0, 24, 25, 30, 50, 60};       // 0: the project's rate
 
 // Bits per pixel per frame for H.264 (HEVC: 40% less). High at 1080p30 is 7.5 Mb/s.
@@ -84,7 +97,9 @@ struct Job {
 
 }  // namespace
 
-// One output: its format, resolution, frame rate and quality, and a line saying what they come to.
+// One output: its format, resolution (with, when its aspect ratio isn't the project's, how the
+// project fits it and where a crop sits), frame rate and quality, and a line saying what they
+// come to.
 @interface OutputCard : NSView
 @property(nonatomic, weak) ExportView* owner;
 - (instancetype)initWithDocument:(editor::Document*)doc;
@@ -96,13 +111,19 @@ struct Job {
 - (int)rate;
 - (int)bitrate;
 - (NSString*)fileSuffix;  // e.g. "720p25 HEVC", naming it among several outputs
+- (BOOL)reshaped;           // its aspect ratio isn't the project's: framing applies
+- (mf::FrameFit)frameFit;
+- (float)cropX;
+- (float)cropY;
 @end
 
 @implementation OutputCard {
   editor::Document* _doc;
   NSTextField* _title;
   NSButton* _remove;
-  NSPopUpButton *_format, *_resolution, *_rate, *_quality;
+  NSPopUpButton *_format, *_resolution, *_rate, *_quality, *_framing;
+  NSSlider* _crop;  // Fill: where the crop sits, along the side that's cut
+  NSTextField *_cropStart, *_cropEnd;
   NSTextField* _summary;
 }
 
@@ -123,11 +144,13 @@ struct Job {
       [p.widthAnchor constraintEqualToConstant:180].active = YES;
       return p;
     };
-    NSMutableArray *formats = [NSMutableArray array], *sizes = [NSMutableArray arrayWithObject:@"Project"],
+    NSMutableArray *formats = [NSMutableArray array], *sizes = [NSMutableArray array],
                    *rates = [NSMutableArray arrayWithObject:@"Project"], *qualities = [NSMutableArray array];
     for (const Format& f : kFormats) [formats addObject:f.title];
-    for (int h : kHeights) {
-      if (h) [sizes addObject:[NSString stringWithFormat:@"%dp", h]];
+    for (const Resolution& r : kResolutions) {
+      [sizes addObject:r.shorter ? [NSString stringWithFormat:@"%dp", r.shorter]
+                       : r.width ? [NSString stringWithFormat:@"%d × %d  %@", r.width, r.height, r.label]
+                                 : @"Project"];
     }
     for (int r : kRates) {
       if (r) [rates addObject:[NSString stringWithFormat:@"%d fps", r]];
@@ -138,6 +161,19 @@ struct Job {
     _rate = popup(rates);
     _quality = popup(qualities);
     [_quality selectItemAtIndex:kDefaultQuality];
+    _framing = popup(@[ @"Fit: show all, with bands", @"Fill: crop to cover" ]);
+    _crop = [NSSlider sliderWithValue:0.5 minValue:0 maxValue:1 target:self action:@selector(changed:)];
+    _crop.continuous = NO;
+    _crop.controlSize = NSControlSizeSmall;
+    [_crop.widthAnchor constraintEqualToConstant:120].active = YES;
+    auto end = [](NSString* text) {
+      NSTextField* l = [NSTextField labelWithString:text];
+      l.font = [NSFont systemFontOfSize:10];
+      l.textColor = NSColor.tertiaryLabelColor;
+      return l;
+    };
+    _cropStart = end(@"Left");
+    _cropEnd = end(@"Right");
 
     _title = [NSTextField labelWithString:@""];
     _title.font = [NSFont systemFontOfSize:11 weight:NSFontWeightSemibold];
@@ -159,7 +195,9 @@ struct Job {
       return r;
     };
     NSStackView* stack = [NSStackView stackViewWithViews:@[
-      header, row(@"Format", _format), row(@"Resolution", _resolution), row(@"Frame rate", _rate), row(@"Quality", _quality), _summary
+      header, row(@"Format", _format), row(@"Resolution", _resolution), row(@"Framing", _framing),
+      row(@"Crop position", [NSStackView stackViewWithViews:@[ _cropStart, _crop, _cropEnd ]]), row(@"Frame rate", _rate),
+      row(@"Quality", _quality), _summary
     ]];
     stack.orientation = NSUserInterfaceLayoutOrientationVertical;
     stack.alignment = NSLayoutAttributeLeading;
@@ -182,6 +220,8 @@ struct Job {
 
 - (void)setEnabled:(BOOL)enabled {
   _format.enabled = _resolution.enabled = _rate.enabled = _quality.enabled = _remove.enabled = enabled;
+  [self refresh];  // framing and crop: only while enabled, and when they apply
+  if (!enabled) _framing.enabled = _crop.enabled = NO;
 }
 
 - (void)changed:(id)sender {
@@ -197,10 +237,13 @@ struct Job {
   return kFormats[std::max<NSInteger>(0, _format.indexOfSelectedItem)];
 }
 
-// The project's size, or a standard height for its shorter side at its aspect ratio, even.
+// The project's size, a standard height for its shorter side at its aspect ratio (even), or a
+// fixed size.
 - (NSSize)size {
   const mf::SceneOutput& o = _doc->scene.output;
-  int h = kHeights[std::max<NSInteger>(0, _resolution.indexOfSelectedItem)];
+  const Resolution& r = kResolutions[std::max<NSInteger>(0, _resolution.indexOfSelectedItem)];
+  if (r.width) return NSMakeSize(r.width, r.height);
+  int h = r.shorter;
   if (h == 0) return NSMakeSize(o.width, o.height);
   double longer = double(h) * std::max(o.width, o.height) / std::min(o.width, o.height);
   int other = std::min(8192, int(std::lround(longer / 2)) * 2);
@@ -221,7 +264,37 @@ struct Job {
 }
 
 - (NSString*)fileSuffix {
-  return [NSString stringWithFormat:@"%.0fp%d %@", std::min([self size].width, [self size].height), [self rate], [self format].codecName];
+  NSSize size = [self size];
+  if (kResolutions[std::max<NSInteger>(0, _resolution.indexOfSelectedItem)].width) {  // a fixed size: all of it
+    return [NSString stringWithFormat:@"%.0fx%.0f %dfps %@", size.width, size.height, [self rate], [self format].codecName];
+  }
+  return [NSString stringWithFormat:@"%.0fp%d %@", std::min(size.width, size.height), [self rate], [self format].codecName];
+}
+
+- (BOOL)reshaped {
+  const mf::SceneOutput& o = _doc->scene.output;
+  NSSize size = [self size];
+  return std::fabs(size.width / size.height - double(o.width) / o.height) > 0.005;
+}
+
+- (mf::FrameFit)frameFit {
+  return _framing.indexOfSelectedItem == 1 ? mf::FrameFit::Fill : mf::FrameFit::Fit;
+}
+
+// A frame relatively taller than the project cuts its sides, so the crop moves left to right;
+// a relatively wider one cuts top and bottom, and it moves top to bottom.
+- (BOOL)cropsSides {
+  const mf::SceneOutput& o = _doc->scene.output;
+  NSSize size = [self size];
+  return size.width / size.height < double(o.width) / o.height;
+}
+
+- (float)cropX {
+  return [self cropsSides] ? float(_crop.doubleValue) : 0.5f;
+}
+
+- (float)cropY {
+  return [self cropsSides] ? 0.5f : float(_crop.doubleValue);
 }
 
 - (void)refresh {
@@ -232,7 +305,13 @@ struct Job {
   [_rate synchronizeTitleAndSelectedItem];
   NSSize size = [self size];
   double seconds = _doc->scene.durationUs() / 1e6;
-  _summary.stringValue = [NSString stringWithFormat:@"%.0f × %.0f · %d fps · %.1f Mb/s · about %.0f MB", size.width, size.height,
+  BOOL reshaped = [self reshaped], fill = [self frameFit] == mf::FrameFit::Fill;
+  _framing.enabled = _resolution.enabled && reshaped;  // the same shape: nothing to fit or crop
+  _crop.enabled = _framing.enabled && fill;
+  _cropStart.stringValue = [self cropsSides] ? @"Left" : @"Top";
+  _cropEnd.stringValue = [self cropsSides] ? @"Right" : @"Bottom";
+  NSString* shape = !reshaped ? @"" : fill ? @" · cropped" : @" · bands";
+  _summary.stringValue = [NSString stringWithFormat:@"%.0f × %.0f%@ · %d fps · %.1f Mb/s · about %.0f MB", size.width, size.height, shape,
                                                     [self rate], [self bitrate] / 1e6, ([self bitrate] + 192000) * seconds / 8e6];
 }
 
@@ -415,9 +494,14 @@ struct Job {
   for (NSUInteger i = 0; i < _cards.count && i < urls.count; ++i) {
     OutputCard* card = _cards[i];
     Job job{urls[i], _doc->scene, {}};
+    // Drawn at the project's size, then scaled to the chosen one: every item keeps its size
+    // relative to the frame (stickers and other items at their pixel size included).
     NSSize size = [card size];
-    job.scene.output.width = int(size.width);
-    job.scene.output.height = int(size.height);
+    job.settings.frameWidth = int(size.width);
+    job.settings.frameHeight = int(size.height);
+    job.settings.frameFit = [card frameFit];  // another aspect ratio: bands of the background, or a crop
+    job.settings.cropX = [card cropX];
+    job.settings.cropY = [card cropY];
     job.scene.output.fpsNum = [card rate];
     job.scene.output.fpsDen = 1;
     job.settings.videoBitrate = [card bitrate];
