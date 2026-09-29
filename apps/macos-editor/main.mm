@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "document.h"
+#include "export_view.h"
 #include "inspector_view.h"
 #include "mf/macos.h"
 #include "mf/player.h"
@@ -147,6 +148,7 @@ static NSString* timeString(int64_t us) {
   NSPanel* _properties;  // floating; holds _inspector
   InspectorView* _projectInspector;  // in the left pane's Project tab
   InspectorView* _transitionInspector;  // in the left pane while a join is selected
+  ExportView* _exportView;              // the Export tab
   editor::Selection _projectSel;     // always the project, except just after it adds a track
   NSBox* _sideLine;
   PaneHandle* _sideHandle;
@@ -186,6 +188,7 @@ static NSString* timeString(int64_t us) {
 }
 
 - (void)applicationWillTerminate:(NSNotification*)note {
+  [_exportView cancel];
   if (_player) _player->shutdown();
 }
 
@@ -229,6 +232,8 @@ static NSString* timeString(int64_t us) {
   _projectInspector = [[InspectorView alloc] initWithFrame:NSMakeRect(0, 0, 300, 500) document:&_doc selection:&_projectSel];
   _projectInspector.delegate = self;
   [_sidebar setProjectView:_projectInspector];
+  _exportView = [[ExportView alloc] initWithFrame:NSMakeRect(0, 0, 300, 500) document:&_doc platform:_platform.get()];
+  [_sidebar setExportView:_exportView];
   _transitionInspector = [[InspectorView alloc] initWithFrame:NSMakeRect(0, 0, 300, 500) document:&_doc selection:&_sel];
   _transitionInspector.delegate = self;
   _sideLine = [[NSBox alloc] initWithFrame:NSMakeRect(side, 0, 1, size.height)];
@@ -748,7 +753,9 @@ struct Dropped {
 // --- Preview --------------------------------------------------------------------------------
 
 // Reopens the player a moment after the first of a burst of edits, e.g. while a slider moves.
+// Every edit comes through here: the Export tab's summary (size, rate, length) follows too.
 - (void)scheduleReload {
+  [_exportView refresh];
   if (_reloadPending) return;
   _reloadPending = YES;
   dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 120 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{

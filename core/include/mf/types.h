@@ -93,11 +93,14 @@ enum class OutputDriver {
 };
 
 // Export output (§2.5). Frames are composed at n / fps and written with the platform encoder.
+enum class VideoCodec { H264, HEVC };
+
 struct ExportSettings {
   int width = 1920, height = 1080;  // set from the scene's output by Exporter::start
   int fps = 30;                      // likewise
   int videoBitrate = 10000000;
   int audioBitrate = 192000;
+  VideoCodec codec = VideoCodec::H264;  // the container comes from the target (Mac OS: the file's extension)
 };
 
 // Opaque handle made by the platform layer. Mac OS: NSURL of the output file.

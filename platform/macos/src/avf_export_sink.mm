@@ -40,19 +40,23 @@ class AvfExportSink : public IExportSink {
       if (!url) return Result::InvalidArgument;
       [[NSFileManager defaultManager] removeItemAtURL:url error:nil];
       NSError* error = nil;
-      writer_ = [AVAssetWriter assetWriterWithURL:url fileType:AVFileTypeMPEG4 error:&error];
+      // .mov: a QuickTime movie; anything else an MP4.
+      bool mov = [url.pathExtension caseInsensitiveCompare:@"mov"] == NSOrderedSame;
+      writer_ = [AVAssetWriter assetWriterWithURL:url fileType:mov ? AVFileTypeQuickTimeMovie : AVFileTypeMPEG4 error:&error];
       if (!writer_) return Result::FileOpenFailed;
 
+      bool hevc = s.codec == VideoCodec::HEVC;
+      NSMutableDictionary* compression = [@{
+        AVVideoAverageBitRateKey : @(s.videoBitrate),
+        AVVideoExpectedSourceFrameRateKey : @(s.fps),
+        AVVideoMaxKeyFrameIntervalKey : @(s.fps),
+      } mutableCopy];
+      if (!hevc) compression[AVVideoProfileLevelKey] = AVVideoProfileLevelH264HighAutoLevel;  // HEVC: Main, the default
       NSDictionary* video = @{
-        AVVideoCodecKey : AVVideoCodecTypeH264,
+        AVVideoCodecKey : hevc ? AVVideoCodecTypeHEVC : AVVideoCodecTypeH264,
         AVVideoWidthKey : @(s.width),
         AVVideoHeightKey : @(s.height),
-        AVVideoCompressionPropertiesKey : @{
-          AVVideoAverageBitRateKey : @(s.videoBitrate),
-          AVVideoExpectedSourceFrameRateKey : @(s.fps),
-          AVVideoMaxKeyFrameIntervalKey : @(s.fps),
-          AVVideoProfileLevelKey : AVVideoProfileLevelH264HighAutoLevel,
-        },
+        AVVideoCompressionPropertiesKey : compression,
       };
       videoInput_ = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeVideo outputSettings:video];
       videoInput_.expectsMediaDataInRealTime = NO;

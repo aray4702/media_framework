@@ -1,8 +1,8 @@
 #pragma once
 
-// The left pane: vertical tabs (Video, Image, Stickers, Emojis, Text, Audio, Project) and what
-// the selected tab offers. It collapses to the tab bar: click the open tab, or the button at the
-// bottom of the bar; any tab opens it again. Its content follows the pane's width. Video, Image
+// The left pane: vertical tabs (Video, Image, Stickers, Emojis, Text, Audio, Project, Export)
+// and what the selected tab offers. It collapses to the tab bar: click the open tab, or the
+// button at the bottom of the bar; any tab opens it again. Its content follows the pane's width. Video, Image
 // and Audio list the files imported so far; Image also has solid colors. Stickers are SF
 // Symbols in color, rendered once into PNG files and added as image items; emojis and text
 // presets are added as text items. A click adds the item at the playhead; a drag carries it to
@@ -39,6 +39,7 @@ struct SidebarPayload {
 + (CGFloat)collapsedWidth;  // the tab bar alone
 - (void)rememberFile:(NSString*)path;  // lists it under its tab (Video, Image or Audio)
 - (void)setProjectView:(NSView*)view;  // what the Project tab shows
+- (void)setExportView:(NSView*)view;   // what the Export tab shows
 - (SidebarPayload)draggedPayload;       // during a drag out of the pane; empty otherwise
 // Shows `view` under `title` in place of the open tab's content, opening the pane if it's
 // collapsed, until hidePanel (or a tab is clicked), which puts back what was there.

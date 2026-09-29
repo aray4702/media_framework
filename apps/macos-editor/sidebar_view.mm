@@ -64,12 +64,13 @@ NSPasteboardType const SidebarDragType = @"com.mediaframework.editor.sidebar-ite
 @end
 
 namespace {
-enum Tab { kVideo, kImage, kStickers, kEmojis, kText, kAudio, kProject, kTabs };
+enum Tab { kVideo, kImage, kStickers, kEmojis, kText, kAudio, kProject, kExport, kTabs };
 constexpr CGFloat kTabBarWidth = 72;
 constexpr int64_t kStillUs = 5000000;
 
-NSString* const kTabTitles[kTabs] = {@"Video", @"Image", @"Stickers", @"Emojis", @"Text", @"Audio", @"Project"};
-NSString* const kTabSymbols[kTabs] = {@"film", @"photo", @"star.circle", @"face.smiling", @"textformat", @"music.note", @"gearshape"};
+NSString* const kTabTitles[kTabs] = {@"Video", @"Image", @"Stickers", @"Emojis", @"Text", @"Audio", @"Project", @"Export"};
+NSString* const kTabSymbols[kTabs] = {@"film",       @"photo",      @"star.circle", @"face.smiling",
+                                      @"textformat", @"music.note", @"gearshape",   @"square.and.arrow.up"};
 
 // An SF Symbol, and colors (0xRRGGBB) for its layers in order: one, or two for two-layer symbols.
 struct Sticker {
@@ -160,7 +161,7 @@ mf::SceneItem textItem(const std::string& text, const char* font, float size) {
   NSTextField* _title;
   NSStackView* _list;
   NSScrollView* _scroll;  // holds _list
-  NSView* _projectView;
+  NSView* _ownViews[kTabs];  // what the Project and Export tabs show, from the owner; nil for the others
   NSButton* _collapseButton;
   NSMutableArray* _actions;  // ClickAction targets of the current tab's buttons
   NSMutableArray<NSString*>* _files[kTabs];
@@ -275,8 +276,7 @@ mf::SceneItem textItem(const std::string& text, const char* font, float size) {
 - (void)setCollapsed:(BOOL)collapsed {
   _collapsed = collapsed;
   _title.hidden = collapsed;
-  _scroll.hidden = collapsed || _panel || _tab == kProject;
-  _projectView.hidden = collapsed || _panel || _tab != kProject;
+  [self showContentOf:_tab];
   _panel.hidden = collapsed;
   _collapseButton.image = [NSImage imageWithSystemSymbolName:collapsed ? @"sidebar.right" : @"sidebar.left"
                                     accessibilityDescription:collapsed ? @"Expand" : @"Collapse"];
@@ -313,12 +313,28 @@ mf::SceneItem textItem(const std::string& text, const char* font, float size) {
 }
 
 - (void)setProjectView:(NSView*)view {
-  [_projectView removeFromSuperview];
-  _projectView = view;
+  [self setView:view ofTab:kProject];
+}
+
+- (void)setExportView:(NSView*)view {
+  [self setView:view ofTab:kExport];
+}
+
+- (void)setView:(NSView*)view ofTab:(Tab)tab {
+  [_ownViews[tab] removeFromSuperview];
+  _ownViews[tab] = view;
   view.frame = _scroll.frame;
   view.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-  view.hidden = _collapsed || _tab != kProject;
   [self addSubview:view];
+  [self showContentOf:_tab];
+}
+
+// Shows the tab's content: the list, or the owner's view for the tab; nothing while collapsed or
+// under a panel.
+- (void)showContentOf:(Tab)tab {
+  bool shown = !_collapsed && !_panel;
+  _scroll.hidden = !shown || _ownViews[tab];
+  for (int t = 0; t < kTabs; ++t) _ownViews[t].hidden = !shown || t != tab;
 }
 
 - (void)showTab:(Tab)tab {
@@ -329,8 +345,7 @@ mf::SceneItem textItem(const std::string& text, const char* font, float size) {
     b.contentTintColor = on ? NSColor.controlAccentColor : NSColor.secondaryLabelColor;
   }
   _title.stringValue = _panel ? (_panelTitle ?: @"") : kTabTitles[tab];
-  _scroll.hidden = _collapsed || _panel || tab == kProject;
-  _projectView.hidden = _collapsed || _panel || tab != kProject;
+  [self showContentOf:tab];
   _panel.hidden = _collapsed;
   for (NSView* v in _list.arrangedSubviews) [v removeFromSuperview];
   [_actions removeAllObjects];
@@ -343,6 +358,7 @@ mf::SceneItem textItem(const std::string& text, const char* font, float size) {
     case kEmojis: [self buildEmojis]; break;
     case kText: [self buildText]; break;
     case kProject:
+    case kExport:
     case kTabs: break;
   }
 }
@@ -438,7 +454,7 @@ mf::SceneItem textItem(const std::string& text, const char* font, float size) {
 }
 
 - (void)buildFiles:(Tab)tab {
-  static NSString* const kinds[kTabs] = {@"videos", @"images", nil, nil, nil, @"audio files", nil};
+  static NSString* const kinds[kTabs] = {@"videos", @"images", nil, nil, nil, @"audio files", nil, nil};
   __weak SidebarView* weak = self;
   NSButton* import = [self button:[NSString stringWithFormat:@"Import %@…", tab == kAudio ? @"Audio" : kTabTitles[tab]]
                             image:[NSImage imageWithSystemSymbolName:@"plus" accessibilityDescription:nil]
