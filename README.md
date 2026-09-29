@@ -118,6 +118,21 @@ The demo is an `NSWindow` with a `CAMetalLayer`-backed video view, an **Open…*
 
 ![The mf_demo window paused at 11.38 s of a 4-minute video, with the Open, Play and seek bar controls along the bottom](docs/images/demo.png)
 
+### Run the editor
+
+```sh
+./build/apps/macos-editor/mf_editor                                  # empty project
+./build/apps/macos-editor/mf_editor clips/1080p30.mp4 clips/720p24.mp4  # starts with these on the timeline
+```
+
+A small editor on top of the scene graph. The left pane, the whole height of the window, has vertical tabs of things to add: **Video**, **Image** (with solid colors), **Stickers**, **Emojis**, **Text** and **Audio**; and **Project**, the project's settings. Drag the handle on its right edge to make it narrower or wider (280 to 640 points); dragging it almost shut, or clicking the open tab (or the button at the bottom of the tab bar), collapses the pane to its tabs, and any tab opens it again. Video, Image and Audio list the files imported so far; click any entry to add it at the playhead. Stickers, emojis and text go over the video, on the highest video track free at the playhead (a new one if none is). To its right are the preview, with **Play/Pause** and the time, and below it the timeline: one row per track, top layer first. Click an empty part of a row to select its track.
+
+Properties open in a floating window. The selected item has a **…** button at its right end, and a selected track has one at the right of its row. For an item: timing, text, transform, fit, blend, effects, audio, and the transition from the item before it. For a track: enabled, opacity or gain, effects, order. The Project tab has the output size, frame rate, background, the global filter, and adding tracks. While open, the window follows the selection.
+
+The selection is shared by the preview and the timeline: select an item in either and it's outlined in both. In the preview, drag the selected item to move it, a corner to scale it, the round handle above it to rotate it (Shift snaps to 15°), or the middle of a side to crop that side; click another item to select it. Anything in the left pane can also be dragged: onto the timeline it lands at that time on that row (a new track if the row doesn't take it), onto the preview it goes over the video at the playhead, where it's dropped. Files dragged from the Finder work the same way. Resizing the window or the panes never stretches the preview: the canvas keeps its aspect ratio, and so does every item in it (except with **Fill**, which stretches to the output by definition).
+
+In the timeline, drag an item to move it. The selected item is highlighted and shows its length in seconds; hover near either end to get trim handles, and drag one to trim that end. The start handle is a ripple trim: the item stays in place, a video or audio item plays from later (or earlier) in its file, and the items after it on the track move by the same amount. Clicking anywhere else in the timeline moves the playhead there, and dragging in the ruler or on empty space scrubs. With the timeline focused, Space plays or pauses and Delete removes the selection. Edits keep every track valid: a transition sets where the next item starts, and a new item pushes later ones along. The player has no live scene update, so after an edit the editor reopens the scene at the same time.
+
 ### Use the library
 
 Link `mf_core` and the platform library (`mf_macos`), then drive a `Player` from one thread: the owner thread.
@@ -208,6 +223,7 @@ Every API call returns without doing I/O or decoding. Only `shutdown` blocks, wh
 | [core/tests/](core/tests/)                     | Host tests with fake adapters and a deterministic single-threaded scheduler                                                                                                                                                            |
 | [platform/macos/](platform/macos/)             | macOS adapters and the platform factory                                                                                                                                                                                                |
 | [apps/macos-demo/](apps/macos-demo/)           | The demo app                                                                                                                                                                                                                           |
+| [apps/macos-editor/](apps/macos-editor/)       | The editor app                                                                                                                                                                                                                           |
 | [scripts/make_clips.sh](scripts/make_clips.sh) | Generates the test clips                                                                                                                                                                                                               |
 | [scene_graph_spec.md](scene_graph_spec.md), [schema/](schema/) | Scene-graph format (v1): tracks, transitions, effects, keyframes; JSON Schema, example, and the OTIO mapping. [scripts/validate_scene.py](scripts/validate_scene.py) validates a document |
 
