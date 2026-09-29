@@ -670,6 +670,7 @@ struct Dropped {
 }
 
 - (void)structureChanged {
+  [_overlay stopEditing];
   [self syncTransitionPanel];
   [_timeline reload];
   _overlay.needsDisplay = YES;
@@ -680,6 +681,7 @@ struct Dropped {
 
 // An open properties window follows the selection.
 - (void)timelineSelectionChanged {
+  [_overlay stopEditing];
   [self syncTransitionPanel];
   _overlay.needsDisplay = YES;
   [_inspector rebuild];

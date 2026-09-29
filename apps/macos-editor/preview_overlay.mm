@@ -81,6 +81,9 @@ void setConstant(mf::Animatable& a, double v) {
   Box _box;       // the selected item's, when the drag started
   double _x0, _y0, _scale0, _rotation0, _crop0;
   BOOL _dropping;  // something is dragged over
+  NSTextField* _editor;       // over a text item while its words are edited
+  editor::Selection _edited;  // that item
+  std::string _before;        // its text before, for Escape
 }
 
 - (instancetype)initWithFrame:(NSRect)frame document:(editor::Document*)doc selection:(editor::Selection*)selection {
@@ -275,6 +278,96 @@ void setConstant(mf::Animatable& a, double v) {
   [arrow drawInRect:NSMakeRect(h.rotate.x - 4, h.rotate.y - 4, 8, 8)];
 }
 
+// --- Editing text -----------------------------------------------------------------------------
+
+// A field over the selected text item, upright at its center, in its font, color and alignment
+// at the preview's scale.
+- (void)editText {
+  Box b;
+  if (![self selectedBox:&b]) return;
+  mf::SceneItem& it = _doc->item(_sel->track, _sel->item);
+  const mf::TextStyle& style = it.style;
+  double k = [self viewScale];
+  CGFloat points = std::max(6.0, style.size * _doc->scene.output.height * k / 1.2);  // a line is about 1.2 × the font size
+  NSFont* font = style.font == "system"        ? [NSFont systemFontOfSize:points]
+                 : style.font == "system-bold" ? [NSFont boldSystemFontOfSize:points]
+                                               : [NSFont fontWithName:[NSString stringWithUTF8String:style.font.c_str()] size:points];
+  _editor = [[NSTextField alloc] initWithFrame:NSZeroRect];
+  _editor.font = font ?: [NSFont systemFontOfSize:points];
+  _editor.textColor = [NSColor colorWithSRGBRed:style.color.r green:style.color.g blue:style.color.b alpha:1];
+  _editor.backgroundColor = [NSColor colorWithWhite:0 alpha:0.45];  // over the rendered text, which lags a little
+  _editor.drawsBackground = YES;
+  _editor.bordered = NO;
+  _editor.focusRingType = NSFocusRingTypeExterior;
+  _editor.alignment = style.align == mf::TextAlign::Left ? NSTextAlignmentLeft : style.align == mf::TextAlign::Right ? NSTextAlignmentRight
+                                                                                                                   : NSTextAlignmentCenter;
+  _editor.usesSingleLineMode = NO;
+  _editor.cell.wraps = YES;
+  _editor.cell.scrollable = NO;
+  _editor.stringValue = [NSString stringWithUTF8String:it.text.c_str()];
+  _editor.delegate = self;
+  _edited = *_sel;
+  _before = it.text;
+  [self placeEditor];
+  [self addSubview:_editor];
+  [self.window makeFirstResponder:_editor];
+  [_editor.currentEditor selectAll:nil];
+  self.needsDisplay = YES;
+}
+
+// Over the item's box as it is now (it grows with the text, wrapping at the style's max width),
+// centered on it, a little larger so the last characters typed don't wrap early.
+- (void)placeEditor {
+  Box b;
+  if (!_editor || ![self selectedBox:&b]) return;
+  double k = [self viewScale];
+  NSPoint center = [self toView:b.at(0.5, 0.5)];
+  CGFloat w = std::max<CGFloat>(80, b.w * k + 16), h = std::max<CGFloat>(_editor.font.pointSize * 1.4, b.h * k + 6);
+  _editor.frame = NSMakeRect(center.x - w / 2, center.y - h / 2, w, h);
+}
+
+- (void)stopEditing {
+  if (!_editor) return;
+  NSTextField* field = _editor;
+  _editor = nil;  // first: removing the field ends its editing, which calls back here
+  [field removeFromSuperview];
+  [self.window makeFirstResponder:self];
+  self.needsDisplay = YES;
+}
+
+// The words as typed become the item's (not while empty: a text item needs some).
+- (void)controlTextDidChange:(NSNotification*)note {
+  if (!_editor || _editor.stringValue.length == 0 || _edited != *_sel) return;
+  _doc->item(_edited.track, _edited.item).text = _editor.stringValue.UTF8String;
+  [self placeEditor];
+  self.needsDisplay = YES;  // the outline follows the new size
+  [self.delegate overlayEdited];
+}
+
+- (void)controlTextDidEndEditing:(NSNotification*)note {
+  [self stopEditing];
+}
+
+- (BOOL)control:(NSControl*)control textView:(NSTextView*)view doCommandBySelector:(SEL)command {
+  if (command == @selector(insertNewline:)) {  // Return: done
+    [self stopEditing];
+    return YES;
+  }
+  if (command == @selector(insertLineBreak:) || command == @selector(insertNewlineIgnoringFieldEditor:)) {  // Option-Return
+    [view insertNewlineIgnoringFieldEditor:nil];
+    return YES;
+  }
+  if (command == @selector(cancelOperation:)) {  // Escape: the text as it was
+    if (_edited == *_sel) {
+      _doc->item(_edited.track, _edited.item).text = _before;
+      [self.delegate overlayEdited];
+    }
+    [self stopEditing];
+    return YES;
+  }
+  return NO;
+}
+
 // --- Dropping --------------------------------------------------------------------------------
 
 - (NSDragOperation)draggingEntered:(id<NSDraggingInfo>)info {
@@ -318,8 +411,13 @@ void setConstant(mf::Animatable& a, double v) {
 }
 
 - (void)mouseDown:(NSEvent*)event {
+  [self stopEditing];
   NSPoint p = [self convertPoint:event.locationInWindow fromView:nil];
   _drag = [self dragAt:p];
+  if (_drag == Drag::Move && event.clickCount >= 2 && _doc->item(_sel->track, _sel->item).type == mf::ItemType::Text) {
+    _drag = Drag::None;
+    return [self editText];
+  }
   if (_drag == Drag::None) {  // select what's under the click, top first
     editor::Selection sel;
     double k = [self viewScale];

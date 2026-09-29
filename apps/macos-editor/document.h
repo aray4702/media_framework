@@ -17,6 +17,7 @@ struct Selection {
   int item = -1;            // -1: the track itself
   bool transition = false;  // the join into `item` from the one before it, not the item
   bool operator!=(const Selection& o) const { return track != o.track || item != o.item || transition != o.transition; }
+  bool operator==(const Selection& o) const { return !(*this != o); }
 };
 
 class Document {
