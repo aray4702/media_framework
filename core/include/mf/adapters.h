@@ -3,6 +3,8 @@
 #include <array>
 #include <functional>
 #include <memory>
+#include <string>
+#include <vector>
 
 #include "mf/types.h"
 
@@ -81,6 +83,29 @@ class IImageLoader {
   virtual Result load(const MediaSource&, VideoFrame* out, int* width, int* height) = 0;
 };
 
+// A live camera and its microphone (the camera window).
+struct CameraDevice {
+  std::string id;    // stable across launches
+  std::string name;  // for menus
+  bool front = false;  // faces the user (Mac OS: the built-in camera): mirrored by default
+};
+class ICamera {
+ public:
+  // On the camera's thread. frame.image is a surface the display and an export sink can use
+  // directly (Mac OS: an IOSurface-backed CVPixelBuffer); frame.ptsUs is its capture time, on
+  // the host clock, in µs.
+  using FrameFn = std::function<void(const VideoFrame& frame)>;
+  // On the microphone's thread: interleaved PCM and the host time of its first sample.
+  using AudioFn = std::function<void(const int16_t* pcm, int frames, int sampleRate, int channels, int64_t hostTimeNs)>;
+  virtual ~ICamera() = default;
+  virtual std::vector<CameraDevice> devices() = 0;
+  // Starts `deviceId` ("": the default), with the microphone when onAudio is set. Ok, or
+  // PermissionDenied, CaptureFailed. Calling it again switches devices.
+  virtual Result start(const std::string& deviceId, FrameFn onFrame, AudioFn onAudio) = 0;
+  // No callback runs after it returns.
+  virtual void stop() = 0;
+};
+
 // Export (§2.5): renders composed frames and encodes them with the mixed audio into a file.
 // Writes never block: Again means the encoder is busy, and the caller retries shortly.
 // Destroying the sink cancels an unfinished file, and no callback runs after the destructor.
@@ -120,6 +145,7 @@ class PlatformFactory {
   virtual std::unique_ptr<IScheduler> createScheduler() = 0;
   virtual std::unique_ptr<IExportSink> createExportSink() { return nullptr; }  // null: export unsupported
   virtual std::unique_ptr<IImageLoader> createImageLoader() { return nullptr; }  // null: no image items
+  virtual std::unique_ptr<ICamera> createCamera() { return nullptr; }            // null: no camera
   virtual IClock& clock() = 0;
 };
 

@@ -16,6 +16,8 @@ const char* toString(Result r) {
     case Result::AudioDeviceFailed: return "AudioDeviceFailed";
     case Result::Unsupported: return "Unsupported";
     case Result::WriteFailed: return "WriteFailed";
+    case Result::PermissionDenied: return "PermissionDenied";
+    case Result::CaptureFailed: return "CaptureFailed";
     case Result::Again: return "Again";
     case Result::Eos: return "Eos";
     case Result::CorruptFrame: return "CorruptFrame";

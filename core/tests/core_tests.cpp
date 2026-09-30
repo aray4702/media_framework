@@ -9,6 +9,7 @@
 #include "../src/json.h"
 #include "../src/layout.h"
 #include "mf/effects.h"
+#include "mf/live_preview.h"
 #include "fakes.h"
 #include "test.h"
 
@@ -1240,6 +1241,78 @@ TEST(scene_plugin_effects_parse_validate_and_write_back) {
   coded = s;
   coded.tracks[0].items[0].effects.plugins[0].params.pop_back();
   CHECK(validateScene(coded, &error) == Result::InvalidArgument && error.find("needs 2 parameters") != std::string::npos);
+}
+
+// --- LivePreview (the camera window) ------------------------------------------------------------
+
+static Scene cameraScene(const std::string& caption) {
+  Scene s;
+  s.output.width = 1080;
+  s.output.height = 1920;
+  SceneTrack camera, sticker, words;
+  SceneItem cam;
+  cam.type = ItemType::Video;
+  cam.id = "camera";
+  cam.src = "camera";
+  cam.durationUs = 3600LL * 1000000;
+  cam.fit = Fit::Cover;
+  cam.transform.flipX = true;
+  cam.effects.blur = true;
+  cam.effects.blurRadius = Animatable(0.01);
+  camera.items = {cam};
+  SceneItem star;
+  star.type = ItemType::Image;
+  star.src = "star.png";
+  star.durationUs = cam.durationUs;
+  star.transform.x = Animatable(0.25);
+  sticker.items = {star};
+  SceneItem text;
+  text.type = ItemType::Text;
+  text.text = caption;
+  text.durationUs = cam.durationUs;
+  words.items = {text};
+  s.tracks = {camera, sticker, words};
+  return s;
+}
+
+TEST(live_preview_draws_each_camera_frame_under_the_scene) {
+  fake::Platform platform;
+  LivePreview preview(platform);
+  CHECK(preview.attach(RenderTarget{}) == Result::Ok);
+  CHECK(preview.attach(RenderTarget{}) == Result::InvalidState);
+  std::string error;
+  CHECK(preview.setScene(cameraScene("Hi"), "nope", &error) == Result::InvalidArgument && error.find("nope") != std::string::npos);
+  CHECK(preview.setScene(cameraScene("Hi"), "camera") == Result::Ok);
+  CHECK(platform.display->composed.empty());  // no camera frame yet: nothing to draw
+
+  VideoFrame frame;
+  frame.ptsUs = 123456;
+  frame.image = std::make_shared<int>(7);
+  preview.present(frame);
+  CHECK_EQ(platform.display->composed.size(), size_t(1));
+  const ComposedFrame& f = platform.display->composed.back();
+  CHECK(f.width == 1080 && f.height == 1920 && f.ptsUs == 123456);
+  CHECK_EQ(f.layers.size(), size_t(3));
+  if (f.layers.size() == 3) {
+    CHECK(f.layers[0].kind == ComposedLayer::Kind::Video && f.layers[0].frame.image == frame.image);  // the camera, at the bottom
+    CHECK(f.layers[0].flipX && f.layers[0].fit == Fit::Cover && f.layers[0].effects.blur > 0.009f);
+    CHECK(f.layers[1].kind == ComposedLayer::Kind::Image && f.layers[1].frame.image && f.layers[1].x == 0.25f);
+    CHECK(f.layers[2].kind == ComposedLayer::Kind::Text && *f.layers[2].text == "Hi");
+  }
+
+  // A scene change redraws the last frame at once.
+  CHECK(preview.setScene(cameraScene("Yo"), "camera") == Result::Ok);
+  CHECK_EQ(platform.display->composed.size(), size_t(2));
+  CHECK(*platform.display->composed.back().layers[2].text == "Yo");
+  CHECK_EQ(preview.presented(), int64_t(2));
+
+  // Frames from the camera's thread while the owner changes the scene.
+  std::thread camera([&] {
+    for (int i = 0; i < 200; ++i) preview.present(frame);
+  });
+  for (int i = 0; i < 50; ++i) preview.setScene(cameraScene(i % 2 ? "A" : "B"), "camera");
+  camera.join();
+  CHECK_EQ(preview.presented(), int64_t(2 + 200 + 50));
 }
 
 TEST(player_composes_plugin_effects_and_edits_them_live) {

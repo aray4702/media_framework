@@ -22,6 +22,7 @@ add_library(mf_core STATIC
   core/src/json.cpp
   core/src/layout.cpp
   core/src/leading_clip_driver.cpp
+  core/src/live_preview.cpp
   core/src/master_clock.cpp
   core/src/metrics.cpp
   core/src/pipeline.cpp

@@ -23,6 +23,8 @@ enum class Result {
   AudioDeviceFailed,
   Unsupported,  // the platform has no implementation (e.g. no export sink)
   WriteFailed,  // export: encoding or writing the output file failed
+  PermissionDenied,  // the camera or microphone isn't allowed (System Settings > Privacy)
+  CaptureFailed,     // no camera, or it stopped
   // Adapter-to-core only; the Player never returns these.
   Again,         // try again later (input full / no output yet)
   Eos,           // end of track
