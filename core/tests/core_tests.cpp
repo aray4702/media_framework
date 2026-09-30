@@ -370,6 +370,37 @@ TEST(player_redraws_an_appearance_edit_without_reopening) {
   CHECK_EQ(h.platform.display->composed.size(), frames + 1);
 }
 
+// Scrubbing slowly right: the picture only moves toward the playhead. A scrub seek's shortcut
+// (the first frame decoded, usually the keyframe) isn't shown when it's farther from the target
+// than the frame already on screen: it would jump back to the keyframe, then forward again.
+TEST(player_slow_scrub_never_jumps_back_to_a_keyframe) {
+  fake::Harness h;  // 30 fps, a keyframe every second
+  h.open();
+  h.run(20);
+  h.player->seek(1800000);  // exact: frame 54
+  h.run(50);
+  CHECK_EQ(h.lastShown(), 1800000);
+  auto& s = *h.platform.scheduler;
+  int64_t previous = h.lastShown();
+  for (int64_t target = 1850000; target <= 1950000; target += 50000) {
+    size_t before = h.platform.display->shown.size();
+    h.player->seek(target);
+    s.pumpOnce(StageId::Source);  // starts this seek at the keyframe, 1 s
+    h.player->seek(target + 20000);  // a newer one is pending: a scrub
+    s.pumpOnce(StageId::Source);  // reads the keyframe
+    s.pumpOnce(StageId::VideoDecode);  // decodes it
+    s.pumpOnce(StageId::Composition);  // only the keyframe is ready
+    h.run(50);
+    for (size_t i = before; i < h.platform.display->shown.size(); ++i) {
+      int64_t shown = h.platform.display->shown[i];
+      if (shown < previous) std::fprintf(stderr, "  scrubbing right to %lld showed %lld after %lld\n", (long long)target, (long long)shown, (long long)previous);
+      CHECK(shown >= previous);
+      previous = shown;
+    }
+  }
+  CHECK(previous >= 1933333);  // the last scrub target's frame
+}
+
 TEST(player_scrub_honors_only_the_latest_seek) {
   fake::Harness h;
   h.open();
@@ -909,6 +940,36 @@ static Scene sceneFrom(const std::string& text) {
 // A document with one video track holding `items`.
 static std::string doc(const std::string& items, const std::string& output = R"({"width": 640, "height": 360, "fps": 30})") {
   return R"({"version": 1, "output": )" + output + R"(, "tracks": [{"kind": "video", "items": [)" + items + "]}]}";
+}
+
+// Scrubbing a scene with a video and something else visible (a caption): no frame goes out with
+// the video missing, even when composition runs before the video has decoded anything.
+TEST(player_scrub_never_shows_a_frame_without_its_video) {
+  fake::Harness h;
+  h.openScene(sceneFrom(R"({"version": 1, "output": {"width": 640, "height": 360, "fps": 30}, "tracks": [
+      {"kind": "video", "items": [{"type": "video", "src": "clip0", "start": 0, "duration": 2}]},
+      {"kind": "video", "items": [{"type": "text", "text": "Hi", "start": 0, "duration": 2}]}]})"));
+  h.run(30);
+  CHECK(h.player->state() == State::Ready);
+  size_t before = h.platform.display->composed.size();
+  auto& s = *h.platform.scheduler;
+  for (int64_t target : {500000, 1200000, 300000}) {
+    h.player->seek(target);
+    s.pumpOnce(StageId::Source);  // starts this seek
+    h.player->seek(target + 100000);  // a newer one is pending: a scrub
+    s.pumpOnce(StageId::Composition);  // before the decoder has produced a frame
+    h.run(5);
+  }
+  h.run(50);
+  const auto& composed = h.platform.display->composed;
+  CHECK(composed.size() > before);
+  for (size_t i = before; i < composed.size(); ++i) {
+    if (composed[i].eos) continue;
+    bool video = false;
+    for (const ComposedLayer& l : composed[i].layers) video |= l.kind == ComposedLayer::Kind::Video;
+    if (!video) std::fprintf(stderr, "  frame %zu at %lld has no video\n", i, (long long)composed[i].ptsUs);
+    CHECK(video);
+  }
 }
 
 TEST(scene_parses_the_example_document) {

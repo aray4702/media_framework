@@ -1,6 +1,7 @@
 #include "composition.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <deque>
 
 #include "drivers.h"
@@ -365,12 +366,28 @@ class CompositionStage : public Stage, private CompositionOutput {
         return Progress::idle();
       }
     }
+    // Scrubbing: the shortcut frame (the first decoded, usually the keyframe) only when it's
+    // closer to the target than the frame on screen. Otherwise, scrubbing slowly, the picture would
+    // jump back to the keyframe, then forward again: keep decoding toward the target instead,
+    // until a frame is closer or it's exact. The frames' arrival wakes us.
+    if (scrub && t && *t <= targetUs_ && !s.allExactAt(targetUs_)) {
+      int64_t shown = ctx_.shownPtsUs.load();
+      if (std::llabs(targetUs_ - *t) >= std::llabs(targetUs_ - shown)) return Progress::idle();
+    }
     if (t && *t > targetUs_) {
       s.advanceAll(*t);
       if (!s.allExactAt(*t) && !scrub) return Progress::idle();
     }
     int64_t at = targetUs_;
     if (t && (*t > targetUs_ || scrub)) at = *t;  // after the target, or a scrub keyframe
+    // A video visible at `at` with nothing decoded yet, which its lane will still deliver: wait for
+    // it, even when scrubbing, rather than show the frame without it (e.g. only a caption over
+    // the background). Its frame's arrival wakes us; a newer seek restarts. Not when its lane
+    // holds its next frame, after `at` (nothing at or before will come), or has moved past it.
+    for (int i : s.videoAt(at)) {
+      const std::optional<VideoFrame>& head = s.head(ctx_.layout.laneOf(i));
+      if (!s.frameOf(i) && s.mayDeliver(i) && !(head && head->item == i)) return Progress::idle();
+    }
     ComposedFrame out = s.composeAt(at);
     bool missingVideo = false;
     for (int i : s.videoAt(at)) missingVideo |= !s.frameOf(i);
