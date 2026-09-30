@@ -150,6 +150,7 @@ NSString* effectNames(const mf::SceneEffects& e) {
 
 - (instancetype)initWithFrame:(NSRect)frame document:(editor::Document*)doc selection:(editor::Selection*)selection {
   if ((self = [super initWithFrame:frame])) {
+    self.clipsToBounds = YES;  // rows can be wider than a narrow pane; don't draw into the preview
     _doc = doc;
     _sel = selection;
     _bindings = [NSMutableArray array];
@@ -212,14 +213,29 @@ NSString* effectNames(const mf::SceneEffects& e) {
   for (Binding* b in _bindings) b.sync();
 }
 
+- (void)setReadOnly:(BOOL)readOnly {
+  if (readOnly == _readOnly) return;
+  _readOnly = readOnly;
+  [self rebuild];
+}
+
+// Grays out every control under `view`.
+static void disableControls(NSView* view) {
+  if ([view isKindOfClass:NSControl.class] && ![view isKindOfClass:NSTextField.class]) ((NSControl*)view).enabled = NO;
+  if ([view isKindOfClass:NSTextField.class] && ((NSTextField*)view).editable) ((NSTextField*)view).enabled = NO;
+  for (NSView* v in view.subviews) disableControls(v);
+}
+
 - (void)rebuild {
   for (NSView* v in _stack.arrangedSubviews) [v removeFromSuperview];
   [_bindings removeAllObjects];
+  if (_readOnly && _readOnlyNote) [self note:_readOnlyNote];
   if (_effectsPage) [self buildEffects];
   else if (_sel->track < 0) [self buildProject];
   else if (_sel->item < 0) [self buildTrack:_sel->track];
   else if (_sel->transition) [self buildTransition:_sel->item track:_sel->track];
   else [self buildItem:_sel->item track:_sel->track];
+  if (_readOnly) disableControls(_stack);
   [self refresh];
 }
 
@@ -625,7 +641,7 @@ NSString* effectNames(const mf::SceneEffects& e) {
     [self note:@"Select a video, image, text or color item, or a video track, to add effects to it."];
     return;
   }
-  [self section:what];
+  [self section:_effectsTitle ?: what];
 
   // Add Effect: a pull-down of the effects not on yet (an effect goes on at most once, 8 in all).
   auto offered = std::make_shared<std::vector<EffectKind>>();

@@ -156,6 +156,7 @@ mf::SceneItem textItem(const std::string& text, const char* font, float size) {
 }  // namespace
 
 @implementation SidebarView {
+  SidebarTabs _tabs;
   Tab _tab;
   NSMutableArray<NSButton*>* _tabButtons;
   NSTextField* _title;
@@ -169,16 +170,38 @@ mf::SceneItem textItem(const std::string& text, const char* font, float size) {
   NSView* _panel;              // shown by showPanel, over the tabs' content
   NSString* _panelTitle;
   BOOL _collapsedUnderPanel;   // the pane was collapsed when the panel opened it
+  BOOL _openedInWindow;        // showTab once after attach; not on every reparent
 }
 
 - (instancetype)initWithFrame:(NSRect)frame {
+  return [self initWithFrame:frame tabs:SidebarTabsAll];
+}
+
+- (NSString*)titleOf:(Tab)t {
+  return t == kAudio && _musicMode ? @"Music" : kTabTitles[t];
+}
+
+- (void)setMusicMode:(BOOL)musicMode {
+  _musicMode = musicMode;
+  for (NSButton* b in _tabButtons) {
+    if (b.tag == kAudio) b.title = [self titleOf:kAudio];
+  }
+  [self showTab:_tab];
+}
+
+- (instancetype)initWithFrame:(NSRect)frame tabs:(SidebarTabs)tabs {
   if ((self = [super initWithFrame:frame])) {
+    _tabs = tabs;
     _tabButtons = [NSMutableArray array];
     _actions = [NSMutableArray array];
     for (int t = 0; t < kTabs; ++t) _files[t] = [NSMutableArray array];
 
     // The tab bar, down the left edge from the top.
+    int shown = 0;
+    _tab = kTabs;
     for (int t = 0; t < kTabs; ++t) {
+      if (!(tabs & (1u << t))) continue;
+      if (_tab == kTabs) _tab = Tab(t);  // the first one opens
       NSButton* b = [NSButton buttonWithTitle:kTabTitles[t]
                                         image:[NSImage imageWithSystemSymbolName:kTabSymbols[t] accessibilityDescription:kTabTitles[t]]
                                        target:self
@@ -190,7 +213,7 @@ mf::SceneItem textItem(const std::string& text, const char* font, float size) {
       b.symbolConfiguration = [NSImageSymbolConfiguration configurationWithPointSize:18 weight:NSFontWeightRegular];
       b.wantsLayer = YES;
       b.layer.cornerRadius = 8;
-      b.frame = NSMakeRect(6, frame.size.height - 10 - (t + 1) * 54, kTabBarWidth - 12, 50);
+      b.frame = NSMakeRect(6, frame.size.height - 10 - (++shown) * 54, kTabBarWidth - 12, 50);
       b.autoresizingMask = NSViewMinYMargin;
       [self addSubview:b];
       [_tabButtons addObject:b];
@@ -240,7 +263,7 @@ mf::SceneItem textItem(const std::string& text, const char* font, float size) {
       [_list.bottomAnchor constraintEqualToAnchor:content.bottomAnchor],
     ]];
     [self addSubview:scroll];
-    [self showTab:kVideo];
+    [self showTab:_tab == kTabs ? kVideo : _tab];
   }
   return self;
 }
@@ -255,22 +278,57 @@ mf::SceneItem textItem(const std::string& text, const char* font, float size) {
     [_panel removeFromSuperview];
     _panel = nil;
     _collapsedUnderPanel = NO;
-    return [self showTab:Tab(sender.tag)];
+    [self showTab:Tab(sender.tag)];
+    return [self notifyTabDelegate];
   }
   if (!_collapsed && sender.tag == _tab) return [self setCollapsed:YES];
   if (_collapsed) [self setCollapsed:NO];
   [self showTab:Tab(sender.tag)];
+  [self notifyTabDelegate];
 }
 
 - (void)toggleCollapsed:(id)sender {
   [self setCollapsed:!_collapsed];
 }
 
+// The title, scroll view and owner tabs follow the pane's size (also after an external frame change).
+- (void)layoutSidebarChrome {
+  if (!_scroll) return;
+  CGFloat x = kTabBarWidth + 1;
+  CGFloat w = std::max<CGFloat>(0, self.bounds.size.width - x);
+  CGFloat h = self.bounds.size.height;
+  _title.frame = NSMakeRect(x + 14, h - 34, std::max<CGFloat>(0, w - 28), 22);
+  NSRect scrollFrame = NSMakeRect(x, 0, w, std::max<CGFloat>(0, h - 42));
+  _scroll.frame = scrollFrame;
+  for (int t = 0; t < kTabs; ++t) {
+    if (_ownViews[t]) _ownViews[t].frame = scrollFrame;
+  }
+  if (_panel) _panel.frame = scrollFrame;
+}
+
+- (void)viewDidMoveToWindow {
+  [super viewDidMoveToWindow];
+  if (!self.window) {
+    _openedInWindow = NO;
+    return;
+  }
+  [self layoutSidebarChrome];
+  if (!_openedInWindow && !_collapsed && _tab < kTabs) {
+    _openedInWindow = YES;
+    [self showTab:_tab];
+  }
+}
+
+- (void)notifyTabDelegate {
+  if ([(id)self.delegate respondsToSelector:@selector(sidebarDidSelectTab:)]) [self.delegate sidebarDidSelectTab:_tab];
+}
+
 // A new width: the open tab's content is laid out again for it.
 - (void)setFrameSize:(NSSize)size {
-  BOOL wider = size.width != self.frame.size.width;
+  BOOL widthChanged = size.width != self.frame.size.width;
   [super setFrameSize:size];
-  if (wider && !_collapsed && _list) [self showTab:_tab];
+  [self layoutSidebarChrome];
+  if (widthChanged && !_collapsed && _list) [self showTab:_tab];
 }
 
 - (void)setCollapsed:(BOOL)collapsed {
@@ -333,6 +391,7 @@ mf::SceneItem textItem(const std::string& text, const char* font, float size) {
   }
   if (_collapsed) [self setCollapsed:NO];
   [self showTab:kEffects];
+  [self notifyTabDelegate];
 }
 
 - (void)setProjectView:(NSView*)view {
@@ -356,8 +415,15 @@ mf::SceneItem textItem(const std::string& text, const char* font, float size) {
 // under a panel.
 - (void)showContentOf:(Tab)tab {
   bool shown = !_collapsed && !_panel;
-  _scroll.hidden = !shown || _ownViews[tab];
-  for (int t = 0; t < kTabs; ++t) _ownViews[t].hidden = !shown || t != tab;
+  NSView* owned = _ownViews[tab];
+  _scroll.hidden = !shown || owned != nil;
+  for (int t = 0; t < kTabs; ++t) {
+    if (_ownViews[t]) _ownViews[t].hidden = !shown || t != tab;
+  }
+  if (shown) {
+    if (owned) [self addSubview:owned positioned:NSWindowAbove relativeTo:_scroll];
+    else [self addSubview:_scroll positioned:NSWindowAbove relativeTo:nil];
+  }
 }
 
 - (void)showTab:(Tab)tab {
@@ -367,7 +433,7 @@ mf::SceneItem textItem(const std::string& text, const char* font, float size) {
     b.layer.backgroundColor = on ? [NSColor.controlAccentColor colorWithAlphaComponent:0.18].CGColor : nil;
     b.contentTintColor = on ? NSColor.controlAccentColor : NSColor.secondaryLabelColor;
   }
-  _title.stringValue = _panel ? (_panelTitle ?: @"") : kTabTitles[tab];
+  _title.stringValue = _panel ? (_panelTitle ?: @"") : [self titleOf:tab];
   [self showContentOf:tab];
   _panel.hidden = _collapsed;
   for (NSView* v in _list.arrangedSubviews) [v removeFromSuperview];
@@ -480,14 +546,15 @@ mf::SceneItem textItem(const std::string& text, const char* font, float size) {
 - (void)buildFiles:(Tab)tab {
   static NSString* const kinds[kTabs] = {@"videos", @"images", nil, nil, nil, @"audio files", nil, nil, nil};
   __weak SidebarView* weak = self;
-  NSButton* import = [self button:[NSString stringWithFormat:@"Import %@…", tab == kAudio ? @"Audio" : kTabTitles[tab]]
+  if (tab == kVideo && [(id)self.delegate respondsToSelector:@selector(sidebarOpenCamera:)]) [self buildCameraRow];
+  NSButton* import = [self button:[NSString stringWithFormat:@"Import %@…", tab == kAudio ? (_musicMode ? @"Music" : @"Audio") : kTabTitles[tab]]
                             image:[NSImage imageWithSystemSymbolName:@"plus" accessibilityDescription:nil]
                               run:^{
                                 [weak import:tab];
                               }];
   import.controlSize = NSControlSizeLarge;
   [_list addArrangedSubview:import];
-  if (tab == kAudio) {  // a voice-over: recorded over the video, from the playhead
+  if (tab == kAudio && !_musicMode) {  // a voice-over: recorded over the video, from the playhead
     NSImage* symbol = [[NSImage imageWithSystemSymbolName:_recording ? @"stop.circle.fill" : @"mic.circle.fill" accessibilityDescription:nil]
         imageWithSymbolConfiguration:[NSImageSymbolConfiguration configurationWithHierarchicalColor:NSColor.systemRedColor]];
     NSButton* record = [self button:_recording ? @"Stop Recording" : @"Record Voice-over"
@@ -501,7 +568,9 @@ mf::SceneItem textItem(const std::string& text, const char* font, float size) {
                           : @"Plays the video from the playhead while you speak; the recording is added there, on an audio track."];
     [self heading:@"Audio files"];
   }
-  if (_files[tab].count == 0) {
+  if (tab == kAudio && _musicMode) {
+    [self hint:@"The music plays while you record, and carries on from where it stopped. Click a file to use it."];
+  } else if (_files[tab].count == 0) {
     [self hint:[NSString stringWithFormat:@"Imported %@ are listed here. Click one to add it at the playhead, or drag it to the "
                                           @"preview or the timeline.", kinds[tab]]];
   }
@@ -547,6 +616,51 @@ mf::SceneItem textItem(const std::string& text, const char* font, float size) {
     }
     [self grid:swatches size:44];
   }
+}
+
+// The camera recording's maximum lengths, by the menu's items.
+static const int64_t kCameraLengthsUs[] = {15000000, 30000000, 60000000, 180000000, 0};
+static NSString* const kCameraLengthKey = @"CameraMaxLength";
+
++ (int64_t)cameraMaxDurationUs {
+  NSInteger i = [NSUserDefaults.standardUserDefaults objectForKey:kCameraLengthKey] ? [NSUserDefaults.standardUserDefaults integerForKey:kCameraLengthKey] : 2;
+  return kCameraLengthsUs[std::clamp<NSInteger>(i, 0, 4)];  // 1 min unless chosen
+}
+
+// The Videos tab's Camera button, and the recording's maximum length next to it.
+- (void)buildCameraRow {
+  __weak SidebarView* weak = self;
+  NSButton* camera = [self button:@"Camera…"
+                            image:[NSImage imageWithSystemSymbolName:@"video.fill" accessibilityDescription:nil]
+                              run:^{
+                                [weak.delegate sidebarOpenCamera:SidebarView.cameraMaxDurationUs];
+                              }];
+  camera.controlSize = NSControlSizeLarge;
+  camera.toolTip = @"Record from the camera, in segments, with stickers, text, effects and music";
+  NSPopUpButton* length = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO];
+  [length addItemsWithTitles:@[ @"15 s", @"30 s", @"1 min", @"3 min", @"Unlimited" ]];
+  int64_t chosen = SidebarView.cameraMaxDurationUs;
+  for (int i = 0; i < 5; ++i) {
+    if (kCameraLengthsUs[i] == chosen) [length selectItemAtIndex:i];
+  }
+  length.toolTip = @"The longest the recording can be";
+  ClickAction* pick = [ClickAction new];
+  __weak NSPopUpButton* weakLength = length;
+  pick.run = ^{
+    [NSUserDefaults.standardUserDefaults setInteger:weakLength.indexOfSelectedItem forKey:kCameraLengthKey];
+  };
+  length.target = pick;
+  length.action = @selector(fire:);
+  [_actions addObject:pick];
+  NSTextField* label = [NSTextField labelWithString:@"Max"];
+  label.textColor = NSColor.secondaryLabelColor;
+  NSStackView* row = [NSStackView stackViewWithViews:@[ camera, label, length ]];
+  row.spacing = 8;
+  [_list addArrangedSubview:row];
+}
+
+- (NSArray<NSString*>*)audioFiles {
+  return [_files[kAudio] copy];
 }
 
 - (void)import:(Tab)tab {

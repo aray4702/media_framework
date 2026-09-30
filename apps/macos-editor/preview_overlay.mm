@@ -506,7 +506,7 @@ void setConstant(mf::Animatable& a, double v) {
     editor::Selection sel;
     double k = [self viewScale];
     NSPoint origin = [self toView:NSZeroPoint], c = NSMakePoint((p.x - origin.x) / k, (p.y - origin.y) / k);
-    for (int t = _doc->tracks() - 1; t >= 0 && sel.track < 0; --t) {
+    for (int t = _doc->tracks() - 1; t >= _firstSelectableTrack && sel.track < 0; --t) {
       for (int i = int(_doc->track(t).items.size()) - 1; i >= 0; --i) {
         Box b;
         if ([self visible:t item:i] && [self box:&b ofTrack:t item:i] && b.contains(c)) {

@@ -24,44 +24,12 @@
 #include "mf/macos.h"
 #include "mf/player.h"
 #include "preview_overlay.h"
+#include "preview_view.h"
+#include "camera_window.h"
 #include "sidebar_view.h"
 #include "timeline_view.h"
 #include "voice_recorder.h"
 #include "waveform.h"
-
-// The player draws into its CAMetalLayer. Resized, the last frame keeps its aspect ratio (never
-// stretched) until `resized` has it drawn again at the new size.
-@interface PreviewView : NSView
-@property(nonatomic, copy) void (^resized)(void);
-@end
-
-@implementation PreviewView
-- (instancetype)initWithFrame:(NSRect)frame {
-  if ((self = [super initWithFrame:frame])) {
-    self.wantsLayer = YES;
-    self.layerContentsPlacement = NSViewLayerContentsPlacementScaleProportionallyToFit;  // AppKit sets the layer's gravity from it
-  }
-  return self;
-}
-- (CALayer*)makeBackingLayer {
-  return [CAMetalLayer layer];
-}
-- (void)updateDrawableSize {
-  CGFloat scale = self.window ? self.window.backingScaleFactor : 1;
-  CAMetalLayer* layer = (CAMetalLayer*)self.layer;
-  layer.contentsScale = scale;
-  layer.drawableSize = CGSizeMake(self.bounds.size.width * scale, self.bounds.size.height * scale);
-}
-- (void)setFrameSize:(NSSize)size {
-  [super setFrameSize:size];
-  [self updateDrawableSize];
-  if (self.resized) self.resized();
-}
-- (void)viewDidChangeBackingProperties {
-  [super viewDidChangeBackingProperties];
-  [self updateDrawableSize];
-}
-@end
 
 // A strip over the left pane's right edge: dragging it resizes the pane.
 @interface PaneHandle : NSView
@@ -85,7 +53,7 @@
 @end
 
 @interface Editor : NSObject <NSApplicationDelegate, TimelineDelegate, InspectorDelegate, SidebarDelegate,
-                                PreviewOverlayDelegate>
+                                PreviewOverlayDelegate, CameraWindowDelegate>
 - (void)player:(int)generation state:(mf::State)state;
 - (void)player:(int)generation failed:(NSString*)reason;
 - (void)player:(int)generation seekCompleted:(int64_t)ptsUs;
@@ -152,6 +120,7 @@ static NSString* timeString(int64_t us) {
 
 @implementation Editor {
   NSArray<NSString*>* _initialFiles;
+  CameraWindowController* _cameraWindow;  // open from the Videos tab's Camera button
   editor::Document _doc;
   editor::Selection _sel;
 
@@ -272,6 +241,7 @@ static NSString* timeString(int64_t us) {
                                             defer:NO];
   [self showFileName];
   _window.minSize = NSMakeSize(900, 600);
+  _window.releasedWhenClosed = NO;  // ARC owns it: released when closed, it was freed under _window (a crash on quit)
   NSView* content = _window.contentView;
   NSSize size = content.bounds.size;
 
@@ -738,6 +708,99 @@ static NSString* timeString(int64_t us) {
   _overlay.provisional = YES;
   [self reloadNow];
   return _doc.item(t, k).endUs();
+}
+
+// --- Camera ---------------------------------------------------------------------------------
+
+// Where camera recordings go: a folder per recording, under Recordings next to the project when it's
+// saved, else in ~/Movies/Media Editor.
+- (NSString*)recordingsFolder {
+  NSURL* folder = _fileURL ? _fileURL.URLByDeletingLastPathComponent
+                           : [[NSFileManager.defaultManager URLsForDirectory:NSMoviesDirectory inDomains:NSUserDomainMask].firstObject
+                                 URLByAppendingPathComponent:@"Media Editor"];
+  return [folder URLByAppendingPathComponent:@"Recordings"].path;
+}
+
+// A recording left unfinished (the editor quit while its window was open): its folder, or nil.
+- (NSString*)unfinishedRecording {
+  NSString* root = [self recordingsFolder];
+  for (NSString* name in [[NSFileManager.defaultManager contentsOfDirectoryAtPath:root error:nil] sortedArrayUsingSelector:@selector(compare:)]) {
+    NSString* folder = [root stringByAppendingPathComponent:name];
+    if ([NSFileManager.defaultManager fileExistsAtPath:[folder stringByAppendingPathComponent:CameraWindowController.journalName]]) return folder;
+  }
+  return nil;
+}
+
+- (void)sidebarOpenCamera:(int64_t)maxDurationUs {
+  if (_cameraWindow) {
+    [_cameraWindow setMaxDuration:maxDurationUs];
+    return [_cameraWindow showWindow:nil];
+  }
+  NSString* unfinished = [self unfinishedRecording];
+  if (unfinished) {
+    NSAlert* alert = [NSAlert new];
+    alert.messageText = @"Recover the unfinished camera recording?";
+    alert.informativeText = [NSString stringWithFormat:@"“%@” wasn't added to a project. Discarding deletes its segments.", unfinished.lastPathComponent];
+    [alert addButtonWithTitle:@"Recover"];
+    [alert addButtonWithTitle:@"Discard"];
+    [alert addButtonWithTitle:@"Cancel"];
+    NSModalResponse response = [alert runModal];
+    if (response == NSAlertThirdButtonReturn) return;
+    if (response == NSAlertFirstButtonReturn) {
+      NSString* text = [NSString stringWithContentsOfFile:[unfinished stringByAppendingPathComponent:CameraWindowController.journalName]
+                                                 encoding:NSUTF8StringEncoding
+                                                    error:nil];
+      mf::Scene journal;
+      std::string error;
+      if (text && mf::parseScene(text.UTF8String, [](const std::string& src) { return mf::macos::sourceFromPath(src); }, &journal, &error) ==
+                      mf::Result::Ok) {
+        return [self openCamera:maxDurationUs folder:unfinished journal:&journal];
+      }
+      [self showStatus:[NSString stringWithFormat:@"The recording couldn't be recovered: %s", error.c_str()] error:YES];
+    }
+    [NSFileManager.defaultManager removeItemAtPath:unfinished error:nil];  // discarded (or unreadable)
+  }
+  NSDateFormatter* format = [NSDateFormatter new];
+  format.dateFormat = @"yyyy-MM-dd 'at' HH.mm.ss";
+  NSString* folder = [[self recordingsFolder] stringByAppendingPathComponent:[@"Recording " stringByAppendingString:[format stringFromDate:NSDate.date]]];
+  [self openCamera:maxDurationUs folder:folder journal:nullptr];
+}
+
+- (void)openCamera:(int64_t)maxDurationUs folder:(NSString*)folder journal:(const mf::Scene*)journal {
+  _cameraWindow = [[CameraWindowController alloc] initWithPlatform:_platform.get()
+                                                            output:_doc.scene.output
+                                                       maxDuration:maxDurationUs
+                                                            folder:folder
+                                                           journal:journal
+                                                        audioFiles:_sidebar.audioFiles];
+  _cameraWindow.delegate = self;
+  [_cameraWindow showWindow:nil];
+}
+
+// Done in the camera window: the recording goes in at the playhead (see CaptureSession::insertInto).
+- (BOOL)cameraWindowAdd:(const editor::CaptureSession&)session {
+  std::string error;
+  int t = session.insertInto(_doc, _playheadUs, [](const std::string& src) { return mf::macos::sourceFromPath(src); }, &error);
+  if (t < 0) {
+    NSAlert* alert = [NSAlert new];
+    alert.messageText = @"The recording can't be added.";
+    alert.informativeText = [NSString stringWithUTF8String:error.c_str()];
+    [alert runModal];
+    return NO;
+  }
+  for (const auto& s : session.segments()) [_sidebar rememberFile:[NSString stringWithUTF8String:s.file.c_str()]];
+  if (session.hasMusic()) [_sidebar rememberFile:[NSString stringWithUTF8String:session.musicSrc().c_str()]];
+  _sel = {t, 0};
+  [self structureChanged];
+  _window.documentEdited = YES;
+  [self showStatus:[NSString stringWithFormat:@"Recording added: %zu segment%s, %.1f s", session.segments().size(),
+                                              session.segments().size() == 1 ? "" : "s", session.totalUs() / 1e6]
+             error:NO];
+  return YES;
+}
+
+- (void)cameraWindowClosed {
+  _cameraWindow = nil;
 }
 
 - (void)sidebarAddFile:(NSString*)path {

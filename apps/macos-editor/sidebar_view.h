@@ -8,11 +8,29 @@
 // Symbols in color, rendered once into PNG files and added as image items; emojis and text
 // presets are added as text items. A click adds the item at the playhead; a drag carries it to
 // the preview or the timeline, which ask draggedPayload for it. Effects shows the selection's
-// effects, and Project the project's settings (both views from the owner).
+// effects, and Project the project's settings (both views from the owner). Videos also has a Camera
+// button, and next to it the camera recording's maximum length (kept across launches).
+//
+// The camera window has one too, with only some tabs (initWithFrame:tabs:) and the Audio tab as
+// Music (musicMode): a click picks the music instead of adding it, and there's no voice-over.
 
 #import <AppKit/AppKit.h>
 
 #include "mf/scene.h"
+
+// Which tabs a pane has (initWithFrame:tabs:), in this order.
+typedef NS_OPTIONS(NSUInteger, SidebarTabs) {
+  SidebarTabVideo = 1 << 0,
+  SidebarTabImage = 1 << 1,
+  SidebarTabStickers = 1 << 2,
+  SidebarTabEmojis = 1 << 3,
+  SidebarTabText = 1 << 4,
+  SidebarTabAudio = 1 << 5,
+  SidebarTabEffects = 1 << 6,
+  SidebarTabProject = 1 << 7,
+  SidebarTabExport = 1 << 8,
+  SidebarTabsAll = (1 << 9) - 1,
+};
 
 // The pasteboard type of a drag out of the pane; what it carries is draggedPayload.
 extern NSPasteboardType const SidebarDragType;
@@ -33,12 +51,19 @@ struct SidebarPayload {
 - (void)sidebarAddItem:(const mf::SceneItem&)item;
 - (void)sidebarCollapsedChanged;  // the pane's width changes: lay out what's beside it
 - (void)sidebarRecordVoiceOver;   // the Audio tab's record button: start, or stop, recording
+@optional
+- (void)sidebarOpenCamera:(int64_t)maxDurationUs;  // the Videos tab's Camera button, with the length chosen (0: unlimited)
+- (void)sidebarDidSelectTab:(NSInteger)tab;  // a tab was opened (e.g. to restack views beside the preview)
 @end
 
 @interface SidebarView : NSView
 @property(nonatomic, weak) id<SidebarDelegate> delegate;
 @property(nonatomic) BOOL collapsed;  // setting it tells the delegate
 @property(nonatomic) BOOL recording;  // a voice-over is being recorded: the record button stops it
+@property(nonatomic) BOOL musicMode;  // the Audio tab is Music (see the top)
+- (instancetype)initWithFrame:(NSRect)frame tabs:(SidebarTabs)tabs;  // initWithFrame: has them all
+- (NSArray<NSString*>*)audioFiles;  // listed under Audio
++ (int64_t)cameraMaxDurationUs;     // the length chosen next to the Camera button (0: unlimited)
 + (CGFloat)collapsedWidth;  // the tab bar alone
 - (void)rememberFile:(NSString*)path;  // lists it under its tab (Video, Image or Audio)
 - (void)setEffectsView:(NSView*)view;  // what the Effects tab shows

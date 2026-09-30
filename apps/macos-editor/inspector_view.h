@@ -27,6 +27,10 @@
 // Why a video item's own audio can't play ("No audio track"), or nil when it can.
 @property(nonatomic, copy) NSString* (^audioProblem)(const mf::SceneItem& item);
 @property(nonatomic) BOOL effectsPage;  // the Effects tab; setting it rebuilds
+@property(nonatomic, copy) NSString* effectsTitle;  // the effects page's heading; nil: what's selected
+// Every control grayed out, under `readOnlyNote` (e.g. "Stop recording to change effects").
+@property(nonatomic) BOOL readOnly;
+@property(nonatomic, copy) NSString* readOnlyNote;
 - (instancetype)initWithFrame:(NSRect)frame document:(editor::Document*)doc selection:(editor::Selection*)selection;
 - (void)rebuild;  // the selection changed
 - (void)refresh;  // values changed elsewhere (e.g. an item dragged in the timeline)

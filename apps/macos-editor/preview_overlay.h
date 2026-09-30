@@ -28,6 +28,8 @@
 @property(nonatomic) BOOL provisional;
 // The pixel size of a video or image item's source; zero when unknown.
 @property(nonatomic, copy) NSSize (^naturalSize)(const mf::SceneItem& item);
+// Tracks below this one can't be selected by a click (the camera window's camera). 0: all can.
+@property(nonatomic) int firstSelectableTrack;
 - (instancetype)initWithFrame:(NSRect)frame document:(editor::Document*)doc selection:(editor::Selection*)selection;
 - (void)stopEditing;  // ends a text edit, keeping what was typed (e.g. the selection changed)
 @end
