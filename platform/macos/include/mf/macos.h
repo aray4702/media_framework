@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -32,6 +33,16 @@ std::vector<std::string> loadEffectPlugins(std::vector<std::string>* errors = nu
 
 int64_t hostNowNs();  // mach_absolute_time in ns: the base CoreAudio and Core Animation use
 
+// A frame's pixel size (a camera frame's, to record it at its own size). False without a picture.
+bool frameSize(const VideoFrame&, int* width, int* height);
+
+// Camera access (and the microphone's, with `microphone`). ICamera::start needs it granted:
+// ask first (macOS shows its prompt once; the answer is kept in System Settings > Privacy).
+enum class CameraAccess { Granted, NotAsked, Denied };
+CameraAccess cameraAccess(bool microphone);
+// Asks for what isn't granted yet. `done` runs on any thread.
+void requestCameraAccess(bool microphone, std::function<void(bool granted)> done);
+
 // Individual adapters (the platform factory uses these; exposed for adapter tests).
 std::unique_ptr<IDemuxer> createDemuxer();
 std::unique_ptr<IVideoDecoder> createVideoDecoder();
@@ -40,5 +51,6 @@ std::unique_ptr<ISpeaker> createSpeaker();
 std::unique_ptr<IDisplay> createDisplay();
 std::unique_ptr<IExportSink> createExportSink();
 std::unique_ptr<IImageLoader> createImageLoader();
+std::unique_ptr<ICamera> createCamera();
 
 }  // namespace mf::macos

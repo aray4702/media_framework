@@ -7,6 +7,7 @@
 #import <Metal/Metal.h>
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -16,6 +17,7 @@
 #include "../src/metal_compositor.h"
 #include "mf/effects.h"
 #include "mf/macos.h"
+#include "mf/segment_recorder.h"
 
 using namespace mf;
 
@@ -324,11 +326,92 @@ static void pluginTests() {
   CHECK(near(render(device, g, {32})[0], Rgb{blue.r, blue.g, blue.b}));
 }
 
+// The camera: devices listed; frames streamed only when access was granted before (the test never
+// asks, so it never shows the system prompt), NV12 on the host clock, and none after stop().
+static void cameraTests() {
+  auto camera = macos::createCamera();
+  std::vector<CameraDevice> devices = camera->devices();
+  for (const CameraDevice& d : devices) std::fprintf(stderr, "camera: %s%s\n", d.name.c_str(), d.front ? " (front)" : "");
+  for (const CameraDevice& d : devices) CHECK(!d.id.empty() && !d.name.empty());
+  if (devices.empty()) return (void)std::fprintf(stderr, "camera: none, skipped\n");
+  if (macos::cameraAccess(false) != macos::CameraAccess::Granted) {
+    CHECK(camera->start("", [](const VideoFrame&) {}, nullptr) == Result::PermissionDenied);
+    return (void)std::fprintf(stderr, "camera: access not granted, streaming skipped\n");
+  }
+  std::atomic<int> frames{0}, nv12{0};
+  std::atomic<int64_t> lastPts{0};
+  CHECK(camera->start(devices[0].id,
+                      [&](const VideoFrame& f) {
+                        auto pixels = static_cast<CVPixelBufferRef>(f.image.get());
+                        if (pixels && CVPixelBufferGetPixelFormatType(pixels) == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange) ++nv12;
+                        lastPts = f.ptsUs;
+                        ++frames;
+                      },
+                      nullptr) == Result::Ok);
+  std::this_thread::sleep_for(std::chrono::milliseconds(2500));  // the camera takes a moment to start
+  camera->stop();
+  int count = frames;
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  std::fprintf(stderr, "camera: %d frames in 2.5 s\n", count);
+  CHECK(count >= 10);
+  CHECK(nv12 == count);
+  CHECK(std::llabs(macos::hostNowNs() / 1000 - lastPts) < 1000000);  // on the host clock
+  CHECK(frames == count);  // none after stop()
+}
+
+// A segment recorded into a real file: 30 synthetic frames (320 × 240) with the microphone, read
+// back: about a second long, at the frame size, with audio.
+static void segmentTests() {
+  NSString* path = [NSTemporaryDirectory() stringByAppendingPathComponent:@"mf_segment_test.mp4"];
+  auto platform = macos::createPlatform();
+  SegmentRecorder rec(*platform);
+  CHECK(rec.start(macos::exportTargetFromPath(path.UTF8String), 320, 240, 30, 48000, 1) == Result::Ok);
+  NSDictionary* attrs = @{(id)kCVPixelBufferIOSurfacePropertiesKey : @{}, (id)kCVPixelBufferMetalCompatibilityKey : @YES};
+  CVPixelBufferRef pixels = nullptr;
+  CVPixelBufferCreate(nullptr, 320, 240, kCVPixelFormatType_32BGRA, (__bridge CFDictionaryRef)attrs, &pixels);
+  CHECK(pixels != nullptr);
+  if (!pixels) return;
+  VideoFrame f;
+  f.image = std::shared_ptr<void>(pixels, [](void* p) { CVPixelBufferRelease(static_cast<CVPixelBufferRef>(p)); });
+  int w = 0, h = 0;
+  CHECK(macos::frameSize(f, &w, &h) && w == 320 && h == 240);
+  std::vector<int16_t> pcm(1600, 1000);  // 1/30 s at 48 kHz
+  int64_t t0 = macos::hostNowNs() / 1000;
+  for (int i = 0; i < 30; ++i) {  // as a camera delivers: a frame and its audio every 1/30 s
+    f.ptsUs = t0 + i * 33333;
+    rec.video(f);
+    rec.audio(pcm.data(), 1600, f.ptsUs * 1000);
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  dispatch_semaphore_t done = dispatch_semaphore_create(0);
+  Result result = Result::Again;
+  int64_t length = 0;
+  rec.stop([&](Result r, int64_t us) {
+    result = r;
+    length = us;
+    dispatch_semaphore_signal(done);
+  });
+  CHECK(dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC)) == 0);
+  std::fprintf(stderr, "segment: %s, %.3f s, %d frames dropped\n", toString(result), length / 1e6, rec.droppedFrames());
+  CHECK(result == Result::Ok && rec.droppedFrames() == 0 && length == 30 * 33333);
+  auto demuxer = macos::createDemuxer();
+  MediaInfo info;
+  CHECK(demuxer->open(macos::sourceFromPath(path.UTF8String), &info) == Result::Ok);
+  std::fprintf(stderr, "segment file: %dx%d, %.3f s, audio %s\n", info.video.width, info.video.height, info.durationUs / 1e6,
+               info.audio ? "yes" : "no");
+  CHECK(info.video.width == 320 && info.video.height == 240);
+  CHECK(std::llabs(info.durationUs - 1000000) < 50000);
+  CHECK(info.audio && info.audio->supported);
+  [NSFileManager.defaultManager removeItemAtPath:path error:nil];
+}
+
 int main(int argc, char** argv) {
   compositorTests();
   framingTests();
   flipTests();
   pluginTests();
+  cameraTests();
+  segmentTests();
   if (argc < 2) {
     std::fprintf(stderr, "usage: %s clip.mp4|audio.m4a\n", argv[0]);
     return 2;

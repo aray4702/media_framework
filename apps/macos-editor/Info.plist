@@ -1,7 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!-- Embedded in the mf_editor executable (it has no app bundle): macOS asks for the microphone
-     with this description when a voice-over is first recorded. -->
+     with this description when a voice-over is first recorded, and for the camera when the
+     camera window first opens. -->
 <plist version="1.0">
 <dict>
   <key>CFBundleIdentifier</key>
@@ -9,6 +10,8 @@
   <key>CFBundleName</key>
   <string>Media Editor</string>
   <key>NSMicrophoneUsageDescription</key>
-  <string>Media Editor records your voice-overs from the microphone.</string>
+  <string>Media Editor records your voice-overs, and your voice with the camera, from the microphone.</string>
+  <key>NSCameraUsageDescription</key>
+  <string>Media Editor shows and records the camera in its camera window.</string>
 </dict>
 </plist>

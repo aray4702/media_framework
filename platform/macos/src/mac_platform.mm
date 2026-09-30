@@ -1,3 +1,4 @@
+#import <CoreVideo/CoreVideo.h>
 #import <Foundation/Foundation.h>
 
 #include <pthread.h>
@@ -22,6 +23,7 @@ class MacPlatform : public PlatformFactory {
   std::unique_ptr<IDisplay> createDisplay() override { return macos::createDisplay(); }
   std::unique_ptr<IExportSink> createExportSink() override { return macos::createExportSink(); }
   std::unique_ptr<IImageLoader> createImageLoader() override { return macos::createImageLoader(); }
+  std::unique_ptr<ICamera> createCamera() override { return macos::createCamera(); }
   std::unique_ptr<IScheduler> createScheduler() override {
     return std::make_unique<ThreadScheduler>(clock_, [](StageId id) {
       static const char* names[] = {"mf.source", "mf.video-decode", "mf.composition", "mf.video-render", "mf.audio"};
@@ -41,6 +43,14 @@ class MacPlatform : public PlatformFactory {
 int64_t hostNowNs() { return static_cast<int64_t>(clock_gettime_nsec_np(CLOCK_UPTIME_RAW)); }
 
 std::unique_ptr<PlatformFactory> createPlatform() { return std::make_unique<MacPlatform>(); }
+
+bool frameSize(const VideoFrame& f, int* width, int* height) {
+  auto pixels = static_cast<CVPixelBufferRef>(f.image.get());
+  if (!pixels) return false;
+  *width = int(CVPixelBufferGetWidth(pixels));
+  *height = int(CVPixelBufferGetHeight(pixels));
+  return true;
+}
 
 MediaSource sourceFromPath(const std::string& path) {
   NSURL* url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:path.c_str()]];

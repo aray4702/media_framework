@@ -28,6 +28,7 @@ add_library(mf_core STATIC
   core/src/pipeline.cpp
   core/src/player.cpp
   core/src/scene.cpp
+  core/src/segment_recorder.cpp
   core/src/thread_scheduler.cpp
   core/src/types.cpp
   core/src/vsync_driver.cpp)

@@ -1,6 +1,7 @@
 add_library(mf_macos STATIC
   src/at_audio_decoder.cpp
   src/au_speaker.cpp
+  src/av_camera.mm
   src/avf_demuxer.mm
   src/avf_export_sink.mm
   src/effect_plugins.mm

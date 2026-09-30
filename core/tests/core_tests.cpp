@@ -10,6 +10,7 @@
 #include "../src/layout.h"
 #include "mf/effects.h"
 #include "mf/live_preview.h"
+#include "mf/segment_recorder.h"
 #include "fakes.h"
 #include "test.h"
 
@@ -1313,6 +1314,69 @@ TEST(live_preview_draws_each_camera_frame_under_the_scene) {
   for (int i = 0; i < 50; ++i) preview.setScene(cameraScene(i % 2 ? "A" : "B"), "camera");
   camera.join();
   CHECK_EQ(preview.presented(), int64_t(2 + 200 + 50));
+}
+
+// --- SegmentRecorder (a camera recording's segment) ----------------------------------------------
+
+TEST(segment_recorder_times_frames_and_audio_from_the_first_frame) {
+  fake::Platform platform;
+  SegmentRecorder rec(platform);
+  CHECK(rec.start(ExportTarget{}, 1921, 1080, 30, 48000, 1) == Result::Ok);  // odd: made even
+  CHECK(rec.start(ExportTarget{}, 1920, 1080, 30, 48000, 1) == Result::InvalidState);
+  fake::ExportSink& sink = *platform.exportSink;
+  CHECK(sink.settings.width == 1920 && sink.settings.height == 1080 && sink.settings.fps == 30 && sink.channels == 1);
+
+  std::vector<int16_t> pcm(1024);
+  for (int i = 0; i < 1024; ++i) pcm[i] = int16_t(i);
+  const int64_t t0 = 10000000;  // capture times on the host clock, in µs
+  rec.audio(pcm.data(), 1024, (t0 - 50000) * 1000);  // before the first frame: dropped
+  CHECK(sink.audioFrames == 0);
+  VideoFrame f;
+  f.image = std::make_shared<int>(1);
+  for (int i = 0; i < 30; ++i) {
+    f.ptsUs = t0 + i * 33333;
+    rec.video(f);
+    if (i == 10) {
+      rec.video(f);  // the same time again: ignored
+      // Starts 10 ms before the first frame: its first 480 samples are cut, the rest at 0.
+      rec.audio(pcm.data(), 1024, (t0 - 10000) * 1000);
+      rec.audio(pcm.data(), 1024, (t0 + 11400) * 1000);  // then contiguous, whatever its time says
+    }
+  }
+  CHECK_EQ(sink.video.size(), size_t(30));
+  CHECK(sink.video[0].ptsUs == 0 && sink.video[29].ptsUs == 29 * 33333);
+  CHECK(sink.video[0].layers.size() == 1 && sink.video[0].layers[0].fit == Fit::Fill && sink.video[0].width == 1920);
+  CHECK(sink.audioFrames == 544 + 1024 && sink.contiguous && sink.samples[0] == 480);
+  CHECK_EQ(rec.durationUs(), int64_t(30 * 33333));
+
+  Result result = Result::Again;
+  int64_t length = 0;
+  rec.stop([&](Result r, int64_t us) {
+    result = r;
+    length = us;
+    CHECK(!rec.recording());  // a callback may call back: no lock held
+  });
+  CHECK(result == Result::Ok && length == 30 * 33333 && sink.finished);
+  rec.video(f);  // after stop: nothing more
+  CHECK_EQ(sink.video.size(), size_t(30));
+
+  // The next segment, at once; the encoder busy for every third frame: those are dropped.
+  platform.sinkBusyEvery = 3;
+  CHECK(rec.start(ExportTarget{}, 1280, 720, 30, 0, 0) == Result::Ok);
+  for (int i = 0; i < 30; ++i) {
+    f.ptsUs = 50000000 + i * 33333;
+    rec.video(f);
+  }
+  CHECK(platform.exportSink->video.size() == 20 && rec.droppedFrames() == 10 && platform.exportSink->channels == 0);
+  rec.stop([&](Result r, int64_t) { result = r; });
+  CHECK(result == Result::Ok);
+
+  // Stopped before any frame: no file.
+  CHECK(rec.start(ExportTarget{}, 1280, 720, 30, 0, 0) == Result::Ok);
+  rec.stop([&](Result r, int64_t) { result = r; });
+  CHECK(result == Result::WriteFailed);
+  rec.stop([&](Result r, int64_t) { result = r; });
+  CHECK(result == Result::InvalidState);
 }
 
 TEST(player_composes_plugin_effects_and_edits_them_live) {
