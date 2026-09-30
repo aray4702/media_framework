@@ -2,6 +2,7 @@
 
 #import <AVFoundation/AVFoundation.h>
 #import <ImageIO/ImageIO.h>
+#import <QuartzCore/QuartzCore.h>
 
 #include <algorithm>
 #include <atomic>
@@ -18,6 +19,12 @@
 namespace {
 constexpr CGFloat kPaneWidth = 380, kBarHeight = 112;  // same width as the editor sidebar (main.mm kSidebarWidth)
 constexpr int kFps = 30;
+
+dispatch_queue_t cameraRecordQueue() {
+  static dispatch_queue_t q =
+      dispatch_queue_create("mf.camera.record", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, 0));
+  return q;
+}
 constexpr int kMicRate = 48000, kMicChannels = 1;  // what AvCamera delivers
 const char* const kCameraItem = "camera";
 
@@ -133,6 +140,7 @@ NSString* effectList(const mf::SceneEffects& e) {
   BOOL _saving, _finished, _cameraRunning, _previewAttached, _updatingZOrder;
   AVAudioPlayer* _music;
   NSTimer* _timer;
+  CFTimeInterval _recordStartTime;  // CACurrentMediaTime when the segment started; 0 when not recording
 
   SidebarView* _pane;
   NSBox* _sideLine;
@@ -172,6 +180,7 @@ NSString* effectList(const mf::SceneEffects& e) {
   _recorder = std::make_unique<mf::SegmentRecorder>(*platform);
   _frameWidth = _frameHeight = 0;
   _firstFrame = false;
+  _recordStartTime = 0;
   _devices = _camera ? _camera->devices() : std::vector<mf::CameraDevice>{};
   bool front = !_devices.empty() && _devices[0].front;
   _session = std::make_unique<editor::CaptureSession>(output, maxDurationUs, front);
@@ -454,7 +463,10 @@ NSString* effectList(const mf::SceneEffects& e) {
                                     *height = h;
                                   }
                                   preview->present(f);
-                                  recorder->video(f);
+                                  mf::VideoFrame frame = f;
+                                  dispatch_async(cameraRecordQueue(), ^{
+                                    recorder->video(frame);
+                                  });
                                   if (!first->exchange(true)) {
                                     dispatch_async(dispatch_get_main_queue(), ^{
                                       [weak showMessage:nil settings:NO];
@@ -659,6 +671,7 @@ NSString* effectList(const mf::SceneEffects& e) {
   }
   ++_nextSegment;
   _recordingFile = file;
+  _recordStartTime = CACurrentMediaTime();
   if (_music) {
     _music.currentTime = _session->musicPositionUs() / 1e6;
     [_music play];
@@ -682,6 +695,7 @@ NSString* effectList(const mf::SceneEffects& e) {
 
 - (void)segment:(NSString*)file savedWith:(mf::Result)r duration:(int64_t)durationUs {
   _saving = NO;
+  _recordStartTime = 0;
   if (r != mf::Result::Ok) {
     _session->cancelSegment();
     [NSFileManager.defaultManager removeItemAtPath:file error:nil];
@@ -713,7 +727,11 @@ NSString* effectList(const mf::SceneEffects& e) {
 }
 
 - (void)tick {
-  int64_t recording = _session->recording() ? std::max<int64_t>(_recorder->durationUs(), 1) : 0;
+  // Wall clock while recording: frame timestamps jump when the camera burps frames after a stall.
+  int64_t recording = 0;
+  if (_session->recording() && !_saving && _recordStartTime > 0) {
+    recording = std::max<int64_t>(int64_t((CACurrentMediaTime() - _recordStartTime) * 1e6), 1);
+  }
   if (_session->recording() && !_saving && _session->maxDurationUs() != editor::CaptureSession::kUnlimited &&
       _session->totalUs() + recording >= _session->maxDurationUs()) {
     [self stopRecording];  // full: stops by itself

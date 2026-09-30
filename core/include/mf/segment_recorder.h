@@ -3,8 +3,9 @@
 // Records one segment of a camera recording into a file: the camera's frames as they are (no
 // overlays or effects: those stay editable) and, optionally, the microphone. Time starts at the
 // segment's first frame: frames and audio are placed by their capture times relative to it, so
-// they stay in sync. Writes go through an IExportSink and never block: a frame the encoder has no
-// room for is dropped (the file just holds the previous frame a little longer).
+// they stay in sync. Writes go through an IExportSink without blocking the caller: frames wait in
+// a short queue and are retried while the encoder catches up; video in the file is timed at a
+// steady frame rate.
 //
 // Frames and audio come from the camera's and the microphone's threads; start and stop from the
 // owner's. All are thread-safe.
@@ -13,6 +14,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <deque>
 #include <mutex>
 #include <vector>
 
@@ -51,12 +53,15 @@ class SegmentRecorder {
   };
   std::vector<Finishing> finishing_;
   void releaseFinished();
+  void drainVideoLocked(bool block);  // holds mu_
   mutable std::mutex mu_;
+  std::deque<ComposedFrame> pendingVideo_;
   bool open_ = false;
   std::atomic<bool> recording_{false};
   int width_ = 0, height_ = 0, frameUs_ = 33333;
   int sampleRate_ = 0, channels_ = 0;
-  int64_t firstUs_ = -1, lastUs_ = -1;  // capture times of the first and last frames written
+  int64_t firstUs_ = -1, lastUs_ = -1;  // capture times of the first and last frames accepted
+  int64_t framesWritten_ = 0;           // encoded frames; file time is framesWritten_ * frameUs_
   int64_t audioPos_ = -1;               // the next audio sample's position; -1: none written yet
   std::atomic<int> dropped_{0};
 };

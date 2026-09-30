@@ -19,7 +19,7 @@
 namespace mf::macos {
 namespace {
 
-constexpr int kMaxQueuedVideo = 3;
+constexpr int kMaxQueuedVideo = 12;
 constexpr int kMaxQueuedAudio = 8;
 
 class AvfExportSink : public IExportSink {

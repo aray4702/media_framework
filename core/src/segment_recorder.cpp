@@ -1,8 +1,14 @@
 #include "mf/segment_recorder.h"
 
 #include <algorithm>
+#include <deque>
+#include <unistd.h>
 
 namespace mf {
+
+namespace {
+constexpr size_t kMaxPendingVideo = 90;  // ~3 s at 30 fps before dropping
+}  // namespace
 
 SegmentRecorder::~SegmentRecorder() = default;  // each sink cancels its unfinished file
 
@@ -34,19 +40,49 @@ Result SegmentRecorder::start(const ExportTarget& target, int width, int height,
   sampleRate_ = sampleRate > 0 ? sampleRate : 0;
   channels_ = sampleRate_ > 0 ? channels : 0;
   firstUs_ = lastUs_ = audioPos_ = -1;
+  framesWritten_ = 0;
+  pendingVideo_.clear();
   dropped_ = 0;
   open_ = true;
   recording_ = true;
   return Result::Ok;
 }
 
+// Sends queued frames in order; returns with the front frame still queued if the encoder is busy.
+void SegmentRecorder::drainVideoLocked(bool block) {
+  while (!pendingVideo_.empty()) {
+    ComposedFrame& f = pendingVideo_.front();
+    f.ptsUs = framesWritten_ * frameUs_;
+    Result r = sink_->writeVideo(f);
+    if (r == Result::Again) {
+      if (!block) return;
+      mu_.unlock();
+      usleep(2000);
+      mu_.lock();
+      if (!open_) return;
+      continue;
+    }
+    pendingVideo_.pop_front();
+    if (r != Result::Ok) {
+      ++dropped_;
+      continue;
+    }
+    ++framesWritten_;
+  }
+}
+
 void SegmentRecorder::video(const VideoFrame& camera) {
   std::lock_guard<std::mutex> lock(mu_);
   if (!recording_ || !camera.image) return;
   if (firstUs_ >= 0 && camera.ptsUs <= lastUs_) return;  // not after the last one
-  int64_t first = firstUs_ >= 0 ? firstUs_ : camera.ptsUs;
+  if (firstUs_ < 0) firstUs_ = camera.ptsUs;
+  lastUs_ = camera.ptsUs;
+
+  if (pendingVideo_.size() >= kMaxPendingVideo) {
+    ++dropped_;
+    return;
+  }
   ComposedFrame f;
-  f.ptsUs = camera.ptsUs - first;
   f.width = width_;
   f.height = height_;
   ComposedLayer l;
@@ -54,12 +90,8 @@ void SegmentRecorder::video(const VideoFrame& camera) {
   l.frame = camera;
   l.fit = Fit::Fill;  // the camera's own size: exactly the frame
   f.layers.push_back(std::move(l));
-  if (sink_->writeVideo(f) != Result::Ok) {  // Again (the encoder is busy) or failed: this frame is dropped
-    ++dropped_;
-    return;
-  }
-  firstUs_ = first;
-  lastUs_ = camera.ptsUs;
+  pendingVideo_.push_back(std::move(f));
+  drainVideoLocked(false);
 }
 
 void SegmentRecorder::audio(const int16_t* pcm, int frames, int64_t hostTimeNs) {
@@ -78,7 +110,16 @@ void SegmentRecorder::audio(const int16_t* pcm, int frames, int64_t hostTimeNs) 
   int n = frames - skip;
   // Later chunks follow on: the microphone's clock is steady, and gaps would be heard. A chunk the
   // encoder has no room for still takes its time (silence), so what follows stays in sync.
-  sink_->writeAudio(pcm + size_t(skip) * channels_, n, audioPos_ * 1000000 / sampleRate_);
+  int64_t ptsUs = audioPos_ * 1000000 / sampleRate_;
+  for (;;) {
+    Result r = sink_->writeAudio(pcm + size_t(skip) * channels_, n, ptsUs);
+    if (r == Result::Ok) break;
+    if (r != Result::Again) return;
+    mu_.unlock();
+    usleep(2000);
+    mu_.lock();
+    if (!recording_) return;
+  }
   audioPos_ += n;
 }
 
@@ -92,9 +133,13 @@ void SegmentRecorder::stop(std::function<void(Result, int64_t)> done) {
       duration = -1;
     } else {
       recording_ = false;
+      drainVideoLocked(true);
+      while (!pendingVideo_.empty()) {  // still busy: wait it out
+        drainVideoLocked(true);
+      }
       open_ = false;
       releaseFinished();
-      duration = firstUs_ < 0 ? 0 : lastUs_ - firstUs_ + frameUs_;
+      duration = framesWritten_ > 0 ? framesWritten_ * frameUs_ : 0;
       if (duration == 0) {
         sink_.reset();  // nothing written: no file worth keeping
       } else {
@@ -115,7 +160,7 @@ void SegmentRecorder::stop(std::function<void(Result, int64_t)> done) {
 
 int64_t SegmentRecorder::durationUs() const {
   std::lock_guard<std::mutex> lock(mu_);
-  return firstUs_ < 0 ? 0 : lastUs_ - firstUs_ + frameUs_;
+  return framesWritten_ > 0 ? framesWritten_ * frameUs_ : 0;
 }
 
 }  // namespace mf
