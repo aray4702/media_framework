@@ -55,6 +55,11 @@ class Player {
   Result seek(int64_t positionUs);  // completes via onSeekCompleted
   Result shutdown();                // joins the threads; idempotent
   Result setFilter(const VideoFilter&);  // any time before shutdown; a paused frame is redrawn
+  // Copies appearance (transform, opacity, effects, text, color, blend, fit, track opacity and
+  // effects, background) into the open scene and redraws the paused frame from the frames already
+  // decoded. While playing, the next frame shows it. InvalidArgument when timing, sources, or
+  // track structure differ: those still need a new open.
+  Result updateAppearance(const Scene&);
 
   State state() const;
   int64_t durationUs() const;  // of the whole timeline

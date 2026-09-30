@@ -482,7 +482,10 @@ class VideoRenderStage : public Stage {
     }
     bool seeking = ctx_.shownSerial != serial_;
     updateOutput(!seeking && !ctx_.hasPendingSeek());
-    if (!seeking) redrawForFilter();
+    if (!seeking) {
+      redrawForFilter();
+      presentPausedFrame();
+    }
 
     if (!current_) {
       ComposedFrame f;
@@ -535,6 +538,18 @@ class VideoRenderStage : public Stage {
     if (version == filterVersion_) return;
     filterVersion_ = version;
     if (lastShown_ && !outputRunning_) present(*lastShown_, ctx_.hostClock.nowNs());
+  }
+
+  // An appearance edit composed a new frame from the ones already decoded.
+  void presentPausedFrame() {
+    if (outputRunning_) return;
+    std::optional<ComposedFrame> frame;
+    {
+      std::lock_guard<std::mutex> lock(ctx_.appearanceMu);
+      frame = std::move(ctx_.pausedFrame);
+      ctx_.pausedFrame.reset();
+    }
+    if (frame) present(std::move(*frame), ctx_.hostClock.nowNs());
   }
 
   // The latest filter is applied here rather than when composed, so changes show at once.

@@ -172,6 +172,7 @@ static ComposedEffects evaluate(const SceneEffects& e, int64_t at) {
 }
 
 ComposedFrame FrameSampler::composeAt(int64_t t) const {
+  std::lock_guard<std::mutex> lock(ctx_.appearanceMu);  // an appearance edit may be writing the scene
   ComposedFrame out;
   out.ptsUs = t;
   out.serial = serial_;
@@ -277,6 +278,25 @@ class CompositionStage : public Stage, private CompositionOutput {
     }
     if (ended_) return Progress::idle();
     if (seeking_) return seekStep();
+    uint32_t appearance = ctx_.appearanceVersion.load();
+    if (appearance != appearanceVersion_) {
+      appearanceVersion_ = appearance;
+      // While playing, the driver's next composeAt reads the new scene. While paused it does
+      // not run, so redraw the frame on screen from the frames already held.
+      if (!ctx_.playing.load()) {
+        int64_t dur = ctx_.layout.durationUs();
+        if (dur > 0) {
+          int64_t t = std::clamp(ctx_.shownPtsUs.load(), int64_t{0}, dur - 1);
+          ComposedFrame frame = sampler_.composeAt(t);
+          {
+            std::lock_guard<std::mutex> lock(ctx_.appearanceMu);
+            ctx_.pausedFrame = std::move(frame);
+          }
+          ctx_.wake(StageId::VideoRender);
+          return Progress::did();
+        }
+      }
+    }
     return driver_->step(sampler_, *this);
   }
 
@@ -364,6 +384,7 @@ class CompositionStage : public Stage, private CompositionOutput {
   FrameSampler sampler_;
   std::unique_ptr<CompositionDriver> driver_;  // made once probing is done: the driver is set by then
   uint32_t serial_ = 0;
+  uint32_t appearanceVersion_ = 0;
   int64_t targetUs_ = 0;
   std::deque<ComposedFrame> out_;  // composed, waiting for room in the queue to T3
   bool seeking_ = false, ended_ = false;

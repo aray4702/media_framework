@@ -902,7 +902,7 @@ struct Dropped {
 
 - (void)overlayEdited {
   [_inspector refresh];
-  [self scheduleReload];
+  if (![self updateAppearance]) [self scheduleReload];
 }
 
 // An audio item's waveform, read once per file in the background; null until it's read.
@@ -997,7 +997,7 @@ struct Dropped {
 - (void)timelineEdited {
   _overlay.needsDisplay = YES;
   [_inspector refresh];
-  [self scheduleReload];
+  if (![self updateAppearance]) [self scheduleReload];
 }
 
 - (void)timelineSeek:(int64_t)us {
@@ -1022,7 +1022,7 @@ struct Dropped {
     [self syncTransitionPanel];
     _timeline.needsDisplay = YES;
   }
-  [self scheduleReload];
+  if (![self updateAppearance]) [self scheduleReload];
 }
 
 - (void)inspectorSelectionChanged {
@@ -1053,8 +1053,20 @@ struct Dropped {
 
 // --- Preview --------------------------------------------------------------------------------
 
+// Pushes a visual edit into the open player, which redraws the paused frame from the frames it
+// already has. NO when the edit changes timing or media, or the player isn't ready: the caller
+// reopens.
+- (BOOL)updateAppearance {
+  _window.documentEdited = YES;
+  if (!_player || _seekOnReadyUs >= 0) return NO;
+  mf::State state = _player->state();
+  if (state != mf::State::Ready && state != mf::State::Play) return NO;
+  return _player->updateAppearance(_doc.scene) == mf::Result::Ok;
+}
+
 // Reopens the player a moment after the first of a burst of edits, e.g. while a slider moves.
-// Every edit comes through here: the Export tab's summary (size, rate, length) follows too.
+// An edit that only changes appearance redraws the open frame instead (updateAppearance).
+// Every edit that reaches here changes timing or media: the Export tab's summary follows too.
 - (void)scheduleReload {
   _window.documentEdited = YES;  // something changed since the last save or open
   [_exportView refresh];

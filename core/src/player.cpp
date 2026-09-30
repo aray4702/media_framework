@@ -98,6 +98,77 @@ struct Player::Impl : PipelineEvents {
     return Result::Ok;
   }
 
+  // Timing, media, and track structure: an appearance edit must leave these alone, because the
+  // decoded frames and the layout were built from them.
+  static bool sameStructure(const Scene& a, const Scene& b) {
+    if (a.tracks.size() != b.tracks.size()) return false;
+    const SceneOutput& oa = a.output, &ob = b.output;
+    if (oa.width != ob.width || oa.height != ob.height || oa.fpsNum != ob.fpsNum || oa.fpsDen != ob.fpsDen ||
+        oa.sampleRate != ob.sampleRate || oa.channels != ob.channels)
+      return false;
+    for (size_t t = 0; t < a.tracks.size(); ++t) {
+      const SceneTrack& ta = a.tracks[t], &tb = b.tracks[t];
+      if (ta.video != tb.video || ta.enabled != tb.enabled || ta.gain != tb.gain || ta.items.size() != tb.items.size() ||
+          ta.transitions.size() != tb.transitions.size())
+        return false;
+      for (size_t k = 0; k < ta.items.size(); ++k) {
+        const SceneItem& ia = ta.items[k], &ib = tb.items[k];
+        if (ia.id != ib.id || ia.type != ib.type || ia.startUs != ib.startUs || ia.durationUs != ib.durationUs ||
+            ia.inUs != ib.inUs || ia.speed != ib.speed || ia.src != ib.src || ia.mute != ib.mute || ia.gain.value != ib.gain.value ||
+            ia.gain.keys.size() != ib.gain.keys.size() || ia.pan.value != ib.pan.value || ia.pan.keys.size() != ib.pan.keys.size())
+          return false;
+      }
+      for (size_t x = 0; x < ta.transitions.size(); ++x) {
+        const SceneTransition& xa = ta.transitions[x], &xb = tb.transitions[x];
+        if (xa.from != xb.from || xa.kind != xb.kind || xa.direction != xb.direction || xa.durationUs != xb.durationUs ||
+            xa.audio != xb.audio || xa.easing.kind != xb.easing.kind || xa.easing.x1 != xb.easing.x1 ||
+            xa.easing.y1 != xb.easing.y1 || xa.easing.x2 != xb.easing.x2 || xa.easing.y2 != xb.easing.y2)
+          return false;
+      }
+    }
+    return true;
+  }
+
+  static void copyAppearance(Scene* dst, const Scene& src) {
+    dst->output.background = src.output.background;
+    for (size_t t = 0; t < dst->tracks.size(); ++t) {
+      dst->tracks[t].opacity = src.tracks[t].opacity;
+      dst->tracks[t].effects = src.tracks[t].effects;
+      for (size_t k = 0; k < dst->tracks[t].items.size(); ++k) {
+        SceneItem& d = dst->tracks[t].items[k];
+        const SceneItem& s = src.tracks[t].items[k];
+        d.transform = s.transform;
+        d.opacity = s.opacity;
+        d.blend = s.blend;
+        d.fit = s.fit;
+        d.effects = s.effects;
+        d.text = s.text;
+        d.style = s.style;
+        d.color = s.color;
+      }
+    }
+  }
+
+  Result updateAppearance(const Scene& scene) {
+    State s = getState();
+    if (s != State::Ready && s != State::Play) return Result::InvalidState;
+    if (!ctx.probed) return Result::InvalidState;
+    if (!sameStructure(ctx.scene, scene)) return Result::InvalidArgument;
+    {
+      std::lock_guard<std::mutex> lock(ctx.appearanceMu);
+      copyAppearance(&ctx.scene, scene);
+      for (int i = 0; i < ctx.layout.items(); ++i) {
+        const SceneItem& it = ctx.layout.item(i);
+        if (it.type != ItemType::Text) continue;
+        if (!ctx.items[i].text || *ctx.items[i].text != it.text) ctx.items[i].text = std::make_shared<const std::string>(it.text);
+      }
+    }
+    ++ctx.appearanceVersion;
+    ctx.wake(StageId::Composition);
+    ctx.wake(StageId::VideoRender);
+    return Result::Ok;
+  }
+
   Result shutdown() {
     {
       std::lock_guard<std::mutex> lock(stateMu);
@@ -244,6 +315,7 @@ Result Player::open(const MediaSource& s, const RenderTarget& t) {
   return open(scene, t);
 }
 Result Player::setFilter(const VideoFilter& f) { return impl_->onOwner() ? impl_->setFilter(f) : Result::WrongThread; }
+Result Player::updateAppearance(const Scene& s) { return impl_->onOwner() ? impl_->updateAppearance(s) : Result::WrongThread; }
 Result Player::play() { return impl_->onOwner() ? impl_->play() : Result::WrongThread; }
 Result Player::pause() { return impl_->onOwner() ? impl_->pause() : Result::WrongThread; }
 Result Player::seek(int64_t us) { return impl_->onOwner() ? impl_->seek(us) : Result::WrongThread; }

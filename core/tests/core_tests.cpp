@@ -334,6 +334,41 @@ TEST(player_seeks_to_exact_frame) {
   CHECK(h.player->metrics().decodeOnly > 0);
 }
 
+TEST(player_redraws_an_appearance_edit_without_reopening) {
+  fake::Harness h;
+  Scene scene;
+  SceneTrack track;
+  SceneItem text;
+  text.type = ItemType::Text;
+  text.text = "Hi";
+  text.durationUs = 1000000;
+  text.transform.x = Animatable(0.5);
+  track.items.push_back(text);
+  scene.tracks.push_back(track);
+  CHECK(h.openScene(scene) == Result::Ok);
+  h.run(30);
+  CHECK(h.player->state() == State::Ready);
+  size_t frames = h.platform.display->composed.size();
+  int64_t decoded = h.player->metrics().decodeOnly;
+
+  scene.tracks[0].items[0].transform.x = Animatable(0.25);
+  scene.tracks[0].items[0].text = "Yo";
+  CHECK(h.player->updateAppearance(scene) == Result::Ok);
+  h.run(10);
+  CHECK_EQ(h.platform.display->composed.size(), frames + 1);
+  const ComposedFrame& f = h.lastComposed();
+  CHECK_EQ(f.layers.size(), size_t(1));
+  CHECK(f.layers[0].x == 0.25f);
+  CHECK(*f.layers[0].text == "Yo");
+  CHECK(h.listener.seeks.empty());
+  CHECK_EQ(h.player->metrics().decodeOnly, decoded);
+
+  scene.tracks[0].items[0].durationUs = 2000000;  // timing: the open scene stays as it is
+  CHECK(h.player->updateAppearance(scene) == Result::InvalidArgument);
+  h.run(5);
+  CHECK_EQ(h.platform.display->composed.size(), frames + 1);
+}
+
 TEST(player_scrub_honors_only_the_latest_seek) {
   fake::Harness h;
   h.open();

@@ -122,6 +122,11 @@ struct Context {
   std::atomic<int64_t> shownPtsUs{0};
   std::atomic<bool> halted{false};       // fatal error or shutdown: stages go idle
   std::atomic<uint32_t> filterVersion{0};  // bumped by setFilter, so T3 can redraw a paused frame
+  // Appearance edits (transform, text, effects, ...). composeAt holds appearanceMu while it reads
+  // the scene; updateAppearance writes under it and bumps the version so a paused frame is redrawn.
+  std::mutex appearanceMu;
+  std::atomic<uint32_t> appearanceVersion{0};
+  std::optional<ComposedFrame> pausedFrame;  // composed while paused; T3 presents it, guarded by appearanceMu
 
   // Export progress.
   std::atomic<bool> audioWritten{false};  // T4 has written the last audio
