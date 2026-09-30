@@ -1,5 +1,7 @@
 #import "metal_compositor.h"
 
+#import "effect_plugins.h"
+
 #import <CoreText/CoreText.h>
 
 #include <algorithm>
@@ -122,10 +124,13 @@ struct MetalCompositor::Prepared {
   id<MTLTexture> tex0 = nil, tex1 = nil;
   Vert vert = kFullQuad;
   double boxW = 0, boxH = 0;  // the fitted box, in canvas pixels
-  bool effectsDone = false;   // drawn through a blur texture: only opacity and the filter are left
+  bool effectsDone = false;   // drawn through an effects texture: only opacity and the filter are left
 };
 
 MetalCompositor::~MetalCompositor() {
+  for (auto& [type, pi] : plugins_) {
+    if (pi.instance) pi.plugin->destroy(pi.instance);
+  }
   if (cache_) CFRelease(cache_);
 }
 
@@ -245,7 +250,7 @@ bool MetalCompositor::prepare(const ComposedLayer& l, double W, double H, double
     bw = W;
     bh = H;
   }
-  p->boxW = bw * l.scale * scale;  // target pixels, for a blur texture
+  p->boxW = bw * l.scale * scale;  // target pixels, for an effects texture
   p->boxH = bh * l.scale * scale;
   double px = (l.x + l.offsetX) * W, py = (l.y + l.offsetY) * H;
   double a = l.rotation * M_PI / 180, cs = std::cos(a), sn = std::sin(a);
@@ -263,14 +268,12 @@ bool MetalCompositor::prepare(const ComposedLayer& l, double W, double H, double
   return true;
 }
 
-// Draws the layer's source with its effects into a texture of its size on screen, then blurs
-// it in two passes (horizontal, vertical). The layer then draws that texture.
-void MetalCompositor::blurInto(Prepared* p, const ComposedLayer& l, id<MTLCommandBuffer> cmd, double sigmaPx) {
+// Draws the layer's source with its shader effects into a texture of its size on screen, then
+// runs each plugin effect on it (§4.4), then blurs it in two passes (horizontal, vertical). The
+// layer then draws that texture.
+void MetalCompositor::effectsInto(Prepared* p, const ComposedLayer& l, id<MTLCommandBuffer> cmd, double pixelsPerUnit, int64_t timeUs) {
   NSUInteger w = NSUInteger(std::clamp(std::lround(p->boxW), 1L, 4096L)), h = NSUInteger(std::clamp(std::lround(p->boxH), 1L, 4096L));
-  MTLTextureDescriptor* d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:kOffscreenFormat width:w height:h mipmapped:NO];
-  d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
-  d.storageMode = MTLStorageModePrivate;
-  id<MTLTexture> a = [device_ newTextureWithDescriptor:d], b = [device_ newTextureWithDescriptor:d];
+  id<MTLTexture> a = scratch(w, h), b = scratch(w, h);
   auto pass = [&](id<MTLTexture> target) {
     MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
     rp.colorAttachments[0].texture = target;
@@ -292,19 +295,33 @@ void MetalCompositor::blurInto(Prepared* p, const ComposedLayer& l, id<MTLComman
   [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
   [enc endEncoding];
 
-  // Wide blurs sample every few pixels, so a pass takes at most 64 taps each side.
-  double reach = 3 * sigmaPx, stride = std::max(1.0, reach / 64);
-  BlurParams bp{{0, 0}, float(std::max(0.5, sigmaPx / stride)), std::max(1, int(std::ceil(reach / stride)))};
-  for (int axis = 0; axis < 2; ++axis) {
-    bp.step[0] = axis == 0 ? float(stride / w) : 0;
-    bp.step[1] = axis == 1 ? float(stride / h) : 0;
-    enc = pass(axis == 0 ? b : a);
-    [enc setRenderPipelineState:blur_];
-    [enc setVertexBytes:&kFullQuad length:sizeof(kFullQuad) atIndex:0];
-    [enc setFragmentBytes:&bp length:sizeof(bp) atIndex:0];
-    [enc setFragmentTexture:axis == 0 ? a : b atIndex:0];
-    [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
-    [enc endEncoding];
+  // Plugin effects, in document order: each reads a and writes b, which then becomes a. One that
+  // isn't loaded, or fails, is skipped.
+  MfEffectContext context{sizeof(MfEffectContext), float(pixelsPerUnit), timeUs};
+  for (const ComposedPluginEffect& e : l.effects.plugins) {
+    const PluginInstance* pi = plugin(e.type);
+    if (!pi || e.params.size() != pi->plugin->paramCount) continue;
+    if (pi->plugin->encode(pi->instance, (__bridge void*)cmd, (__bridge void*)a, (__bridge void*)b, e.params.data(), &context) == 0) {
+      std::swap(a, b);
+    }
+  }
+
+  if (l.effects.blur > 0) {
+    // Wide blurs sample every few pixels, so a pass takes at most 64 taps each side.
+    double sigmaPx = l.effects.blur * pixelsPerUnit;
+    double reach = 3 * sigmaPx, stride = std::max(1.0, reach / 64);
+    BlurParams bp{{0, 0}, float(std::max(0.5, sigmaPx / stride)), std::max(1, int(std::ceil(reach / stride)))};
+    for (int axis = 0; axis < 2; ++axis) {
+      bp.step[0] = axis == 0 ? float(stride / w) : 0;
+      bp.step[1] = axis == 1 ? float(stride / h) : 0;
+      enc = pass(axis == 0 ? b : a);
+      [enc setRenderPipelineState:blur_];
+      [enc setVertexBytes:&kFullQuad length:sizeof(kFullQuad) atIndex:0];
+      [enc setFragmentBytes:&bp length:sizeof(bp) atIndex:0];
+      [enc setFragmentTexture:axis == 0 ? a : b atIndex:0];
+      [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+      [enc endEncoding];
+    }
   }
   p->source = kRgba;
   p->tex0 = a;
@@ -312,6 +329,32 @@ void MetalCompositor::blurInto(Prepared* p, const ComposedLayer& l, id<MTLComman
   p->vert.uv[0] = p->vert.uv[1] = 0;
   p->vert.uv[2] = p->vert.uv[3] = 1;
   p->effectsDone = true;
+}
+
+// Kept from frame to frame like the group textures: frames are encoded in order on one queue, and
+// Metal orders the passes that write and read a texture.
+id<MTLTexture> MetalCompositor::scratch(NSUInteger width, NSUInteger height) {
+  if (scratchUsed_ == scratch_.size()) scratch_.push_back(nil);
+  __strong id<MTLTexture>& t = scratch_[scratchUsed_++];
+  if (!t || t.width != width || t.height != height) {
+    MTLTextureDescriptor* d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:kOffscreenFormat width:width height:height mipmapped:NO];
+    d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+    d.storageMode = MTLStorageModePrivate;
+    t = [device_ newTextureWithDescriptor:d];
+  }
+  return t;
+}
+
+const MetalCompositor::PluginInstance* MetalCompositor::plugin(const std::string& type) {
+  auto it = plugins_.find(type);
+  if (it == plugins_.end()) {  // first use: made once, and a failure is remembered
+    PluginInstance pi;
+    pi.plugin = findEffectPlugin(type);
+    if (pi.plugin) pi.instance = pi.plugin->create((__bridge void*)device_);
+    if (!pi.instance) NSLog(@"[mf] effect '%s' can't run: %s", type.c_str(), pi.plugin ? "its plugin failed to start" : "no plugin loaded has it");
+    it = plugins_.emplace(type, pi).first;
+  }
+  return it->second.instance ? &it->second : nullptr;
 }
 
 void MetalCompositor::draw(id<MTLRenderCommandEncoder> enc, id<MTLRenderPipelineState> pipeline, const Prepared& p,
@@ -395,7 +438,7 @@ bool MetalCompositor::combine(const ComposedFrame& c, int g, const std::vector<P
   v.uv[1] = float((viewport.originY + y0 * viewport.height) / th);
   v.uv[2] = float((viewport.originX + x1 * viewport.width) / tw);
   v.uv[3] = float((viewport.originY + y1 * viewport.height) / th);
-  out->boxW = (x1 - x0) * viewport.width;  // target pixels, for a blur texture
+  out->boxW = (x1 - x0) * viewport.width;  // target pixels, for an effects texture
   out->boxH = (y1 - y0) * viewport.height;
   return true;
 }
@@ -414,18 +457,20 @@ void MetalCompositor::encode(const ComposedFrame& c, id<MTLTexture> target, id<M
   auto textures = std::make_shared<std::vector<CVMetalTextureRef>>();
   std::vector<Prepared> prepared(c.layers.size());
   std::vector<bool> ok(c.layers.size());
-  for (size_t i = 0; i < c.layers.size(); ++i) {  // blurred layers render first, into their own textures
+  scratchUsed_ = 0;
+  auto offscreen = [](const ComposedEffects& e) { return e.blur > 0 || !e.plugins.empty(); };
+  for (size_t i = 0; i < c.layers.size(); ++i) {  // layers with plugin effects or a blur render first, into their own textures
     const ComposedLayer& l = c.layers[i];
     ok[i] = l.opacity > 0 && prepare(l, W, H, scale, &prepared[i], textures.get());
-    if (ok[i] && l.effects.blur > 0) blurInto(&prepared[i], l, cmd, l.effects.blur * H * scale);
+    if (ok[i] && offscreen(l.effects)) effectsInto(&prepared[i], l, cmd, H * scale, c.ptsUs);
   }
-  // Then each track drawn on its own, with its effects (and its blur) on the combined image.
+  // Then each track drawn on its own, with its effects (plugins and blur too) on the combined image.
   std::vector<Prepared> groups(c.groups.size());
   std::vector<bool> groupOk(c.groups.size());
   for (size_t g = 0; g < c.groups.size(); ++g) {
     const ComposedGroup& group = c.groups[g];
     groupOk[g] = group.opacity > 0 && combine(c, int(g), prepared, ok, viewport, tw, th, cmd, &groups[g]);
-    if (groupOk[g] && group.effects.blur > 0) blurInto(&groups[g], groupLayer(group), cmd, group.effects.blur * H * scale);
+    if (groupOk[g] && offscreen(group.effects)) effectsInto(&groups[g], groupLayer(group), cmd, H * scale, c.ptsUs);
   }
 
   MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];

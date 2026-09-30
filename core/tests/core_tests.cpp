@@ -8,6 +8,7 @@
 #include "../src/master_clock.h"
 #include "../src/json.h"
 #include "../src/layout.h"
+#include "mf/effects.h"
 #include "fakes.h"
 #include "test.h"
 
@@ -1096,6 +1097,115 @@ TEST(scene_easing_and_keyframes) {
   CHECK(a.at(1500000) == 10);  // held until the next key
   CHECK(a.at(2000000) == 20);
   CHECK(a.at(9000000) == 20);
+}
+
+// --- Effect plugins (the core's side: types, parameters) ---------------------------------------
+
+// Registered once per process: the registry never forgets a type.
+static const EffectInfo& testEffect() {
+  static const EffectInfo* info = [] {
+    EffectInfo e;
+    e.type = "test.fx";
+    e.displayName = "Test";
+    e.params = {{"amount", 0.5, 0, 1}, {"size", 0.1, 0, 0.5}};
+    CHECK(registerEffect(e) == Result::Ok);
+    return findEffect("test.fx");
+  }();
+  return *info;
+}
+
+TEST(effect_registry_checks_types_and_parameters) {
+  CHECK(testEffect().param("size") == 1 && testEffect().param("nope") == -1);
+  auto rejects = [](EffectInfo e, const std::string& reason) {
+    std::string error;
+    bool ok = registerEffect(std::move(e), &error) == Result::InvalidArgument && error.find(reason) != std::string::npos;
+    if (!ok) std::fprintf(stderr, "  expected '%s', got '%s'\n", reason.c_str(), error.c_str());
+    CHECK(ok);
+  };
+  rejects({"test.fx", "", {}}, "already registered");
+  rejects({"blur", "", {}}, "built in");
+  rejects({"9lives", "", {}}, "must be 1 to 64");
+  rejects({"test.bad", "", {{"type", 0, 0, 1}}}, "bad parameter name");
+  rejects({"test.bad", "", {{"a", 0, 0, 1}, {"a", 0, 0, 1}}}, "listed twice");
+  rejects({"test.bad", "", {{"a", 2, 0, 1}}}, "min <= default <= max");
+  CHECK(findEffect("test.bad") == nullptr);
+  bool listed = false;
+  for (const EffectInfo* e : registeredEffects()) listed |= e == &testEffect();
+  CHECK(listed);
+}
+
+TEST(scene_plugin_effects_parse_validate_and_write_back) {
+  testEffect();
+  const std::string red = R"("type": "color", "color": "#ff0000", "start": 0, "duration": 2)";
+  Scene s = sceneFrom(doc("{" + red + R"(, "effects": [{"type": "blur", "radius": 0.01}, {"type": "test.fx", "amount": {"keys": [[0, 0], [2, 1]]}}]})"));
+  const SceneEffects& e = s.tracks[0].items[0].effects;
+  CHECK(e.blur && e.plugins.size() == 1 && e.plugins[0].type == "test.fx");
+  CHECK(e.plugins[0].params.size() == 2 && e.plugins[0].params[0].keys.size() == 2);
+  CHECK(e.plugins[0].params[1].value == 0.1);  // not given: its default
+
+  std::string text = serializeScene(s);
+  CHECK(text.find("\"test.fx\"") != std::string::npos && text.find("\"amount\"") != std::string::npos);
+  CHECK(text.find("\"size\"") == std::string::npos);  // at its default: left out
+  Scene back;
+  CHECK(reserialized(text, &back) == text);
+
+  struct Case {
+    std::string effects, reason;
+  };
+  for (const Case& c : std::vector<Case>{
+           {R"({"type": "test.fx", "colour": 1})", "unknown field 'colour'"},
+           {R"({"type": "test.fx", "amount": 2})", "effects.amount: must be between 0 and 1"},
+           {R"({"type": "test.fx", "size": {"keys": [[0, 0], [3, 0.2]]}})", "within the item"},
+           {R"({"type": "test.fx"}, {"type": "test.fx"})", "at most one test.fx"},
+           {R"({"type": "nope"})", "'nope' is not loaded"},
+       }) {
+    Scene scene;
+    std::string error;
+    Result r = parseScene(doc("{" + red + R"(, "effects": [)" + c.effects + "]}"), resolveClip, &scene, &error);
+    bool ok = r == Result::InvalidArgument && error.find(c.reason) != std::string::npos;
+    if (!ok) std::fprintf(stderr, "  expected '%s', got '%s'\n", c.reason.c_str(), error.c_str());
+    CHECK(ok);
+  }
+
+  // Scenes built in code are checked the same way.
+  Scene coded = s;
+  coded.tracks[0].items[0].effects.plugins[0].type = "nope";
+  std::string error;
+  CHECK(validateScene(coded, &error) == Result::InvalidArgument && error.find("no loaded effect plugin") != std::string::npos);
+  coded = s;
+  coded.tracks[0].items[0].effects.plugins[0].params.pop_back();
+  CHECK(validateScene(coded, &error) == Result::InvalidArgument && error.find("needs 2 parameters") != std::string::npos);
+}
+
+TEST(player_composes_plugin_effects_and_edits_them_live) {
+  testEffect();
+  fake::Harness h;
+  Scene scene;
+  SceneTrack track;
+  SceneItem red;
+  red.type = ItemType::Color;
+  red.color = {1, 0, 0, 1};
+  red.durationUs = 2000000;
+  ScenePluginEffect fx{"test.fx", {Animatable(0.25), Animatable(0.3)}};
+  red.effects.plugins.push_back(fx);
+  track.items.push_back(red);
+  track.effects.plugins.push_back({"test.fx", {Animatable(1), Animatable(0)}});  // on the track's image too
+  scene.tracks.push_back(track);
+  CHECK(h.openScene(scene) == Result::Ok);
+  h.run(30);
+  CHECK(h.player->state() == State::Ready);
+  const ComposedFrame& f = h.lastComposed();
+  CHECK_EQ(f.layers.size(), size_t(1));
+  CHECK(f.layers[0].effects.plugins.size() == 1 && f.layers[0].effects.plugins[0].type == "test.fx");
+  CHECK(f.layers[0].effects.plugins[0].params == std::vector<float>({0.25f, 0.3f}));
+  CHECK(f.groups.size() == 1 && f.groups[0].effects.plugins.size() == 1 && f.groups[0].effects.plugins[0].params[0] == 1);
+
+  size_t frames = h.platform.display->composed.size();
+  scene.tracks[0].items[0].effects.plugins[0].params[0] = Animatable(0.75);
+  CHECK(h.player->updateAppearance(scene) == Result::Ok);
+  h.run(10);
+  CHECK_EQ(h.platform.display->composed.size(), frames + 1);
+  CHECK(h.lastComposed().layers[0].effects.plugins[0].params[0] == 0.75f);
 }
 
 TEST(scene_layout_assigns_lanes_by_overlap) {

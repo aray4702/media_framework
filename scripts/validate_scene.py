@@ -23,6 +23,9 @@ RANGES = {
     "brightness": (-1, 1), "contrast": (0, 2), "saturation": (0, 2),
     "radius": (0, 0.1), "left": (0, 1), "top": (0, 1), "right": (0, 1), "bottom": (0, 1),
 }
+# Any other effect type comes from an effect plugin: its parameters' ranges are known only to the
+# engine, once the plugin is loaded.
+BUILTIN_EFFECTS = ("colorAdjust", "blur", "crop", "chromaKey")
 
 
 def to_time(value):
@@ -44,8 +47,8 @@ def to_end(item):
     return item["type"] in ("video", "audio") and to_time(item["duration"]) == 0
 
 
-def check_animatable(name, value, duration, where, errors):
-    lo, hi = RANGES.get(name, (None, None))
+def check_animatable(name, value, duration, where, errors, ranged=True):
+    lo, hi = RANGES.get(name, (None, None)) if ranged else (None, None)
     keys = keyframes(value)
     values = [value] if keys is None else [v for _, v in keys]
     if lo is not None:
@@ -81,9 +84,10 @@ def check_effects(node, duration, where, errors):
         if types.count(t) > 1:
             errors.append(f"{where}.effects: at most one {t} effect (R12)")
     for i, effect in enumerate(node.get("effects", [])):
+        builtin = effect["type"] in BUILTIN_EFFECTS
         for name, value in effect.items():
             if name != "type" and not isinstance(value, str) and name not in ("tolerance", "softness"):
-                check_animatable(name, value, duration, f"{where}.effects[{i}]", errors)
+                check_animatable(name, value, duration, f"{where}.effects[{i}]", errors, ranged=builtin)
         if effect["type"] == "crop":
             if keyframes(effect.get("left", 0)) is None and keyframes(effect.get("right", 0)) is None:
                 if effect.get("left", 0) + effect.get("right", 0) >= 1:

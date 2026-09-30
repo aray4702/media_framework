@@ -35,7 +35,8 @@ The core never calls a platform API directly. To port the player, you write the 
 - **Real-time safe and bounded:** the audio path is lock-free and does not allocate. Every queue is capped by count, bytes and duration.
 - **Built-in metrics:** dropped frames, jank, A/V offset, time to first frame and seek latency, all measured from actual present times.
 - **Composition:** clips play back to back with a horizontal slide (and an audio crossfade) between them, a caption at the bottom, and live brightness and contrast, all drawn in one GPU pass with no extra copy.
-- **Scene graph:** a JSON document of tracks holding video, image, text, color and audio items, with transitions (cut, crossfade, push, slide, wipe), per-item and per-track effects (color adjust, chroma key, crop, blur), blend modes, and keyframe animation of any number. See [scene_graph_spec.md](scene_graph_spec.md).
+- **Scene graph:** a JSON document of tracks holding video, image, text, color and audio items, with transitions (cut, crossfade, push, slide, wipe), per-item and per-track effects (color adjust, chroma key, crop, blur, and effect plugins such as beauty), blend modes, and keyframe animation of any number. See [scene_graph_spec.md](scene_graph_spec.md).
+- **Effect plugins:** a `.dylib` with a small C interface adds an effect type that scenes, the editor and export can use, with animatable parameters. The `beauty` plugin (skin smoothing, whitening, sharpening) is built with the framework. See [Effect plugins](#effect-plugins).
 - **Three output drivers:** leading-clip (one output frame per source frame), vsync (one per display refresh, so slides stay smooth) and export (a fixed frame grid, written to an MP4 or MOV file, H.264 or HEVC video with AAC audio, faster than real time).
 
 
@@ -107,6 +108,8 @@ To play or export a scene document, use `--scene` (the example uses the test cli
 scripts/validate_scene.py schema/examples/demo_clips.json                                   # check a document
 ```
 
+`--beauty 0.6` puts the beauty plugin on every video and image (for playback, autotest and export). The window also has a live **Beauty** slider.
+
 To choose the driver, add `--driver leading` or `--driver vsync`. To export instead of playing, add `--export`:
 
 ```sh
@@ -141,6 +144,19 @@ Where two videos or images meet on a track, a round button sits on the join. Cli
 Audio has its own tracks, below the video ones and tinted green; audio items show their waveform. Audio files must be AAC or MP3 (an `.m4a` or `.mp3`, for example `clips/audio_only.m4a` and `clips/audio_only.mp3`, made by `scripts/make_clips.sh`); the macOS demuxer reads files with no video track.
 
 In the timeline, drag an item to move it along its track, or up or down onto another track of the same kind (video, image, text and color items on video tracks, audio on audio tracks): a dashed outline shows where it will land, right after anything already playing there. The selected item is highlighted and shows its length in seconds; hover near either end to get trim handles, and drag one to trim that end. The start handle trims into the file (a video or audio item plays from later or earlier in it): dragged left, the item first grows into any free space before it on its track; once there's none, and when dragged right, it's a ripple trim, where the item stays in place and the items after it on the track move by the same amount. Clicking anywhere else in the timeline moves the playhead there, and dragging in the ruler or on empty space scrubs. With the timeline focused, Space plays or pauses and Delete removes the selection. Edits keep every track valid: a transition sets where the next item starts, and a new item pushes later ones along. The player has no live scene update, so after an edit the editor reopens the scene at the playhead: the player's first frame is the one there, with no frame from the start shown before it.
+
+### Effect plugins
+
+An effect plugin adds an effect type. It is a `.dylib` that exports one C function, `mf_effect_plugin()`, declared in [effect_plugin.h](platform/macos/include/mf/effect_plugin.h). That function returns the type's name, its parameters (name, default, min, max), and `create`/`destroy`/`encode` callbacks. `encode` gets a Metal command buffer, an input texture (the item with the effects before it applied, the size it has on screen) and an output texture, and encodes its passes. A plugin needs only that header: nothing from the framework is linked into it.
+
+```cpp
+std::vector<std::string> errors;
+mf::macos::loadEffectPlugins(&errors);   // before parsing or opening scenes that use them
+```
+
+`loadEffectPlugins` searches `$MF_EFFECT_PLUGIN_PATH`, `plugins/` next to the executable, an app bundle's `PlugIns`, `~/Library/Application Support/Media Framework/Plugins`, and `build/plugins`, where the build puts `beauty.dylib`. Each type is registered in the core ([effects.h](core/include/mf/effects.h)), so documents can use it like a built-in effect (scene_graph_spec.md §4.4), `Player::updateAppearance` edits it live, and the exporter renders it. `mf_demo` and `mf_editor` load plugins at startup. In the editor, each plugin gets its own section in the **Effects** properties, with a slider per parameter.
+
+[plugins/beauty](plugins/beauty/beauty.mm) is the example. It computes a skin mask from CbCr, applies a one-pass sparse bilateral blur, and mixes in smoothing, a log-curve whitening on skin, and an unsharp mask elsewhere. It takes two GPU passes per item.
 
 ### Use the library
 
@@ -233,6 +249,7 @@ Every API call returns without doing I/O or decoding. Only `shutdown` blocks, wh
 | [platform/macos/](platform/macos/)             | macOS adapters and the platform factory                                                                                                                                                                                                |
 | [apps/macos-demo/](apps/macos-demo/)           | The demo app                                                                                                                                                                                                                           |
 | [apps/macos-editor/](apps/macos-editor/)       | The editor app                                                                                                                                                                                                                           |
+| [plugins/beauty/](plugins/beauty/)             | The beauty effect plugin (built into `build/plugins/beauty.dylib`)                                                                                                                                                                       |
 | [scripts/make_clips.sh](scripts/make_clips.sh) | Generates the test clips                                                                                                                                                                                                               |
 | [scene_graph_spec.md](scene_graph_spec.md), [schema/](schema/) | Scene-graph format (v1): tracks, transitions, effects, keyframes; JSON Schema, example, and the OTIO mapping. [scripts/validate_scene.py](scripts/validate_scene.py) validates a document |
 
@@ -410,7 +427,8 @@ flowchart LR
 | AtAudioDecoder        | [at_audio_decoder.cpp](platform/macos/src/at_audio_decoder.cpp) | `AudioConverter`, AAC → S16                                                  |
 | AuSpeaker             | [au_speaker.cpp](platform/macos/src/au_speaker.cpp)             | Default-output AudioUnit; the render callback pulls from the ring            |
 | MetalDisplay          | [metal_display.mm](platform/macos/src/metal_display.mm)         | Pending-frame queue drained on each vsync; draws with MetalCompositor        |
-| MetalCompositor       | [metal_compositor.mm](platform/macos/src/metal_compositor.mm)   | One-pass draw of a composed frame: layers (NV12 → RGB, filter), Core Text caption |
+| MetalCompositor       | [metal_compositor.mm](platform/macos/src/metal_compositor.mm)   | One-pass draw of a composed frame: layers (NV12 → RGB, filter), Core Text caption; plugin effects and blur in offscreen textures |
+| Effect plugins        | [effects.cpp](core/src/effects.cpp), [effect_plugins.mm](platform/macos/src/effect_plugins.mm) | Registry of plugin effect types (core); `dlopen` loader and ABI check (macOS) |
 | ImageIoLoader         | [image_loader.mm](platform/macos/src/image_loader.mm)           | Image items: ImageIO into a BGRA `CVPixelBuffer`                             |
 | AvfExportSink         | [avf_export_sink.mm](platform/macos/src/avf_export_sink.mm)     | MetalCompositor into `AVAssetWriter` buffers → H.264; mixed PCM → AAC        |
 

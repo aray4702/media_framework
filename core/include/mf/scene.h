@@ -42,7 +42,15 @@ struct SceneTransform {
   float anchorX = 0.5f, anchorY = 0.5f;
 };
 
-// Each effect at most once per item (or track), applied crop → chromaKey → colorAdjust → blur (§4.4).
+// An effect from a plugin (mf/effects.h): its type, and a value for every parameter of the
+// type's EffectInfo, in that order.
+struct ScenePluginEffect {
+  std::string type;
+  std::vector<Animatable> params;
+};
+
+// Each effect at most once per item (or track), applied crop → chromaKey → colorAdjust →
+// plugin effects (in document order) → blur (§4.4).
 struct SceneEffects {
   bool colorAdjust = false;
   Animatable brightness{0}, contrast{1}, saturation{1};
@@ -53,7 +61,9 @@ struct SceneEffects {
   bool chromaKey = false;
   Color keyColor;
   float keyTolerance = 0.15f, keySoftness = 0.1f;
-  bool any() const { return colorAdjust || blur || crop || chromaKey; }
+  std::vector<ScenePluginEffect> plugins;
+  bool any() const { return colorAdjust || blur || crop || chromaKey || !plugins.empty(); }
+  int count() const { return int(colorAdjust) + int(blur) + int(crop) + int(chromaKey) + int(plugins.size()); }
 };
 
 enum class ItemType { Video, Image, Text, Color, Audio };

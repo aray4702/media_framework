@@ -9,6 +9,7 @@
 #include <set>
 
 #include "json.h"
+#include "mf/effects.h"
 
 namespace mf {
 
@@ -263,9 +264,27 @@ class Reader {
     return true;
   }
 
+  // A plugin effect: every parameter of its registered type, the ones not given at their defaults.
+  bool pluginEffect(const Value& e, const std::string& ep, const EffectInfo& info, SceneEffects* out) {
+    for (const ScenePluginEffect& p : out->plugins) {
+      if (p.type == info.type) return fail(ep, "at most one " + info.type + " effect (R12)");
+    }
+    ScenePluginEffect p;
+    p.type = info.type;
+    for (const EffectParamInfo& param : info.params) p.params.emplace_back(param.defaultValue);
+    for (const auto& [key, value] : e.object) {
+      if (key == "type") continue;
+      int k = info.param(key);
+      if (k < 0) return fail(ep, "unknown field '" + key + "'");
+      if (!animatable(&value, ep + "." + key, &p.params[size_t(k)])) return false;
+    }
+    out->plugins.push_back(std::move(p));
+    return true;
+  }
+
   bool effects(const Value* v, const std::string& path, SceneEffects* out) {
     if (!v) return true;
-    if (!v->isArray() || v->array.size() > 4) return fail(path, "must be a list of at most 4 effects");
+    if (!v->isArray() || v->array.size() > 8) return fail(path, "must be a list of at most 8 effects");
     for (size_t k = 0; k < v->array.size(); ++k) {
       const Value& e = v->array[k];
       std::string ep = path + "[" + std::to_string(k) + "]";
@@ -273,7 +292,13 @@ class Reader {
       if (!type || !type->isString()) return fail(ep, "needs a type");
       const std::string& t = type->string;
       bool* seen = t == "colorAdjust" ? &out->colorAdjust : t == "blur" ? &out->blur : t == "crop" ? &out->crop : t == "chromaKey" ? &out->chromaKey : nullptr;
-      if (!seen) return fail(ep + ".type", "must be one of colorAdjust, blur, crop, chromaKey");
+      if (!seen) {
+        if (const EffectInfo* info = findEffect(t)) {
+          if (!pluginEffect(e, ep, *info, out)) return false;
+          continue;
+        }
+        return fail(ep + ".type", "must be one of colorAdjust, blur, crop, chromaKey, or a loaded effect plugin's type ('" + t + "' is not loaded)");
+      }
       if (*seen) return fail(ep, "at most one " + t + " effect (R12)");
       *seen = true;
       if (t == "colorAdjust") {
@@ -524,6 +549,22 @@ struct Checker {
     if (e.crop && !e.cropTop.animated() && !e.cropBottom.animated() && e.cropTop.value + e.cropBottom.value >= 1) {
       return fail(p + ".effects", "crop removes the whole height (R7)");
     }
+    if (e.count() > 8) return fail(p + ".effects", "more than 8 effects");
+    for (size_t k = 0; k < e.plugins.size(); ++k) {
+      const ScenePluginEffect& fx = e.plugins[k];
+      const EffectInfo* info = findEffect(fx.type);
+      if (!info) return fail(p + ".effects", "no loaded effect plugin has the type '" + fx.type + "'");
+      for (size_t j = 0; j < k; ++j) {
+        if (e.plugins[j].type == fx.type) return fail(p + ".effects", "at most one " + fx.type + " effect (R12)");
+      }
+      if (fx.params.size() != info->params.size()) {
+        return fail(p + ".effects", fx.type + " needs " + std::to_string(info->params.size()) + " parameters");
+      }
+      for (size_t j = 0; j < fx.params.size(); ++j) {
+        const EffectParamInfo& param = info->params[j];
+        if (!range(fx.params[j], p + ".effects." + param.name, d, param.min, param.max)) return false;
+      }
+    }
     return true;
   }
 
@@ -708,6 +749,16 @@ class Writer {
       addAnim(&c, "brightness", e.brightness, 0);
       addAnim(&c, "contrast", e.contrast, 1);
       addAnim(&c, "saturation", e.saturation, 1);
+      list.array.push_back(c);
+    }
+    for (const ScenePluginEffect& fx : e.plugins) {  // applied after colorAdjust, before blur
+      json::Value c = json::object();
+      json::add(&c, "type", json::string(fx.type));
+      if (const EffectInfo* info = findEffect(fx.type)) {
+        for (size_t k = 0; k < fx.params.size() && k < info->params.size(); ++k) {
+          addAnim(&c, info->params[k].name.c_str(), fx.params[k], info->params[k].defaultValue);
+        }
+      }
       list.array.push_back(c);
     }
     if (e.blur) {

@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "../src/metal_compositor.h"
+#include "mf/effects.h"
 #include "mf/macos.h"
 
 using namespace mf;
@@ -235,9 +236,54 @@ static void framingTests() {
                c[0][0], c[1][1], l[1][0], r[0][1]);
 }
 
+// The beauty plugin, built into the build tree's plugins folder, loaded and drawn by the compositor.
+static void pluginTests() {
+  id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+  if (!device) return;
+  std::vector<std::string> errors;
+  std::vector<std::string> types = macos::loadEffectPlugins(&errors);
+  for (const std::string& e : errors) std::fprintf(stderr, "  plugin: %s\n", e.c_str());
+  CHECK(errors.empty());
+  const EffectInfo* info = findEffect("beauty");
+  CHECK(info && info->params.size() == 3 && info->param("whiten") == 1);
+  if (!info) return;
+  CHECK(macos::loadEffectPlugins(&errors).empty() && errors.empty());  // loaded once: again is a no-op
+
+  auto beauty = [](float smooth, float whiten, float sharpen) {
+    ComposedEffects e;
+    e.plugins.push_back({"beauty", {smooth, whiten, sharpen}});
+    return e;
+  };
+  // Skin: whitened by the log curve, log(c·(k − 1) + 1) / log(k) with k = 1 + 4·whiten.
+  Color skin{0.85f, 0.62f, 0.50f, 1};
+  auto lift = [](float c) { return std::log(c * 4 + 1) / std::log(5.0f); };
+  Rgb whitened{lift(skin.r), lift(skin.g), lift(skin.b)};
+  ComposedFrame f;
+  f.layers = {colorLayer(skin, 1, -1)};
+  f.layers[0].effects = beauty(0, 1, 0);
+  CHECK(near(render(device, f, {32})[0], whitened));
+  // On a track's combined image too.
+  f.layers[0].effects = {};
+  f.layers[0].group = 0;
+  f.groups = {track()};
+  f.groups[0].effects = beauty(0, 1, 0);
+  CHECK(near(render(device, f, {32})[0], whitened));
+  // Not skin, and flat: smoothing and sharpening leave it as it is.
+  Color blue{0.2f, 0.4f, 0.9f, 1};
+  ComposedFrame g;
+  g.layers = {colorLayer(blue, 1, -1)};
+  g.layers[0].effects = beauty(1, 1, 1);
+  CHECK(near(render(device, g, {32})[0], Rgb{blue.r, blue.g, blue.b}));
+  // An effect no plugin has is skipped; the plugin effect still runs before the blur.
+  g.layers[0].effects.plugins.insert(g.layers[0].effects.plugins.begin(), ComposedPluginEffect{"missing", {1}});
+  g.layers[0].effects.blur = 0.01f;
+  CHECK(near(render(device, g, {32})[0], Rgb{blue.r, blue.g, blue.b}));
+}
+
 int main(int argc, char** argv) {
   compositorTests();
   framingTests();
+  pluginTests();
   if (argc < 2) {
     std::fprintf(stderr, "usage: %s clip.mp4|audio.m4a\n", argv[0]);
     return 2;

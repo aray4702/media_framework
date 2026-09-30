@@ -5,6 +5,8 @@
 #include <functional>
 #include <vector>
 
+#include "mf/effects.h"
+
 // Runs a block when its control acts, and another to show the model's current value.
 @interface Binding : NSObject
 @property(nonatomic, copy) void (^action)(id sender);
@@ -43,6 +45,24 @@ void setConstant(mf::Animatable& a, double v) {
 
 using ItemRef = std::function<mf::SceneItem&()>;
 using EffectsRef = std::function<mf::SceneEffects&()>;
+
+// The effect of this plugin type among `e`'s; with `add`, added at its defaults when missing.
+mf::ScenePluginEffect* pluginEffect(mf::SceneEffects& e, const mf::EffectInfo& info, bool add) {
+  for (mf::ScenePluginEffect& p : e.plugins) {
+    if (p.type == info.type) return &p;
+  }
+  if (!add) return nullptr;
+  mf::ScenePluginEffect p;
+  p.type = info.type;
+  for (const mf::EffectParamInfo& param : info.params) p.params.emplace_back(param.defaultValue);
+  e.plugins.push_back(std::move(p));
+  return &e.plugins.back();
+}
+
+NSString* capitalized(const std::string& name) {  // "smooth" → "Smooth"
+  NSString* s = [NSString stringWithUTF8String:name.c_str()];
+  return s.length ? [[s substringToIndex:1].uppercaseString stringByAppendingString:[s substringFromIndex:1]] : s;
+}
 }  // namespace
 
 @implementation InspectorView {
@@ -479,6 +499,35 @@ using EffectsRef = std::function<mf::SceneEffects&()>;
              fx().chromaKey = true;
              fx().keySoftness = float(v);
            }];
+  // One section per loaded effect plugin, from the parameters it declares.
+  for (const mf::EffectInfo* info : mf::registeredEffects()) {
+    EffectsRef f = fx;
+    [self check:capitalized(info->displayName.empty() ? info->type : info->displayName)
+            get:^{
+              return pluginEffect(f(), *info, false) != nullptr;
+            }
+            set:^(bool on) {
+              if (on) {
+                pluginEffect(f(), *info, true);
+              } else {
+                auto& list = f().plugins;
+                list.erase(std::remove_if(list.begin(), list.end(), [&](const mf::ScenePluginEffect& p) { return p.type == info->type; }),
+                           list.end());
+              }
+            }];
+    for (size_t k = 0; k < info->params.size(); ++k) {
+      const mf::EffectParamInfo& param = info->params[k];
+      double byDefault = param.defaultValue;
+      [self slider:capitalized(param.name) min:param.min max:param.max
+               get:^{
+                 mf::ScenePluginEffect* p = pluginEffect(f(), *info, false);
+                 return p ? p->params[k].value : byDefault;
+               }
+               set:^(double v) {
+                 setConstant(pluginEffect(f(), *info, true)->params[k], v);  // turns the effect on
+               }];
+    }
+  }
 }
 
 - (void)buildItem:(int)k track:(int)t {

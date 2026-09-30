@@ -1,5 +1,6 @@
 // Minimal demo player: open clips, play/pause, seek bar (scrubbing pauses while dragging),
-// brightness and contrast sliders. Several clips play back to back with a slide between them.
+// brightness and contrast sliders, and a beauty slider when the beauty effect plugin is loaded.
+// Several clips play back to back with a slide between them.
 //
 //   mf_demo [options] [clip.mp4 ...]
 //   mf_demo --autotest [options] clip.mp4 [clip.mp4 ...] [play-seconds]
@@ -12,6 +13,7 @@
 //   --driver auto|vsync|leading    what sets the output times while playing (default auto)
 //   --export out.mp4               render the scene into a file instead of playing it
 //   --size WxH, --fps N            export size (default 1920x1080) and frame rate (default 30)
+//   --beauty N                     the beauty effect plugin on every video and image, 0 to 1
 
 #import <AppKit/AppKit.h>
 #import <QuartzCore/QuartzCore.h>
@@ -23,6 +25,7 @@
 #include <atomic>
 #include <random>
 
+#include "mf/effects.h"
 #include "mf/exporter.h"
 #include "mf/macos.h"
 #include "mf/player.h"
@@ -66,6 +69,7 @@ struct Options {
   mf::ExportSettings exportSettings;
   BOOL autotest = NO;
   double playSeconds = 8;
+  double beauty = 0;
 };
 
 @interface Controller : NSObject <NSApplicationDelegate>
@@ -168,6 +172,30 @@ static mf::Result sceneFromClips(mf::PlatformFactory& platform, const Options& o
   return mf::Result::Ok;
 }
 
+// Puts the beauty effect (from its plugin) on every video and image item, replacing any it had:
+// smooth by `amount`, whiten by half of it, sharpen at its default. 0 takes it off. False when
+// no plugin loaded has the effect.
+static bool applyBeauty(mf::Scene* scene, double amount) {
+  const mf::EffectInfo* info = mf::findEffect("beauty");
+  if (!info) return false;
+  int smooth = info->param("smooth"), whiten = info->param("whiten");
+  for (mf::SceneTrack& track : scene->tracks) {
+    for (mf::SceneItem& it : track.items) {
+      if (it.type != mf::ItemType::Video && it.type != mf::ItemType::Image) continue;
+      auto& list = it.effects.plugins;
+      list.erase(std::remove_if(list.begin(), list.end(), [](const mf::ScenePluginEffect& p) { return p.type == "beauty"; }), list.end());
+      if (amount <= 0) continue;
+      mf::ScenePluginEffect beauty;
+      beauty.type = info->type;
+      for (const mf::EffectParamInfo& param : info->params) beauty.params.emplace_back(param.defaultValue);
+      if (smooth >= 0) beauty.params[smooth] = mf::Animatable(amount);
+      if (whiten >= 0) beauty.params[whiten] = mf::Animatable(amount / 2);
+      list.push_back(std::move(beauty));
+    }
+  }
+  return true;
+}
+
 @implementation Controller {
   NSWindow* _window;
   VideoView* _video;
@@ -177,6 +205,8 @@ static mf::Result sceneFromClips(mf::PlatformFactory& platform, const Options& o
   NSTextField* _statusLabel;
   NSSlider* _brightness;
   NSSlider* _contrast;
+  NSSlider* _beauty;
+  mf::Scene _scene;  // as opened, with the beauty slider's effect: live edits go through updateAppearance
   NSTimer* _timer;
   std::unique_ptr<mf::PlatformFactory> _platform;
   std::unique_ptr<Listener> _listener;
@@ -274,6 +304,17 @@ static mf::Result sceneFromClips(mf::PlatformFactory& platform, const Options& o
   NSButton* reset = [NSButton buttonWithTitle:@"Reset" target:self action:@selector(resetFilter:)];
   reset.frame = NSMakeRect(572, 42, 70, 28);
   [content addSubview:reset];
+  // The beauty effect plugin on every video and image, applied live to the open scene.
+  NSTextField* beauty = [NSTextField labelWithString:@"Beauty"];
+  beauty.frame = NSMakeRect(660, 46, 50, 20);
+  [content addSubview:beauty];
+  _beauty = [NSSlider sliderWithValue:std::clamp(_options.beauty, 0.0, 1.0) minValue:0 maxValue:1 target:self action:@selector(beautyChanged:)];
+  _beauty.frame = NSMakeRect(714, 44, 200, 24);
+  _beauty.continuous = YES;
+  _beauty.enabled = mf::findEffect("beauty") != nullptr;
+  beauty.textColor = _beauty.enabled ? NSColor.labelColor : NSColor.disabledControlTextColor;
+  _beauty.toolTip = _beauty.enabled ? nil : @"The beauty effect plugin isn't loaded";
+  [content addSubview:_beauty];
 
   [_window center];
   [_window makeKeyAndOrderFront:nil];
@@ -299,8 +340,10 @@ static mf::Result sceneFromClips(mf::PlatformFactory& platform, const Options& o
   std::string error;
   mf::Result r = mf::macos::loadScene(path.UTF8String, &scene, &error);
   if (r == mf::Result::Ok) {
+    if (_beauty.doubleValue > 0) applyBeauty(&scene, _beauty.doubleValue);  // at 0, the document's own effects stay
     r = _player->open(scene, mf::macos::targetFromView((__bridge void*)_video), _options.driver, &error);
     _player->setFilter([self currentFilter]);
+    _scene = std::move(scene);
   }
   if (r != mf::Result::Ok) [self failed:[NSString stringWithFormat:@"%s: %s", mf::toString(r), error.c_str()]];
 }
@@ -315,8 +358,10 @@ static mf::Result sceneFromClips(mf::PlatformFactory& platform, const Options& o
   std::string error;
   mf::Result r = sceneFromClips(*_platform, _options, paths, NO, &scene, &error);
   if (r == mf::Result::Ok) {
+    applyBeauty(&scene, _beauty.doubleValue);
     r = _player->open(scene, mf::macos::targetFromView((__bridge void*)_video), _options.driver, &error);
     _player->setFilter([self currentFilter]);
+    _scene = std::move(scene);
   }
   if (r != mf::Result::Ok) [self failed:[NSString stringWithFormat:@"%s: %s", mf::toString(r), error.c_str()]];
 }
@@ -333,6 +378,13 @@ static mf::Result sceneFromClips(mf::PlatformFactory& platform, const Options& o
   _brightness.doubleValue = 0;
   _contrast.doubleValue = 1;
   [self filterChanged:sender];
+}
+
+// An appearance edit: the open frame is redrawn (or the next one shows it) without reopening.
+// Before the scene is ready it's refused, and the next open takes the slider's value.
+- (void)beautyChanged:(id)sender {
+  if (!_player || !applyBeauty(&_scene, _beauty.doubleValue)) return;
+  _player->updateAppearance(_scene);
 }
 
 - (void)togglePlay:(id)sender {
@@ -484,6 +536,10 @@ static int exportScene(const Options& o) {
   std::string error;
   mf::Result r = o.scenePath ? mf::macos::loadScene(o.scenePath.UTF8String, &scene, &error)  // its own size and rate
                              : sceneFromClips(*platform, o, o.paths, YES, &scene, &error);
+  if (r == mf::Result::Ok && o.beauty > 0 && !applyBeauty(&scene, o.beauty)) {
+    r = mf::Result::InvalidArgument;
+    error = "--beauty: the beauty effect plugin isn't loaded";
+  }
   if (r == mf::Result::Ok) r = exporter->start(scene, target, o.exportSettings, &error);
   if (r != mf::Result::Ok) {
     std::printf("ERROR %s %s\n", mf::toString(r), error.c_str());
@@ -501,6 +557,10 @@ static int exportScene(const Options& o) {
 int main(int argc, const char** argv) {
   setvbuf(stdout, nullptr, _IOLBF, 0);
   @autoreleasepool {
+    // Effect plugins first: they add effect types that scenes can use.
+    std::vector<std::string> pluginErrors;
+    mf::macos::loadEffectPlugins(&pluginErrors);
+    for (const std::string& e : pluginErrors) std::fprintf(stderr, "effect plugin not loaded: %s\n", e.c_str());
     Options options;
     NSMutableArray<NSString*>* paths = [NSMutableArray array];
     NSCharacterSet* numeric = [NSCharacterSet characterSetWithCharactersInString:@"0123456789."];
@@ -533,6 +593,9 @@ int main(int argc, const char** argv) {
         ++i;
       } else if ([arg isEqualToString:@"--fps"] && value) {
         options.exportSettings.fps = value.intValue;
+        ++i;
+      } else if ([arg isEqualToString:@"--beauty"] && value) {
+        options.beauty = std::clamp(value.doubleValue, 0.0, 1.0);
         ++i;
       } else if ([arg isEqualToString:@"--transition-ms"] && value) {
         options.transitionUs = static_cast<int64_t>(value.doubleValue * 1000);

@@ -162,6 +162,12 @@ static ComposedEffects evaluate(const SceneEffects& e, int64_t at) {
     out.saturation = float(e.saturation.at(at));
   }
   if (e.blur) out.blur = float(e.blurRadius.at(at));
+  for (const ScenePluginEffect& p : e.plugins) {
+    ComposedPluginEffect c;
+    c.type = p.type;
+    for (const Animatable& a : p.params) c.params.push_back(float(a.at(at)));
+    out.plugins.push_back(std::move(c));
+  }
   if (e.chromaKey) {
     out.chromaKey = true;
     out.keyColor = e.keyColor;

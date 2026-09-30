@@ -144,7 +144,14 @@ struct TextStyle {
   }
 };
 
-// Effects (§4.4) as drawn in one output frame, applied crop → chromaKey → colorAdjust → blur.
+// A plugin effect (mf/effects.h) as drawn in one output frame.
+struct ComposedPluginEffect {
+  std::string type;
+  std::vector<float> params;  // in the order of the type's EffectInfo
+  bool operator==(const ComposedPluginEffect& o) const { return type == o.type && params == o.params; }
+};
+
+// Effects (§4.4) as drawn in one output frame, applied crop → chromaKey → colorAdjust → plugins → blur.
 struct ComposedEffects {
   float crop[4] = {0, 0, 0, 0};              // left, top, right, bottom fractions removed
   float brightness = 0, contrast = 1, saturation = 1;
@@ -152,10 +159,11 @@ struct ComposedEffects {
   bool chromaKey = false;
   Color keyColor;
   float keyTolerance = 0.15f, keySoftness = 0.1f;
+  std::vector<ComposedPluginEffect> plugins;  // in document order
   bool operator==(const ComposedEffects& o) const {
     return std::equal(crop, crop + 4, o.crop) && brightness == o.brightness && contrast == o.contrast &&
            saturation == o.saturation && blur == o.blur && chromaKey == o.chromaKey && keyColor == o.keyColor &&
-           keyTolerance == o.keyTolerance && keySoftness == o.keySoftness;
+           keyTolerance == o.keyTolerance && keySoftness == o.keySoftness && plugins == o.plugins;
   }
 };
 

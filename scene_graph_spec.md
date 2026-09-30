@@ -115,7 +115,7 @@ Animatable fields and their ranges (checked on every key):
 
 ### 4.4 Effects
 
-An item has **at most one effect of each type**, and they always apply **in this order**, whatever the list order: `crop` → `chromaKey` → `colorAdjust` → `blur`. They act on the item's own image, before fit and transform.
+An item has **at most one effect of each type**, and at most 8 in all. They always apply **in this order**, whatever the list order: `crop` → `chromaKey` → `colorAdjust` → plugin effects (in list order) → `blur`. They act on the item's own image, before fit and transform.
 
 A **video track** can have `effects` too, with the same types, order and limits. They act on the track's combined image (§5.1), in output coordinates: `crop` removes those fractions of the output, and `blur`'s σ is relative to the output height. Their keyframe times are scene time, not item time. A fixed order keeps every effect a single shader pass, except blur, which needs two. RGB values are in 0–1:
 
@@ -127,6 +127,18 @@ A **video track** can have `effects` too, with the same types, order and limits.
 | `chromaKey` | `color`, `tolerance` (0.15), `softness` (0.1) | `d` = distance in the CbCr plane from `color`; `α' = α · smoothstep(tolerance, tolerance + softness, d)` |
 
 An effect type the renderer doesn't know is a validation error, not silently skipped, so a document never renders differently from what was authored.
+
+**Plugin effects.** Any other `type` names an effect from an effect plugin, which must be loaded before the document is parsed or opened. A plugin declares its type and its parameters (name, default, minimum, maximum). In a document, each parameter is a key of the effect, animatable like any other number. Parameters that are left out take their defaults. An unknown key, a value outside the plugin's range (R7) or a type no loaded plugin has is a validation error, as for the built-in effects. For example, with the `beauty` plugin (in `plugins/beauty`):
+
+```json
+"effects": [{ "type": "beauty", "smooth": 0.6, "whiten": { "keys": [[0, 0], [1, 0.3]] } }]
+```
+
+| Plugin `type` | Parameters | Definition |
+| --- | --- | --- |
+| `beauty` | `smooth` (0.5), `whiten` (0.2), `sharpen` (0.2), all 0–1 | Skin mask `k` from a feathered CbCr box. Bilateral blur (σ = (0.002 + 0.004·smooth) × output height). `rgb' = mix(rgb, blurred, smooth·k)`, then a log lift `log(c·4w + 1) / log(1 + 4w)` by `k`, where w = whiten, then `+ sharpen·(1 − k)·(rgb − blurred)` |
+
+On macOS, a plugin is a `.dylib` that implements [effect_plugin.h](platform/macos/include/mf/effect_plugin.h): it gets the image with the effects before it applied, as an RGBA16F texture the size of the item on screen, and writes its result to another. `mf::macos::loadEffectPlugins()` loads plugins from `$MF_EFFECT_PLUGIN_PATH`, `plugins/` next to the executable, an app bundle's `PlugIns`, `~/Library/Application Support/Media Framework/Plugins` and the build tree. The core registry is [effects.h](core/include/mf/effects.h).
 
 ### 4.5 Text
 
@@ -212,7 +224,7 @@ The **schema** checks structure, types, enumerations, required fields and fixed 
 | R9 *(runtime)* | Each `src` opens and has the needed track: video for `video`, audio for `audio`, a decodable image for `image` |
 | R10 *(runtime)* | A media item's `in` lies inside its file (for duration 0 as well). If the file ends before `in + duration × speed`, the item holds its last frame (video) or goes silent (audio) |
 | R11 *(runtime)* | At most 8 video and audio items play at once, counting each item from 1 s before its start (so its decoder can start early). Each such item needs its own decoder, and the platform's hardware limits still apply (e.g. two 4K H.264 streams at once on Apple silicon) |
-| R12 | An item or a track has at most one effect of each type (§4.4); only video tracks have effects |
+| R12 | An item or a track has at most one effect of each type and 8 in all, each built in or from a loaded effect plugin (§4.4); only video tracks have effects |
 
 A document that fails R1–R8 or R12 is rejected by `open()` or `Exporter::start()` with `InvalidArgument`, before anything is decoded. R9–R11 fail asynchronously through `onError`, like media errors today.
 
@@ -230,6 +242,7 @@ The engine plays and exports scenes: `Player::open(const Scene&, ...)`, `Exporte
 | Per-item frame selection; `composeAt(t)` evaluates every visible item into a `ComposedLayer`, and a track that is combined on its own into a `ComposedGroup` (its effects, opacity, blend) | [core/src/composition.cpp](core/src/composition.cpp) |
 | Audio mix: every sounding item, resampled and sped up by reading at its media time | `AudioStage` in [core/src/pipeline.cpp](core/src/pipeline.cpp) |
 | Drawing: fit, transform, blend modes, effects, blur passes, wipe clips, styled text; a grouped track is drawn into its own texture first, then onto the canvas | [platform/macos/src/metal_compositor.mm](platform/macos/src/metal_compositor.mm) |
+| Effect plugins: the core's registry of types and parameters; the macOS plugin interface and loader; the beauty plugin | [core/src/effects.cpp](core/src/effects.cpp), [platform/macos/include/mf/effect_plugin.h](platform/macos/include/mf/effect_plugin.h), [platform/macos/src/effect_plugins.mm](platform/macos/src/effect_plugins.mm), [plugins/beauty/beauty.mm](plugins/beauty/beauty.mm) |
 | Image items | [platform/macos/src/image_loader.mm](platform/macos/src/image_loader.mm) (ImageIO, EXIF orientation) |
 
 - **Lanes.** Each video or audio item gets a lane: its own decoders and queues. Lanes are assigned greedily in start order, and an item can reuse a lane once the lane's previous item has ended, counting from 1 s before the new item starts. That's the fewest lanes possible. For clips joined by transitions this gives the two alternating lanes the timeline engine used.

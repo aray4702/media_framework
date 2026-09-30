@@ -1202,6 +1202,10 @@ struct Dropped {
 
 int main(int argc, const char** argv) {
   @autoreleasepool {
+    // Effect plugins first: they add effect types that documents, and the inspector, can use.
+    std::vector<std::string> pluginErrors;
+    mf::macos::loadEffectPlugins(&pluginErrors);
+    for (const std::string& e : pluginErrors) NSLog(@"[mf_editor] effect plugin not loaded: %s", e.c_str());
     NSMutableArray<NSString*>* files = [NSMutableArray array];
     for (int i = 1; i < argc; ++i) {
       NSString* arg = [NSString stringWithUTF8String:argv[i]];
