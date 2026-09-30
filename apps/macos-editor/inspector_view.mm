@@ -822,6 +822,13 @@ NSString* effectNames(const mf::SceneEffects& e) {
     [self animatable:@"Y" min:-0.5 max:1.5 ref:[item]() -> mf::Animatable& { return item().transform.y; }];
     [self animatable:@"Scale" min:0.1 max:4 ref:[item]() -> mf::Animatable& { return item().transform.scale; }];
     [self animatable:@"Rotation" min:-180 max:180 ref:[item]() -> mf::Animatable& { return item().transform.rotation; }];
+    [self check:@"Mirror"
+            get:^{
+              return item().transform.flipX;
+            }
+            set:^(bool on) {
+              item().transform.flipX = on;
+            }];
     [self animatable:@"Opacity" min:0 max:1 ref:[item]() -> mf::Animatable& { return item().opacity; }];
     if (type != mf::ItemType::Text) {
       [self popup:@"Fit"

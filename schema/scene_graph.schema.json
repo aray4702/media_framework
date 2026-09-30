@@ -582,6 +582,11 @@
           "$ref": "#/$defs/animatable",
           "default": 0,
           "description": "Degrees, clockwise."
+        },
+        "flipX": {
+          "type": "boolean",
+          "default": false,
+          "description": "Mirrors the item's image left to right within its box (after crop)."
         }
       }
     },

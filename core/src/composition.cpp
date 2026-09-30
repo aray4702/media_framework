@@ -189,23 +189,28 @@ ComposedFrame FrameSampler::composeAt(int64_t t) const {
   out.filter = ctx_.filter();
   int lead = leadItem(t);
   out.frameDurationUs = lead >= 0 ? ctx_.items[lead].info.video.frameDurationUs : int64_t(ctx_.fpsDen) * 1000000 / ctx_.fpsNum;
+  composeLayers(ctx_.scene, layout(), ctx_.items, t, [this](int item) { return frameOf(item); }, &out);
+  return out;
+}
 
+void composeLayers(const Scene& scene, const SceneLayout& layout, const std::vector<ItemRuntime>& items, int64_t t,
+                   const std::function<const VideoFrame*(int item)>& videoFrame, ComposedFrame* out) {
   std::vector<SceneLayout::Visible> visible;
-  layout().visibleAt(t, &visible);
+  layout.visibleAt(t, &visible);
   // A track is drawn on its own first (a group) while two of its items are visible, or when it
   // has effects (§5.1). A lone item without track effects is drawn onto the canvas directly.
-  const std::vector<SceneTrack>& tracks = ctx_.scene.tracks;
+  const std::vector<SceneTrack>& tracks = scene.tracks;
   std::vector<int> shown(tracks.size(), 0), groupOf(tracks.size(), -1);
   for (const SceneLayout::Visible& v : visible) ++shown[v.track];
   for (const SceneLayout::Visible& v : visible) {
-    const SceneItem& it = layout().item(v.item);
-    const ItemRuntime& rt = ctx_.items[v.item];
+    const SceneItem& it = layout.item(v.item);
+    const ItemRuntime& rt = items[v.item];
     int64_t local = t - it.startUs;
     ComposedLayer l;
     l.item = v.item;
     switch (it.type) {
       case ItemType::Video: {
-        const VideoFrame* f = frameOf(v.item);
+        const VideoFrame* f = videoFrame(v.item);
         if (!f) continue;  // not decoded yet: nothing to draw
         l.kind = ComposedLayer::Kind::Video;
         l.frame = *f;
@@ -235,6 +240,7 @@ ComposedFrame FrameSampler::composeAt(int64_t t) const {
     l.anchorY = tr.anchorY;
     l.scale = float(tr.scale.at(local));
     l.rotation = float(tr.rotation.at(local));
+    l.flipX = tr.flipX;
     l.offsetX = v.offsetX;
     l.offsetY = v.offsetY;
     std::copy(v.clip, v.clip + 4, l.clip);
@@ -244,14 +250,14 @@ ComposedFrame FrameSampler::composeAt(int64_t t) const {
     if (shown[v.track] > 1 || track.effects.any()) {
       int& g = groupOf[v.track];
       if (g < 0) {
-        g = int(out.groups.size());
+        g = int(out->groups.size());
         ComposedGroup group;
         group.track = v.track;
         group.opacity = track.opacity;
         group.effects = evaluate(track.effects, t);
-        out.groups.push_back(group);
+        out->groups.push_back(group);
       }
-      out.groups[g].blend = it.blend;  // the top item's: the one drawn last
+      out->groups[g].blend = it.blend;  // the top item's: the one drawn last
       l.group = g;
       l.opacity = opacity;
       l.blend = v.mix ? Blend::Add : Blend::Normal;  // combined over a transparent image
@@ -259,9 +265,8 @@ ComposedFrame FrameSampler::composeAt(int64_t t) const {
       l.opacity = opacity * track.opacity;
       l.blend = it.blend;
     }
-    out.layers.push_back(std::move(l));
+    out->layers.push_back(std::move(l));
   }
-  return out;
 }
 
 namespace {

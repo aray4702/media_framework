@@ -261,9 +261,9 @@ bool MetalCompositor::prepare(const ComposedLayer& l, double W, double H, double
     p->vert.pos[2 * k] = float(2 * x / W - 1);
     p->vert.pos[2 * k + 1] = float(1 - 2 * y / H);
   }
-  p->vert.uv[0] = u0;
+  p->vert.uv[0] = l.flipX ? u1 : u0;  // mirrored: the box stays, its image reads right to left
   p->vert.uv[1] = v0;
-  p->vert.uv[2] = u1;
+  p->vert.uv[2] = l.flipX ? u0 : u1;
   p->vert.uv[3] = v1;
   return true;
 }

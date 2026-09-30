@@ -2,6 +2,7 @@
 // the compositor's track groups (scene_graph_spec.md §5.1) by reading back rendered pixels.
 // Usage: macos_adapter_tests clip.mp4
 
+#import <CoreVideo/CoreVideo.h>
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
@@ -236,6 +237,49 @@ static void framingTests() {
                c[0][0], c[1][1], l[1][0], r[0][1]);
 }
 
+// flipX: an image, red on its left half and blue on its right, drawn filling the canvas, is
+// mirrored within its box; with its left quarter cropped, the crop is of the image, before the flip.
+static void flipTests() {
+  id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+  if (!device) return;
+  NSDictionary* attrs = @{(id)kCVPixelBufferIOSurfacePropertiesKey : @{}, (id)kCVPixelBufferMetalCompatibilityKey : @YES};
+  CVPixelBufferRef pixels = nullptr;
+  CHECK(CVPixelBufferCreate(nullptr, 16, 8, kCVPixelFormatType_32BGRA, (__bridge CFDictionaryRef)attrs, &pixels) == kCVReturnSuccess);
+  if (!pixels) return;
+  CVPixelBufferLockBaseAddress(pixels, 0);
+  auto* base = static_cast<uint8_t*>(CVPixelBufferGetBaseAddress(pixels));
+  size_t stride = CVPixelBufferGetBytesPerRow(pixels);
+  for (int y = 0; y < 8; ++y) {
+    for (int x = 0; x < 16; ++x) {
+      uint8_t* p = base + y * stride + x * 4;  // B, G, R, A
+      bool left = x < 8;
+      p[0] = left ? 0 : 255, p[1] = 0, p[2] = left ? 255 : 0, p[3] = 255;
+    }
+  }
+  CVPixelBufferUnlockBaseAddress(pixels, 0);
+  auto image = [&](bool flip, float cropLeft, float blur = 0) {
+    ComposedLayer l;
+    l.kind = ComposedLayer::Kind::Image;
+    l.frame.image = std::shared_ptr<void>(CVPixelBufferRetain(pixels), [](void* p) { CVPixelBufferRelease(static_cast<CVPixelBufferRef>(p)); });
+    l.fit = Fit::Fill;
+    l.flipX = flip;
+    l.effects.crop[0] = cropLeft;
+    l.effects.blur = blur;
+    ComposedFrame f;
+    f.layers = {l};
+    return render(device, f, {8, 56});
+  };
+  const Rgb red{1, 0, 0}, blue{0, 0, 1};
+  std::vector<Rgb> plain = image(false, 0), flipped = image(true, 0), cropped = image(true, 0.25f);
+  CHECK(near(plain[0], red) && near(plain[1], blue));
+  CHECK(near(flipped[0], blue) && near(flipped[1], red));
+  CHECK(near(cropped[0], blue) && near(cropped[1], red));  // a third red (x 4 to 8 of 4 to 16), mirrored to the right
+  // Through an effects texture (a tiny blur takes the offscreen path): still mirrored.
+  std::vector<Rgb> offscreen = image(true, 0, 0.001f);
+  CHECK(near(offscreen[0], blue) && near(offscreen[1], red));
+  CVPixelBufferRelease(pixels);
+}
+
 // The beauty plugin, built into the build tree's plugins folder, loaded and drawn by the compositor.
 static void pluginTests() {
   id<MTLDevice> device = MTLCreateSystemDefaultDevice();
@@ -283,6 +327,7 @@ static void pluginTests() {
 int main(int argc, char** argv) {
   compositorTests();
   framingTests();
+  flipTests();
   pluginTests();
   if (argc < 2) {
     std::fprintf(stderr, "usage: %s clip.mp4|audio.m4a\n", argv[0]);

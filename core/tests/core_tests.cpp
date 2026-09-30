@@ -352,14 +352,16 @@ TEST(player_redraws_an_appearance_edit_without_reopening) {
   size_t frames = h.platform.display->composed.size();
   int64_t decoded = h.player->metrics().decodeOnly;
 
+  CHECK(!h.lastComposed().layers[0].flipX);
   scene.tracks[0].items[0].transform.x = Animatable(0.25);
+  scene.tracks[0].items[0].transform.flipX = true;
   scene.tracks[0].items[0].text = "Yo";
   CHECK(h.player->updateAppearance(scene) == Result::Ok);
   h.run(10);
   CHECK_EQ(h.platform.display->composed.size(), frames + 1);
   const ComposedFrame& f = h.lastComposed();
   CHECK_EQ(f.layers.size(), size_t(1));
-  CHECK(f.layers[0].x == 0.25f);
+  CHECK(f.layers[0].x == 0.25f && f.layers[0].flipX);
   CHECK(*f.layers[0].text == "Yo");
   CHECK(h.listener.seeks.empty());
   CHECK_EQ(h.player->metrics().decodeOnly, decoded);
@@ -1039,6 +1041,7 @@ TEST(scene_serializes_every_field_back) {
   a.mute = true;
   a.pan = Animatable(-0.5);
   a.transform.anchorX = 0;
+  a.transform.flipX = true;
   a.transform.x.keys = {{0, 0.25, Easing::bezier(0.1f, 0.2f, 0.3f, 0.4f)}, {2000000, 0.75, Easing{Easing::Kind::Hold}}, {4000000, 0.5, std::nullopt}};
   a.transform.x.easing = Easing::bezier(0.42f, 0, 0.58f, 1);
   a.effects.crop = a.effects.chromaKey = a.effects.colorAdjust = true;
@@ -1097,7 +1100,8 @@ TEST(scene_serializes_every_field_back) {
   CHECK_EQ(ba.transform.x.keys.size(), size_t(3));
   CHECK(ba.transform.x.keys[0].easing && ba.transform.x.keys[0].easing->x2 == 0.3f);
   CHECK(ba.transform.x.keys[1].easing && ba.transform.x.keys[1].easing->kind == Easing::Kind::Hold && !ba.transform.x.keys[2].easing);
-  CHECK(ba.transform.x.easing.x1 == 0.42f && ba.transform.anchorX == 0);
+  CHECK(ba.transform.x.easing.x1 == 0.42f && ba.transform.anchorX == 0 && ba.transform.flipX);
+  CHECK(!back.tracks[1].items[1].transform.flipX);
   CHECK(ba.effects.crop && ba.effects.chromaKey && ba.effects.colorAdjust && ba.effects.saturation.value == 1.4);
   CHECK(back.tracks[1].items[1].blend == Blend::Screen && back.tracks[1].items[1].fit == Fit::Cover);
   CHECK(back.tracks[1].effects.blur && back.tracks[1].opacity == 0.8f);

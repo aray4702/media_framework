@@ -239,6 +239,11 @@ void setConstant(mf::Animatable& a, double v) {
   NSAffineTransform* place = [NSAffineTransform transform];
   [place translateXBy:anchor.x yBy:anchor.y];
   [place rotateByRadians:b.rad];
+  if (it.transform.flipX) {  // mirrored within its box, as the compositor draws it
+    [place translateXBy:NSMidX(box) yBy:0];
+    [place scaleXBy:-1 yBy:1];
+    [place translateXBy:-NSMidX(box) yBy:0];
+  }
   [place concat];
   CGContextSetAlpha(NSGraphicsContext.currentContext.CGContext, std::clamp(it.opacity.at(local), 0.0, 1.0));
   switch (it.type) {

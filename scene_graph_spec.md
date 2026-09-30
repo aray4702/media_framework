@@ -65,6 +65,7 @@ Why a format of our own: OTIO is the standard for moving an edit between tools, 
    This gives the item's box.
 2. **Transform** the box:
    - `anchor` `[ax, ay]` (default `[0.5, 0.5]`) is a point of the box, in fractions of the box;
+   - `flipX` (default false) mirrors the item's image left to right within its box (after `crop`), as for a front camera: the box itself doesn't move;
    - `scale` (default 1) and `rotation` (degrees, clockwise, default 0) apply about the anchor;
    - the anchor is then placed at `(x · width, y · height)` of the output (defaults 0.5, 0.5, so centered).
 

@@ -183,6 +183,7 @@ struct ComposedLayer {
   float x = 0.5f, y = 0.5f;                  // fractions of the output
   float anchorX = 0.5f, anchorY = 0.5f;      // fractions of the item's box
   float scale = 1, rotation = 0;             // rotation in degrees, clockwise
+  bool flipX = false;                        // the image mirrored left to right within its box
   float offsetX = 0, offsetY = 0;            // transition (push, slide), in output widths / heights
   float clip[4] = {0, 0, 1, 1};              // visible output region x0, y0, x1, y1 (wipe)
 

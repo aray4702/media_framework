@@ -248,10 +248,10 @@ class Reader {
 
   bool transform(const Value* v, const std::string& path, SceneTransform* out) {
     if (!v) return true;
-    if (!object(*v, path, {"x", "y", "anchor", "scale", "rotation"})) return false;
+    if (!object(*v, path, {"x", "y", "anchor", "scale", "rotation", "flipX"})) return false;
     if (!animatable(v->find("x"), path + ".x", &out->x) || !animatable(v->find("y"), path + ".y", &out->y) ||
         !animatable(v->find("scale"), path + ".scale", &out->scale) ||
-        !animatable(v->find("rotation"), path + ".rotation", &out->rotation)) {
+        !animatable(v->find("rotation"), path + ".rotation", &out->rotation) || !boolean(v->find("flipX"), path + ".flipX", &out->flipX)) {
       return false;
     }
     if (const Value* a = v->find("anchor")) {
@@ -803,6 +803,7 @@ class Writer {
       if (t.anchorX != 0.5f || t.anchorY != 0.5f) json::add(&tr, "anchor", json::array({num(t.anchorX), num(t.anchorY)}));
       addAnim(&tr, "scale", t.scale, 1);
       addAnim(&tr, "rotation", t.rotation, 0);
+      if (t.flipX) json::add(&tr, "flipX", json::boolean(true));
       if (!tr.object.empty()) json::add(&v, "transform", tr);
       addAnim(&v, "opacity", it.opacity, 1);
       static const char* const blends[] = {"normal", "add", "multiply", "screen"};

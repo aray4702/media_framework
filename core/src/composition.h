@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -64,6 +65,14 @@ class FrameSampler {
   std::vector<LaneView> lanes_;
   std::vector<int> seqIndex_;  // per item: its index in its lane's seq, or -1
 };
+
+// Every item visible at t as layers (and tracks drawn on their own as groups), bottom to top,
+// with their values evaluated at t (§5.1): what composeAt draws, shared with the live preview.
+// `videoFrame(i)` is video item i's frame, or null to leave it out (not decoded yet); image and
+// text items come from `items`. Appends to out->layers and out->groups; the caller holds
+// whatever guards `scene`.
+void composeLayers(const Scene& scene, const SceneLayout& layout, const std::vector<ItemRuntime>& items, int64_t t,
+                   const std::function<const VideoFrame*(int item)>& videoFrame, ComposedFrame* out);
 
 // Where a driver's frames go: to T3, in order.
 class CompositionOutput {

@@ -40,6 +40,7 @@ struct Animatable {
 struct SceneTransform {
   Animatable x{0.5}, y{0.5}, scale{1}, rotation{0};
   float anchorX = 0.5f, anchorY = 0.5f;
+  bool flipX = false;  // the image mirrored left to right within its box (e.g. a front camera)
 };
 
 // An effect from a plugin (mf/effects.h): its type, and a value for every parameter of the
