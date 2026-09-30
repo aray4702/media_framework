@@ -63,6 +63,80 @@ NSString* capitalized(const std::string& name) {  // "smooth" → "Smooth"
   NSString* s = [NSString stringWithUTF8String:name.c_str()];
   return s.length ? [[s substringToIndex:1].uppercaseString stringByAppendingString:[s substringFromIndex:1]] : s;
 }
+
+// An effect the Effects tab offers: a built-in one, or a loaded plugin's.
+struct EffectKind {
+  std::string type;
+  NSString* name;
+  const mf::EffectInfo* plugin = nullptr;
+};
+
+EffectKind kindOf(const std::string& type) {
+  if (type == "colorAdjust") return {type, @"Color Adjust"};
+  if (type == "blur") return {type, @"Blur"};
+  if (type == "crop") return {type, @"Crop"};
+  if (type == "chromaKey") return {type, @"Chroma Key"};
+  const mf::EffectInfo* info = mf::findEffect(type);
+  return {type, capitalized(info && !info->displayName.empty() ? info->displayName : type), info};
+}
+
+// Every effect that can be added: the built-in ones, then each loaded plugin's.
+std::vector<EffectKind> allEffects() {
+  std::vector<EffectKind> out;
+  for (const char* t : {"colorAdjust", "blur", "crop", "chromaKey"}) out.push_back(kindOf(t));
+  for (const mf::EffectInfo* info : mf::registeredEffects()) out.push_back(kindOf(info->type));
+  return out;
+}
+
+// The effects on `e`, in the order they apply (§4.4): crop, chroma key, color adjust, plugins, blur.
+std::vector<EffectKind> appliedEffects(const mf::SceneEffects& e) {
+  std::vector<EffectKind> out;
+  if (e.crop) out.push_back(kindOf("crop"));
+  if (e.chromaKey) out.push_back(kindOf("chromaKey"));
+  if (e.colorAdjust) out.push_back(kindOf("colorAdjust"));
+  for (const mf::ScenePluginEffect& p : e.plugins) out.push_back(kindOf(p.type));
+  if (e.blur) out.push_back(kindOf("blur"));
+  return out;
+}
+
+bool hasEffect(const mf::SceneEffects& e, const std::string& type) {
+  for (const EffectKind& k : appliedEffects(e)) {
+    if (k.type == type) return true;
+  }
+  return false;
+}
+
+// Adds the effect at its defaults, or takes it off (back to its defaults).
+void setEffect(mf::SceneEffects& e, const EffectKind& k, bool on) {
+  static const mf::SceneEffects fresh;
+  if (k.type == "colorAdjust") {
+    e.colorAdjust = on;
+    e.brightness = fresh.brightness;
+    e.contrast = fresh.contrast;
+    e.saturation = fresh.saturation;
+  } else if (k.type == "blur") {
+    e.blur = on;
+    e.blurRadius = mf::Animatable(0.01);  // a radius to see: the default, 0, shows nothing
+  } else if (k.type == "crop") {
+    e.crop = on;
+    e.cropLeft = e.cropTop = e.cropRight = e.cropBottom = fresh.cropLeft;
+  } else if (k.type == "chromaKey") {
+    e.chromaKey = on;
+    e.keyColor = {0, 1, 0, 1};  // green screen
+    e.keyTolerance = fresh.keyTolerance;
+    e.keySoftness = fresh.keySoftness;
+  } else {
+    auto& list = e.plugins;
+    list.erase(std::remove_if(list.begin(), list.end(), [&](const mf::ScenePluginEffect& p) { return p.type == k.type; }), list.end());
+    if (on && k.plugin) pluginEffect(e, *k.plugin, true);
+  }
+}
+
+NSString* effectNames(const mf::SceneEffects& e) {
+  NSMutableArray* names = [NSMutableArray array];
+  for (const EffectKind& k : appliedEffects(e)) [names addObject:k.name];
+  return names.count ? [names componentsJoinedByString:@", "] : @"None";
+}
 }  // namespace
 
 @implementation InspectorView {
@@ -70,6 +144,8 @@ NSString* capitalized(const std::string& name) {  // "smooth" → "Smooth"
   editor::Selection* _sel;
   NSStackView* _stack;
   NSMutableArray<Binding*>* _bindings;
+  std::string _effectsShown;  // the effects page: what it was built for (the target and its effects)
+  BOOL _rebuildPending;
 }
 
 - (instancetype)initWithFrame:(NSRect)frame document:(editor::Document*)doc selection:(editor::Selection*)selection {
@@ -114,14 +190,33 @@ NSString* capitalized(const std::string& name) {  // "smooth" → "Smooth"
   return self;
 }
 
+- (void)setEffectsPage:(BOOL)effectsPage {
+  _effectsPage = effectsPage;
+  [self rebuild];
+}
+
+// The effects page's rows depend on which effects are on: when that changes (added, removed, or
+// e.g. a crop dragged in the preview), the page is built again, just after this event, since the
+// control that changed it may be one of its rows.
 - (void)refresh {
+  if (_effectsPage && [self effectsSignature] != _effectsShown && !_rebuildPending) {
+    _rebuildPending = YES;
+    __weak InspectorView* weak = self;
+    dispatch_async(dispatch_get_main_queue(), ^{
+      InspectorView* s = weak;
+      if (!s) return;
+      s->_rebuildPending = NO;
+      [s rebuild];
+    });
+  }
   for (Binding* b in _bindings) b.sync();
 }
 
 - (void)rebuild {
   for (NSView* v in _stack.arrangedSubviews) [v removeFromSuperview];
   [_bindings removeAllObjects];
-  if (_sel->track < 0) [self buildProject];
+  if (_effectsPage) [self buildEffects];
+  else if (_sel->track < 0) [self buildProject];
   else if (_sel->item < 0) [self buildTrack:_sel->track];
   else if (_sel->transition) [self buildTransition:_sel->item track:_sel->track];
   else [self buildItem:_sel->item track:_sel->track];
@@ -419,7 +514,7 @@ NSString* capitalized(const std::string& name) {  // "smooth" → "Smooth"
              set:^(double v) {
                track().opacity = float(v);
              }];
-    [self effects:[track]() -> mf::SceneEffects& { return track().effects; } title:@"Track effects"];
+    [self effectsSummary:[track]() -> mf::SceneEffects& { return track().effects; }];
   } else {
     [self slider:@"Gain" min:0 max:4
              get:^{
@@ -438,95 +533,200 @@ NSString* capitalized(const std::string& name) {  // "smooth" → "Smooth"
         actions:@[ ^{ move(+1); }, ^{ move(-1); }, ^{ [weak.delegate inspectorDeleteSelection]; } ]];
 }
 
-- (void)effects:(EffectsRef)fx title:(NSString*)title {
+// In the properties window: which effects are on. They're added and edited in the Effects tab.
+- (void)effectsSummary:(EffectsRef)fx {
+  [self section:@"Effects"];
+  NSTextField* names = [NSTextField wrappingLabelWithString:@""];
+  names.font = [NSFont systemFontOfSize:NSFont.smallSystemFontSize];
+  [names.widthAnchor constraintEqualToConstant:kControlWidth + kValueWidth].active = YES;
+  Binding* b = [Binding new];
+  b.sync = ^{
+    names.stringValue = effectNames(fx());
+  };
+  [_bindings addObject:b];
+  [self row:@"Applied" views:@[ names ]];
+  __weak InspectorView* weak = self;
+  [self buttons:@[ @"Edit Effects…" ] actions:@[ ^{ [weak.delegate inspectorShowEffects]; } ]];
+}
+
+// The effects page's target: the selected visual item, or video track. Empty when there's none.
+- (EffectsRef)effectsTarget:(NSString**)what {
+  editor::Document* doc = _doc;
+  int t = _sel->track, k = _sel->item;
+  if (t < 0 || _sel->transition || t >= doc->tracks()) return {};
+  if (k < 0) {
+    if (!doc->track(t).video) return {};
+    *what = @"Video track";
+    return [doc, t]() -> mf::SceneEffects& { return doc->track(t).effects; };
+  }
+  const mf::SceneItem& it = doc->item(t, k);
+  if (it.type == mf::ItemType::Audio) return {};
+  static NSString* const kinds[] = {@"Video", @"Image", @"Text", @"Color", @"Audio"};
+  NSString* detail = !it.src.empty() ? [NSString stringWithUTF8String:it.src.c_str()].lastPathComponent
+                     : it.type == mf::ItemType::Text ? [NSString stringWithUTF8String:it.text.c_str()] : nil;
+  *what = detail.length ? [NSString stringWithFormat:@"%@: %@", kinds[int(it.type)], detail] : kinds[int(it.type)];
+  return [doc, t, k]() -> mf::SceneEffects& { return doc->item(t, k).effects; };
+}
+
+- (std::string)effectsSignature {
+  NSString* what = nil;
+  EffectsRef fx = [self effectsTarget:&what];
+  std::string s = std::to_string(_sel->track) + "/" + std::to_string(_sel->item) + (_sel->transition ? "t" : "");
+  if (fx) {
+    for (const EffectKind& k : appliedEffects(fx())) s += " " + k.type;
+  }
+  return s;
+}
+
+- (void)note:(NSString*)text {
+  NSTextField* label = [NSTextField wrappingLabelWithString:text];
+  label.textColor = NSColor.secondaryLabelColor;
+  [label.widthAnchor constraintEqualToConstant:kLabelWidth + kControlWidth + kValueWidth].active = YES;
+  [_stack addArrangedSubview:label];
+}
+
+// An applied effect's heading, with a button that takes it off.
+- (void)effectHeading:(NSString*)title remove:(void (^)(void))remove {
   [self section:title];
-  // Changing a parameter turns its effect on.
-  // The blocks copy `f`, a local: a block in a lambda would otherwise keep a reference to `fx`.
-  auto param = [&](NSString* name, double min, double max, bool mf::SceneEffects::*on, mf::Animatable mf::SceneEffects::*value) {
-    EffectsRef f = fx;
+  NSTextField* label = (NSTextField*)_stack.arrangedSubviews.lastObject;
+  [_stack removeArrangedSubview:label];
+  NSButton* button = [NSButton buttonWithImage:[NSImage imageWithSystemSymbolName:@"minus.circle" accessibilityDescription:@"Remove"]
+                                        target:nil
+                                        action:nil];
+  button.bordered = NO;
+  button.contentTintColor = NSColor.secondaryLabelColor;
+  button.toolTip = [NSString stringWithFormat:@"Remove %@", title];
+  __weak InspectorView* weak = self;
+  Binding* b = [Binding new];
+  b.action = ^(id) {
+    remove();
+    [weak edited];
+  };
+  b.sync = ^{
+  };
+  button.target = b;
+  button.action = @selector(fire:);
+  [_bindings addObject:b];
+  NSView* spacer = [NSView new];
+  [spacer setContentHuggingPriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
+  NSStackView* row = [NSStackView stackViewWithViews:@[ label, spacer, button ]];
+  [row.widthAnchor constraintEqualToConstant:kLabelWidth + kControlWidth + kValueWidth + 12].active = YES;
+  [_stack addArrangedSubview:row];
+}
+
+// The Effects tab: the effects on the selected item or video track, in the order they apply, each
+// with its parameters and a remove button; and a menu of the effects to add (built in, and each
+// loaded plugin's).
+- (void)buildEffects {
+  NSString* what = nil;
+  EffectsRef fx = [self effectsTarget:&what];
+  _effectsShown = [self effectsSignature];
+  if (!fx) {
+    [self note:@"Select a video, image, text or color item, or a video track, to add effects to it."];
+    return;
+  }
+  [self section:what];
+
+  // Add Effect: a pull-down of the effects not on yet (an effect goes on at most once, 8 in all).
+  auto offered = std::make_shared<std::vector<EffectKind>>();
+  for (const EffectKind& k : allEffects()) {
+    if (!hasEffect(fx(), k.type)) offered->push_back(k);
+  }
+  NSPopUpButton* add = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:YES];
+  add.controlSize = NSControlSizeSmall;
+  [add.menu addItemWithTitle:@"Add Effect" action:nil keyEquivalent:@""];  // a pull-down's first item is its title
+  for (const EffectKind& k : *offered) {
+    NSMenuItem* item = [add.menu addItemWithTitle:k.name action:nil keyEquivalent:@""];
+    item.toolTip = k.plugin ? @"From an effect plugin" : nil;
+  }
+  add.enabled = !offered->empty() && fx().count() < 8;
+  [add.widthAnchor constraintEqualToConstant:kControlWidth].active = YES;
+  EffectsRef f = fx;
+  [self bind:add
+      action:^(NSPopUpButton* p) {
+        NSInteger i = p.indexOfSelectedItem - 1;
+        if (i >= 0 && i < NSInteger(offered->size())) setEffect(f(), (*offered)[size_t(i)], true);
+      }
+        sync:^{
+        }];
+  [self row:@"" views:@[ add ]];
+
+  std::vector<EffectKind> applied = appliedEffects(fx());
+  if (applied.empty()) {
+    [self note:@"No effects yet. Add one above; they apply in the order listed."];
+    return;
+  }
+  for (const EffectKind& k : applied) {
+    EffectKind kind = k;
+    [self effectHeading:k.name
+                 remove:^{
+                   setEffect(f(), kind, false);
+                 }];
+    [self effectParams:kind of:f];
+  }
+}
+
+// An applied effect's parameters.
+- (void)effectParams:(const EffectKind&)k of:(EffectsRef)f {
+  // The blocks copy `g`, a local: a block in a lambda would otherwise keep a reference to `f`.
+  auto param = [&](NSString* name, double min, double max, mf::Animatable mf::SceneEffects::*value) {
+    EffectsRef g = f;
     [self slider:name min:min max:max
              get:^{
-               return (f().*value).value;
+               return (g().*value).value;
              }
              set:^(double v) {
-               f().*on = true;
-               setConstant(f().*value, v);
+               setConstant(g().*value, v);
              }];
   };
-  auto toggle = [&](NSString* name, bool mf::SceneEffects::*on) {
-    EffectsRef f = fx;
-    [self check:name
+  if (k.type == "colorAdjust") {
+    param(@"Brightness", -1, 1, &mf::SceneEffects::brightness);
+    param(@"Contrast", 0, 2, &mf::SceneEffects::contrast);
+    param(@"Saturation", 0, 2, &mf::SceneEffects::saturation);
+  } else if (k.type == "blur") {
+    param(@"Radius", 0, 0.1, &mf::SceneEffects::blurRadius);
+  } else if (k.type == "crop") {  // at most 0.45 a side: never the whole image (R7)
+    param(@"Left", 0, 0.45, &mf::SceneEffects::cropLeft);
+    param(@"Top", 0, 0.45, &mf::SceneEffects::cropTop);
+    param(@"Right", 0, 0.45, &mf::SceneEffects::cropRight);
+    param(@"Bottom", 0, 0.45, &mf::SceneEffects::cropBottom);
+  } else if (k.type == "chromaKey") {
+    [self color:@"Key color"
             get:^{
-              return f().*on;
+              return f().keyColor;
             }
-            set:^(bool v) {
-              f().*on = v;
+            set:^(const mf::Color& c) {
+              f().keyColor = c;
             }];
-  };
-  toggle(@"Color adjust", &mf::SceneEffects::colorAdjust);
-  param(@"Brightness", -1, 1, &mf::SceneEffects::colorAdjust, &mf::SceneEffects::brightness);
-  param(@"Contrast", 0, 2, &mf::SceneEffects::colorAdjust, &mf::SceneEffects::contrast);
-  param(@"Saturation", 0, 2, &mf::SceneEffects::colorAdjust, &mf::SceneEffects::saturation);
-  toggle(@"Blur", &mf::SceneEffects::blur);
-  param(@"Radius", 0, 0.1, &mf::SceneEffects::blur, &mf::SceneEffects::blurRadius);
-  toggle(@"Crop", &mf::SceneEffects::crop);  // at most 0.45 a side: never the whole image (R7)
-  param(@"Left", 0, 0.45, &mf::SceneEffects::crop, &mf::SceneEffects::cropLeft);
-  param(@"Top", 0, 0.45, &mf::SceneEffects::crop, &mf::SceneEffects::cropTop);
-  param(@"Right", 0, 0.45, &mf::SceneEffects::crop, &mf::SceneEffects::cropRight);
-  param(@"Bottom", 0, 0.45, &mf::SceneEffects::crop, &mf::SceneEffects::cropBottom);
-  toggle(@"Chroma key", &mf::SceneEffects::chromaKey);
-  [self color:@"Key color"
-          get:^{
-            return fx().keyColor;
-          }
-          set:^(const mf::Color& c) {
-            fx().chromaKey = true;
-            fx().keyColor = c;
-          }];
-  [self slider:@"Tolerance" min:0 max:1
-           get:^{
-             return double(fx().keyTolerance);
-           }
-           set:^(double v) {
-             fx().chromaKey = true;
-             fx().keyTolerance = float(v);
-           }];
-  [self slider:@"Softness" min:0 max:1
-           get:^{
-             return double(fx().keySoftness);
-           }
-           set:^(double v) {
-             fx().chromaKey = true;
-             fx().keySoftness = float(v);
-           }];
-  // One section per loaded effect plugin, from the parameters it declares.
-  for (const mf::EffectInfo* info : mf::registeredEffects()) {
-    EffectsRef f = fx;
-    [self check:capitalized(info->displayName.empty() ? info->type : info->displayName)
-            get:^{
-              return pluginEffect(f(), *info, false) != nullptr;
-            }
-            set:^(bool on) {
-              if (on) {
-                pluginEffect(f(), *info, true);
-              } else {
-                auto& list = f().plugins;
-                list.erase(std::remove_if(list.begin(), list.end(), [&](const mf::ScenePluginEffect& p) { return p.type == info->type; }),
-                           list.end());
-              }
-            }];
-    for (size_t k = 0; k < info->params.size(); ++k) {
-      const mf::EffectParamInfo& param = info->params[k];
-      double byDefault = param.defaultValue;
-      [self slider:capitalized(param.name) min:param.min max:param.max
+    [self slider:@"Tolerance" min:0 max:1
+             get:^{
+               return double(f().keyTolerance);
+             }
+             set:^(double v) {
+               f().keyTolerance = float(v);
+             }];
+    [self slider:@"Softness" min:0 max:1
+             get:^{
+               return double(f().keySoftness);
+             }
+             set:^(double v) {
+               f().keySoftness = float(v);
+             }];
+  } else if (const mf::EffectInfo* info = k.plugin) {
+    for (size_t j = 0; j < info->params.size(); ++j) {
+      const mf::EffectParamInfo& p = info->params[j];
+      double byDefault = p.defaultValue;
+      [self slider:capitalized(p.name) min:p.min max:p.max
                get:^{
-                 mf::ScenePluginEffect* p = pluginEffect(f(), *info, false);
-                 return p ? p->params[k].value : byDefault;
+                 mf::ScenePluginEffect* e = pluginEffect(f(), *info, false);
+                 return e ? e->params[j].value : byDefault;
                }
                set:^(double v) {
-                 setConstant(pluginEffect(f(), *info, true)->params[k], v);  // turns the effect on
+                 if (mf::ScenePluginEffect* e = pluginEffect(f(), *info, false)) setConstant(e->params[j], v);
                }];
     }
+  } else {
+    [self note:@"Its plugin isn't loaded: it's kept in the project, but not drawn or editable."];
   }
 }
 
@@ -641,7 +841,7 @@ NSString* capitalized(const std::string& name) {  // "smooth" → "Smooth"
         set:^(int i) {
           item().blend = mf::Blend(i);
         }];
-    [self effects:[item]() -> mf::SceneEffects& { return item().effects; } title:@"Effects"];
+    [self effectsSummary:[item]() -> mf::SceneEffects& { return item().effects; }];
   }
 
   [self buttons:@[ @"Delete Item" ] actions:@[ ^{ [weak.delegate inspectorDeleteSelection]; } ]];

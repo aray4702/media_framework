@@ -64,13 +64,13 @@ NSPasteboardType const SidebarDragType = @"com.mediaframework.editor.sidebar-ite
 @end
 
 namespace {
-enum Tab { kVideo, kImage, kStickers, kEmojis, kText, kAudio, kProject, kExport, kTabs };
+enum Tab { kVideo, kImage, kStickers, kEmojis, kText, kAudio, kEffects, kProject, kExport, kTabs };
 constexpr CGFloat kTabBarWidth = 72;
 constexpr int64_t kStillUs = 5000000;
 
-NSString* const kTabTitles[kTabs] = {@"Video", @"Image", @"Stickers", @"Emojis", @"Text", @"Audio", @"Project", @"Export"};
-NSString* const kTabSymbols[kTabs] = {@"film",       @"photo",      @"star.circle", @"face.smiling",
-                                      @"textformat", @"music.note", @"gearshape",   @"square.and.arrow.up"};
+NSString* const kTabTitles[kTabs] = {@"Video", @"Image", @"Stickers", @"Emojis", @"Text", @"Audio", @"Effects", @"Project", @"Export"};
+NSString* const kTabSymbols[kTabs] = {@"film",       @"photo",      @"star.circle",    @"face.smiling",       @"textformat",
+                                      @"music.note", @"wand.and.stars", @"gearshape", @"square.and.arrow.up"};
 
 // An SF Symbol, and colors (0xRRGGBB) for its layers in order: one, or two for two-layer symbols.
 struct Sticker {
@@ -161,7 +161,7 @@ mf::SceneItem textItem(const std::string& text, const char* font, float size) {
   NSTextField* _title;
   NSStackView* _list;
   NSScrollView* _scroll;  // holds _list
-  NSView* _ownViews[kTabs];  // what the Project and Export tabs show, from the owner; nil for the others
+  NSView* _ownViews[kTabs];  // what the Effects, Project and Export tabs show, from the owner; nil for the others
   NSButton* _collapseButton;
   NSMutableArray* _actions;  // ClickAction targets of the current tab's buttons
   NSMutableArray<NSString*>* _files[kTabs];
@@ -321,6 +321,20 @@ mf::SceneItem textItem(const std::string& text, const char* font, float size) {
   }
 }
 
+- (void)setEffectsView:(NSView*)view {
+  [self setView:view ofTab:kEffects];
+}
+
+- (void)showEffectsTab {
+  if (_panel) {
+    [_panel removeFromSuperview];
+    _panel = nil;
+    _collapsedUnderPanel = NO;
+  }
+  if (_collapsed) [self setCollapsed:NO];
+  [self showTab:kEffects];
+}
+
 - (void)setProjectView:(NSView*)view {
   [self setView:view ofTab:kProject];
 }
@@ -366,6 +380,7 @@ mf::SceneItem textItem(const std::string& text, const char* font, float size) {
     case kStickers: [self buildStickers]; break;
     case kEmojis: [self buildEmojis]; break;
     case kText: [self buildText]; break;
+    case kEffects:
     case kProject:
     case kExport:
     case kTabs: break;
@@ -463,7 +478,7 @@ mf::SceneItem textItem(const std::string& text, const char* font, float size) {
 }
 
 - (void)buildFiles:(Tab)tab {
-  static NSString* const kinds[kTabs] = {@"videos", @"images", nil, nil, nil, @"audio files", nil, nil};
+  static NSString* const kinds[kTabs] = {@"videos", @"images", nil, nil, nil, @"audio files", nil, nil, nil};
   __weak SidebarView* weak = self;
   NSButton* import = [self button:[NSString stringWithFormat:@"Import %@…", tab == kAudio ? @"Audio" : kTabTitles[tab]]
                             image:[NSImage imageWithSystemSymbolName:@"plus" accessibilityDescription:nil]

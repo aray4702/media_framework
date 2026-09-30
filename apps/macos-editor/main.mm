@@ -171,6 +171,7 @@ static NSString* timeString(int64_t us) {
   InspectorView* _inspector;
   NSPanel* _properties;  // floating; holds _inspector
   InspectorView* _projectInspector;  // in the left pane's Project tab
+  InspectorView* _effectsInspector;  // in the left pane's Effects tab: the selection's effects
   InspectorView* _transitionInspector;  // in the left pane while a join is selected
   ExportView* _exportView;              // the Export tab
   editor::Selection _projectSel;     // always the project, except just after it adds a track
@@ -283,6 +284,10 @@ static NSString* timeString(int64_t us) {
   _projectInspector = [[InspectorView alloc] initWithFrame:NSMakeRect(0, 0, 300, 500) document:&_doc selection:&_projectSel];
   _projectInspector.delegate = self;
   [_sidebar setProjectView:_projectInspector];
+  _effectsInspector = [[InspectorView alloc] initWithFrame:NSMakeRect(0, 0, 300, 500) document:&_doc selection:&_sel];
+  _effectsInspector.delegate = self;
+  _effectsInspector.effectsPage = YES;
+  [_sidebar setEffectsView:_effectsInspector];
   _exportView = [[ExportView alloc] initWithFrame:NSMakeRect(0, 0, 300, 500) document:&_doc platform:_platform.get()];
   [_sidebar setExportView:_exportView];
   _transitionInspector = [[InspectorView alloc] initWithFrame:NSMakeRect(0, 0, 300, 500) document:&_doc selection:&_sel];
@@ -897,11 +902,13 @@ struct Dropped {
   [self syncTransitionPanel];
   _timeline.needsDisplay = YES;
   [_inspector rebuild];
+  [_effectsInspector rebuild];
   [self updatePropertiesTitle];
 }
 
 - (void)overlayEdited {
   [_inspector refresh];
+  [_effectsInspector refresh];
   if (![self updateAppearance]) [self scheduleReload];
 }
 
@@ -971,6 +978,7 @@ struct Dropped {
   [_timeline reload];
   _overlay.needsDisplay = YES;
   [_inspector rebuild];
+  [_effectsInspector rebuild];
   [self rebuildProjectTab];
   [self updatePropertiesTitle];
   [self scheduleReload];
@@ -991,12 +999,14 @@ struct Dropped {
   [self syncTransitionPanel];
   _overlay.needsDisplay = YES;
   [_inspector rebuild];
+  [_effectsInspector rebuild];
   [self updatePropertiesTitle];
 }
 
 - (void)timelineEdited {
   _overlay.needsDisplay = YES;
   [_inspector refresh];
+  [_effectsInspector refresh];
   if (![self updateAppearance]) [self scheduleReload];
 }
 
@@ -1018,11 +1028,16 @@ struct Dropped {
   [_inspector refresh];  // both show the project when nothing is selected
   [_projectInspector refresh];
   [_transitionInspector refresh];
+  [_effectsInspector refresh];
   if (_sel.transition && !_doc.junction(_sel.track, _sel.item)) {  // e.g. removed between two text items
     [self syncTransitionPanel];
     _timeline.needsDisplay = YES;
   }
   if (![self updateAppearance]) [self scheduleReload];
+}
+
+- (void)inspectorShowEffects {
+  [_sidebar showEffectsTab];
 }
 
 - (void)inspectorSelectionChanged {

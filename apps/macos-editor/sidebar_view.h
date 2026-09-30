@@ -1,14 +1,14 @@
 #pragma once
 
-// The left pane: vertical tabs (Video, Image, Stickers, Emojis, Text, Audio, Project, Export)
+// The left pane: vertical tabs (Video, Image, Stickers, Emojis, Text, Audio, Effects, Project, Export)
 // and what the selected tab offers. It collapses to the tab bar: click the open tab, or the
 // button at the bottom of the bar; any tab opens it again. Its content follows the pane's width.
 // Video, Image and Audio list the files imported so far; Image also has solid colors, and Audio
 // a button to record a voice-over (the delegate records; `recording` shows it). Stickers are SF
 // Symbols in color, rendered once into PNG files and added as image items; emojis and text
 // presets are added as text items. A click adds the item at the playhead; a drag carries it to
-// the preview or the timeline, which ask draggedPayload for it. Project shows the project's
-// settings.
+// the preview or the timeline, which ask draggedPayload for it. Effects shows the selection's
+// effects, and Project the project's settings (both views from the owner).
 
 #import <AppKit/AppKit.h>
 
@@ -41,6 +41,8 @@ struct SidebarPayload {
 @property(nonatomic) BOOL recording;  // a voice-over is being recorded: the record button stops it
 + (CGFloat)collapsedWidth;  // the tab bar alone
 - (void)rememberFile:(NSString*)path;  // lists it under its tab (Video, Image or Audio)
+- (void)setEffectsView:(NSView*)view;  // what the Effects tab shows
+- (void)showEffectsTab;                // opens the pane on the Effects tab
 - (void)setProjectView:(NSView*)view;  // what the Project tab shows
 - (void)setExportView:(NSView*)view;   // what the Export tab shows
 - (SidebarPayload)draggedPayload;       // during a drag out of the pane; empty otherwise
