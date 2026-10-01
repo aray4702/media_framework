@@ -49,16 +49,16 @@ Result SegmentRecorder::start(const ExportTarget& target, int width, int height,
 }
 
 // Sends queued frames in order; returns with the front frame still queued if the encoder is busy.
-void SegmentRecorder::drainVideoLocked(bool block) {
+void SegmentRecorder::drainVideoLocked(std::unique_lock<std::mutex>& lock, bool block) {
   while (!pendingVideo_.empty()) {
     ComposedFrame& f = pendingVideo_.front();
     f.ptsUs = framesWritten_ * frameUs_;
     Result r = sink_->writeVideo(f);
     if (r == Result::Again) {
       if (!block) return;
-      mu_.unlock();
+      lock.unlock();
       usleep(2000);
-      mu_.lock();
+      lock.lock();
       if (!open_) return;
       continue;
     }
@@ -72,7 +72,7 @@ void SegmentRecorder::drainVideoLocked(bool block) {
 }
 
 void SegmentRecorder::video(const VideoFrame& camera) {
-  std::lock_guard<std::mutex> lock(mu_);
+  std::unique_lock<std::mutex> lock(mu_);
   if (!recording_ || !camera.image) return;
   if (firstUs_ >= 0 && camera.ptsUs <= lastUs_) return;  // not after the last one
   if (firstUs_ < 0) firstUs_ = camera.ptsUs;
@@ -91,11 +91,11 @@ void SegmentRecorder::video(const VideoFrame& camera) {
   l.fit = Fit::Fill;  // the camera's own size: exactly the frame
   f.layers.push_back(std::move(l));
   pendingVideo_.push_back(std::move(f));
-  drainVideoLocked(false);
+  drainVideoLocked(lock, false);
 }
 
 void SegmentRecorder::audio(const int16_t* pcm, int frames, int64_t hostTimeNs) {
-  std::lock_guard<std::mutex> lock(mu_);
+  std::unique_lock<std::mutex> lock(mu_);
   if (!recording_ || sampleRate_ == 0 || firstUs_ < 0 || frames <= 0) return;  // audio starts with the first frame
   int skip = 0;
   if (audioPos_ < 0) {  // the first chunk: placed by its time, what came before the first frame cut off
@@ -115,9 +115,9 @@ void SegmentRecorder::audio(const int16_t* pcm, int frames, int64_t hostTimeNs) 
     Result r = sink_->writeAudio(pcm + size_t(skip) * channels_, n, ptsUs);
     if (r == Result::Ok) break;
     if (r != Result::Again) return;
-    mu_.unlock();
+    lock.unlock();
     usleep(2000);
-    mu_.lock();
+    lock.lock();
     if (!recording_) return;
   }
   audioPos_ += n;
@@ -128,15 +128,13 @@ void SegmentRecorder::stop(std::function<void(Result, int64_t)> done) {
   int64_t duration = 0;
   auto finished = std::make_shared<std::atomic<bool>>(false);
   {
-    std::lock_guard<std::mutex> lock(mu_);
+    std::unique_lock<std::mutex> lock(mu_);
     if (!open_) {
       duration = -1;
     } else {
       recording_ = false;
-      drainVideoLocked(true);
-      while (!pendingVideo_.empty()) {  // still busy: wait it out
-        drainVideoLocked(true);
-      }
+      drainVideoLocked(lock, true);
+      while (!pendingVideo_.empty()) drainVideoLocked(lock, true);
       open_ = false;
       releaseFinished();
       duration = framesWritten_ > 0 ? framesWritten_ * frameUs_ : 0;
@@ -161,6 +159,11 @@ void SegmentRecorder::stop(std::function<void(Result, int64_t)> done) {
 int64_t SegmentRecorder::durationUs() const {
   std::lock_guard<std::mutex> lock(mu_);
   return framesWritten_ > 0 ? framesWritten_ * frameUs_ : 0;
+}
+
+int SegmentRecorder::pendingVideoFrames() const {
+  std::lock_guard<std::mutex> lock(mu_);
+  return int(pendingVideo_.size());
 }
 
 }  // namespace mf
