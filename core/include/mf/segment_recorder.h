@@ -40,6 +40,7 @@ class SegmentRecorder {
 
   bool recording() const { return recording_; }
   int64_t durationUs() const;  // so far
+  int pendingVideoFrames() const;  // waiting for the encoder
   int droppedFrames() const { return dropped_; }
 
  private:
@@ -53,7 +54,7 @@ class SegmentRecorder {
   };
   std::vector<Finishing> finishing_;
   void releaseFinished();
-  void drainVideoLocked(bool block);  // holds mu_
+  void drainVideoLocked(std::unique_lock<std::mutex>& lock, bool block);
   mutable std::mutex mu_;
   std::deque<ComposedFrame> pendingVideo_;
   bool open_ = false;
