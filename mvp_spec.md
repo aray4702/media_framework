@@ -186,7 +186,7 @@ The player plays a **scene** (scene_graph_spec.md): tracks of video, image, text
 
 **Layout.** `SceneLayout` flattens the enabled tracks into items. Two items of a track overlap only across a transition, by exactly its length, so each video track shows at most two items at a time.
 
-**Lanes.** Each video or audio item plays on a **lane**: its own packet queues, video and audio decoders and frame queue. Items are assigned greedily in start order, each widened by 1 s of preroll, so items that never overlap share a lane and an incoming item decodes alongside the outgoing one (at most 8 lanes). T1 probes every item on `open` (one demuxer each, to fail early on unsupported media), then:
+**Lanes.** Each video or audio item plays on a **lane**: its own packet queues, video and audio decoders and frame queue. Items are assigned greedily in start order, each widened by 1 s of preroll, so items that never overlap share a lane and an incoming item decodes alongside the outgoing one (at most 8 lanes). **Invariant:** the incoming clips shall be ready by start. A clip's first frame is decoded before the timeline reaches that clip's start, so the cut or transition begins on it. T1 probes every item on `open` (one demuxer each, to fail early on unsupported media), then:
 
 - **Seek to `t`:** each lane seeks its first item that hasn't ended by `t` to its media time at `t` (or to its start, when it begins later).
 - **End of an item:** once a lane has read both tracks of an item to the end, it moves on to its next item from its start.
