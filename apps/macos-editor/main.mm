@@ -322,10 +322,23 @@ static NSString* timeString(int64_t us) {
   _timeLabel.font = [NSFont monospacedDigitSystemFontOfSize:13 weight:NSFontWeightMedium];
   _timeLabel.frame = NSMakeRect(46, 9, 200, 18);
   [transport addSubview:_timeLabel];
+  // Zoom shares the play button's band, at the right. The band stays put at the bottom as the
+  // preview grows, so these do too.
+  NSImageView* zoomIcon = [NSImageView imageViewWithImage:[NSImage imageWithSystemSymbolName:@"plus.magnifyingglass"
+                                                                    accessibilityDescription:@"Zoom"]];
+  zoomIcon.frame = NSMakeRect(width - 190, 12, 20, 20);
+  zoomIcon.autoresizingMask = NSViewMinXMargin;
+  [top addSubview:zoomIcon];
+  NSSlider* zoom = [NSSlider sliderWithValue:std::log(40.0) minValue:std::log(5.0) maxValue:std::log(400.0) target:self
+                                      action:@selector(zoomChanged:)];
+  zoom.controlSize = NSControlSizeSmall;
+  zoom.frame = NSMakeRect(width - 165, 12, 150, 20);
+  zoom.autoresizingMask = NSViewMinXMargin;
+  [top addSubview:zoom];
 
-  // Bottom: the timeline, with the zoom above it.
+  // Bottom: the timeline.
   NSView* bottom = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, width, 380)];
-  NSScrollView* scroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(0, 0, width, 380 - 30)];
+  NSScrollView* scroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(0, 0, width, 380)];
   scroll.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
   scroll.hasHorizontalScroller = YES;
   scroll.hasVerticalScroller = YES;
@@ -338,17 +351,6 @@ static NSString* timeString(int64_t us) {
   };
   scroll.documentView = _timeline;
   [bottom addSubview:scroll];
-  NSImageView* zoomIcon = [NSImageView imageViewWithImage:[NSImage imageWithSystemSymbolName:@"plus.magnifyingglass"
-                                                                    accessibilityDescription:@"Zoom"]];
-  zoomIcon.frame = NSMakeRect(width - 190, 380 - 25, 20, 20);
-  zoomIcon.autoresizingMask = NSViewMinXMargin | NSViewMinYMargin;
-  [bottom addSubview:zoomIcon];
-  NSSlider* zoom = [NSSlider sliderWithValue:std::log(40.0) minValue:std::log(5.0) maxValue:std::log(400.0) target:self
-                                      action:@selector(zoomChanged:)];
-  zoom.controlSize = NSControlSizeSmall;
-  zoom.frame = NSMakeRect(width - 165, 380 - 25, 150, 20);
-  zoom.autoresizingMask = NSViewMinXMargin | NSViewMinYMargin;
-  [bottom addSubview:zoom];
 
   // The properties of the selection, in a floating window shown by the "…" buttons.
   _inspector = [[InspectorView alloc] initWithFrame:NSMakeRect(0, 0, 360, 560) document:&_doc selection:&_sel];
@@ -509,7 +511,10 @@ static NSString* timeString(int64_t us) {
   [_voiceTimer invalidate];
   _voiceTimer = nil;
   NSTimeInterval seconds = [_recorder stop];
-  if (_player && _player->state() == mf::State::Play) _player->pause();
+  if (_player && _player->state() == mf::State::Play) {
+    _player->pause();
+    [self updatePlayButton:NO];
+  }
   _sidebar.recording = NO;
   [_timeline hideRecording];
   [self showStatus:@"" error:NO];
@@ -1219,6 +1224,7 @@ struct Dropped {
   if (!_playAfterSeek) return;
   _playAfterSeek = NO;
   _player->play();
+  [self updatePlayButton:_player->state() == mf::State::Play];
 }
 
 - (void)player:(int)generation seekCompleted:(int64_t)ptsUs {
@@ -1241,9 +1247,12 @@ struct Dropped {
   } else if (_player->positionUs() >= _player->durationUs() - 50000) {  // at the end: from the start
     _playAfterSeek = YES;
     [self seekTo:0];
+    return;  // stays on play until the seek finishes and playback resumes
   } else {
     _player->play();
   }
+  // play() and pause() change state without a callback, so the icon follows here.
+  [self updatePlayButton:_player->state() == mf::State::Play];
 }
 
 // Seeking needs a paused player (A4): a seek while playing pauses.
@@ -1256,7 +1265,10 @@ struct Dropped {
     if (_seekOnReadyUs >= 0) _seekOnReadyUs = frame;
     return;
   }
-  if (_player->state() == mf::State::Play) _player->pause();
+  if (_player->state() == mf::State::Play) {
+    _player->pause();  // A4: seek only in Ready; the icon follows, since pause posts no callback
+    [self updatePlayButton:NO];
+  }
   _player->seek(frame);
 }
 
