@@ -4,9 +4,9 @@ A JSON description of what the player plays and the exporter renders: **tracks**
 
 | File | What it is |
 | --- | --- |
-| [schema/scene_graph.schema.json](schema/scene_graph.schema.json) | JSON Schema (draft 2020-12): structure, types and ranges |
-| [schema/examples/two_clips_logo_title.json](schema/examples/two_clips_logo_title.json) | Two clips joined by a push, a fading logo, an animated title, a music bed |
-| [scripts/validate_scene.py](scripts/validate_scene.py) | Checks the schema, then the rules of §6 that a schema can't express |
+| [schema/scene_graph.schema.json](../../schema/scene_graph.schema.json) | JSON Schema (draft 2020-12): structure, types and ranges |
+| [schema/examples/two_clips_logo_title.json](../../schema/examples/two_clips_logo_title.json) | Two clips joined by a push, a fading logo, an animated title, a music bed |
+| [scripts/validate_scene.py](../../scripts/validate_scene.py) | Checks the schema, then the rules of §6 that a schema can't express |
 
 Why a format of our own: OTIO is the standard for moving an edit between tools, but it deliberately leaves effects, animation and compositing undefined. MLT XML and FCPXML define them, but only as their own engines behave. So this format is what the engine renders, with exact rules, and OTIO is how it is exchanged (§8).
 
@@ -139,7 +139,7 @@ An effect type the renderer doesn't know is a validation error, not silently ski
 | --- | --- | --- |
 | `beauty` | `smooth` (0.5), `whiten` (0.2), `sharpen` (0.2), all 0–1 | Skin mask `k` from a feathered CbCr box. Bilateral blur (σ = (0.002 + 0.004·smooth) × output height). `rgb' = mix(rgb, blurred, smooth·k)`, then a log lift `log(c·4w + 1) / log(1 + 4w)` by `k`, where w = whiten, then `+ sharpen·(1 − k)·(rgb − blurred)` |
 
-On macOS, a plugin is a `.dylib` that implements [effect_plugin.h](platform/macos/include/mf/effect_plugin.h): it gets the image with the effects before it applied, as an RGBA16F texture the size of the item on screen, and writes its result to another. `mf::macos::loadEffectPlugins()` loads plugins from `$MF_EFFECT_PLUGIN_PATH`, `plugins/` next to the executable, an app bundle's `PlugIns`, `~/Library/Application Support/Media Framework/Plugins` and the build tree. The core registry is [effects.h](core/include/mf/effects.h).
+On macOS, a plugin is a `.dylib` that implements [effect_plugin.h](../../platform/macos/include/mf/effect_plugin.h): it gets the image with the effects before it applied, as an RGBA16F texture the size of the item on screen, and writes its result to another. `mf::macos::loadEffectPlugins()` loads plugins from `$MF_EFFECT_PLUGIN_PATH`, `plugins/` next to the executable, an app bundle's `PlugIns`, `~/Library/Application Support/Media Framework/Plugins` and the build tree. The core registry is [effects.h](../../core/include/mf/effects.h).
 
 ### 4.5 Text
 
@@ -237,14 +237,14 @@ The engine plays and exports scenes: `Player::open(const Scene&, ...)`, `Exporte
 
 | Part | Where |
 | --- | --- |
-| JSON reader (strict RFC 8259, key order kept, depth limit) | [core/src/json.cpp](core/src/json.cpp) |
-| Parsing, the schema's checks, rules R1–R8 and R12, keyframes and easing; writing documents | [core/src/scene.cpp](core/src/scene.cpp) |
-| Lanes and "what is visible at `t`" (transition offsets, clips, fades; audio fades) | [core/src/layout.cpp](core/src/layout.cpp) |
-| Per-item frame selection; `composeAt(t)` evaluates every visible item into a `ComposedLayer`, and a track that is combined on its own into a `ComposedGroup` (its effects, opacity, blend) | [core/src/composition.cpp](core/src/composition.cpp) |
-| Audio mix: every sounding item, resampled and sped up by reading at its media time | `AudioStage` in [core/src/pipeline.cpp](core/src/pipeline.cpp) |
-| Drawing: fit, transform, blend modes, effects, blur passes, wipe clips, styled text; a grouped track is drawn into its own texture first, then onto the canvas | [platform/macos/src/metal_compositor.mm](platform/macos/src/metal_compositor.mm) |
-| Effect plugins: the core's registry of types and parameters; the macOS plugin interface and loader; the beauty plugin | [core/src/effects.cpp](core/src/effects.cpp), [platform/macos/include/mf/effect_plugin.h](platform/macos/include/mf/effect_plugin.h), [platform/macos/src/effect_plugins.mm](platform/macos/src/effect_plugins.mm), [plugins/beauty/beauty.mm](plugins/beauty/beauty.mm) |
-| Image items | [platform/macos/src/image_loader.mm](platform/macos/src/image_loader.mm) (ImageIO, EXIF orientation) |
+| JSON reader (strict RFC 8259, key order kept, depth limit) | [core/src/json.cpp](../../core/src/json.cpp) |
+| Parsing, the schema's checks, rules R1–R8 and R12, keyframes and easing; writing documents | [core/src/scene.cpp](../../core/src/scene.cpp) |
+| Lanes and "what is visible at `t`" (transition offsets, clips, fades; audio fades) | [core/src/layout.cpp](../../core/src/layout.cpp) |
+| Per-item frame selection; `composeAt(t)` evaluates every visible item into a `ComposedLayer`, and a track that is combined on its own into a `ComposedGroup` (its effects, opacity, blend) | [core/src/composition.cpp](../../core/src/composition.cpp) |
+| Audio mix: every sounding item, resampled and sped up by reading at its media time | `AudioStage` in [core/src/pipeline.cpp](../../core/src/pipeline.cpp) |
+| Drawing: fit, transform, blend modes, effects, blur passes, wipe clips, styled text; a grouped track is drawn into its own texture first, then onto the canvas | [platform/macos/src/metal_compositor.mm](../../platform/macos/src/metal_compositor.mm) |
+| Effect plugins: the core's registry of types and parameters; the macOS plugin interface and loader; the beauty plugin | [core/src/effects.cpp](../../core/src/effects.cpp), [platform/macos/include/mf/effect_plugin.h](../../platform/macos/include/mf/effect_plugin.h), [platform/macos/src/effect_plugins.mm](../../platform/macos/src/effect_plugins.mm), [plugins/beauty/beauty.mm](../../plugins/beauty/beauty.mm) |
+| Image items | [platform/macos/src/image_loader.mm](../../platform/macos/src/image_loader.mm) (ImageIO, EXIF orientation) |
 
 - **Lanes.** Each video or audio item gets a lane: its own decoders and queues. Lanes are assigned greedily in start order, and an item can reuse a lane once the lane's previous item has ended, counting from 1 s before the new item starts. That's the fewest lanes possible. For clips joined by transitions this gives the two alternating lanes the timeline engine used.
 - **Drivers.** `Auto` uses the leading-clip driver for a scene with a single video item and nothing else visible, and the vsync driver otherwise. Export always uses the fixed grid at `output.fps`.

@@ -24,7 +24,7 @@ The core is portable C++17. It sees platform objects only through the interfaces
 
 ### What gets played
 
-The pipeline plays a **`Scene`** ([scene.h](core/include/mf/scene.h)): tracks of video, image, text, color and audio items, transitions between neighbouring items of a track, per-item effects, and keyframed values. It comes from a JSON document (`parseScene`, [scene_graph_spec.md](scene_graph_spec.md)) or is built in code (`validateScene`).
+The pipeline plays a **`Scene`** ([scene.h](../../core/include/mf/scene.h)): tracks of video, image, text, color and audio items, transitions between neighbouring items of a track, per-item effects, and keyframed values. It comes from a JSON document (`parseScene`, [scene_graph_spec.md](scene_graph_spec.md)) or is built in code (`validateScene`).
 
 - A video or audio item with **duration 0** plays to the end of its file. T1 opens those files first, sets the durations, and validates again with them.
 - `Player::open(MediaSource)` is a scene of one such item, with the output size, rate and audio format taken from the file.
@@ -48,37 +48,37 @@ Export:  T3 ─► IExportSink.writeVideo ─► MetalCompositor ─► AVAssetW
 
 | Component | File | Role |
 | --- | --- | --- |
-| Player / Impl | [player.cpp](core/src/player.cpp) | Public playback API, state machine, receives pipeline events |
-| Exporter / Impl | [exporter.cpp](core/src/exporter.cpp) | Public export API; same pipeline with the export driver and sink |
-| Scene, parseScene, validateScene | [scene.cpp](core/src/scene.cpp), [json.cpp](core/src/json.cpp) | Scene model, easing and keyframe evaluation, JSON parsing, rules R1–R8 |
-| SceneLayout | [layout.cpp](core/src/layout.cpp) | Flattens enabled tracks into items; assigns lanes; media ↔ timeline time; what is visible at t; transition gains |
-| Context | [pipeline.h](core/src/pipeline.h) | Owns adapters, lanes, items, queues, ring, clock, metrics; seek slot; serials |
-| SourceStage (T1) | [pipeline.cpp](core/src/pipeline.cpp) | Probe, build the layout, start seeks, demux every lane by lowest timeline DTS |
-| VideoDecodeStage (T2) | [pipeline.cpp](core/src/pipeline.cpp) | Per lane: packets → decoder → frames in PTS order; reconfigure per item |
-| CompositionStage (TC) | [composition.cpp](core/src/composition.cpp) | Exact seek frame, then runs the driver; hands composed frames to T3 |
-| FrameSampler | [composition.cpp](core/src/composition.cpp) | Per-lane head frame and each item's latest frame; `composeAt(t)` builds the layers |
-| LeadingClipDriver | [leading_clip_driver.cpp](core/src/leading_clip_driver.cpp) | One output per frame of the highest-fps visible video |
-| VsyncDriver | [vsync_driver.cpp](core/src/vsync_driver.cpp) | One output per display refresh, at the clock time it will be seen |
-| ExportDriver | [export_driver.cpp](core/src/export_driver.cpp) | Outputs on the fixed n / fps grid, each once every layer is exact |
-| VideoRenderStage (T3) | [pipeline.cpp](core/src/pipeline.cpp) | Complete seeks, A/V sync, present/drop, start/stop output, detect end; on export, write video |
-| AudioStage (T4) | [pipeline.cpp](core/src/pipeline.cpp) | Per lane decode; resample, gain, pan, fades; mix into the ring (or the export sink) |
-| AvSync | [av_sync.cpp](core/src/av_sync.cpp) | Per-frame present/drop/wait decision on the vsync grid (leading-clip driver) |
-| MasterClock | [master_clock.cpp](core/src/master_clock.cpp) | Audio clock, or steady clock when there's no audio or it has ended |
-| AudioRing | [audio_ring.cpp](core/src/audio_ring.cpp) | Lock-free SPSC PCM ring that also carries the audio clock |
-| BoundedQueue | [bounded_queue.h](core/src/bounded_queue.h) | Non-blocking queue capped by count, bytes and duration, with wake hooks |
-| ThreadScheduler | [thread_scheduler.cpp](core/src/thread_scheduler.cpp) | One thread per stage; runs `pump()` and waits on a CV |
-| Metrics | [metrics.cpp](core/src/metrics.cpp) | Drops, late layers, jank, A/V offset, TTFF, seek latency |
-| MacPlatform | [mac_platform.mm](platform/macos/src/mac_platform.mm) | Factory, host clock, thread names and QoS, `loadScene` (resolves `src` paths) |
-| AvfDemuxer | [avf_demuxer.mm](platform/macos/src/avf_demuxer.mm) | AVAssetReader, one output per track |
-| VtVideoDecoder | [vt_video_decoder.mm](platform/macos/src/vt_video_decoder.mm) | Async VTDecompressionSession + PTS reorder; session kept across items when the format allows |
-| AtAudioDecoder | [at_audio_decoder.cpp](platform/macos/src/at_audio_decoder.cpp) | AudioConverter AAC → S16, synchronous |
-| AuSpeaker | [au_speaker.cpp](platform/macos/src/au_speaker.cpp) | DefaultOutput AudioUnit; render callback pulls from the ring |
-| MetalDisplay | [metal_display.mm](platform/macos/src/metal_display.mm) | Pending-frame queue drained on each vsync; draws with MetalCompositor |
-| MetalCompositor | [metal_compositor.mm](platform/macos/src/metal_compositor.mm) | Draws a `ComposedFrame`: letterbox, layers with geometry, effects, blend, blur, text |
-| ImageIoLoader | [image_loader.mm](platform/macos/src/image_loader.mm) | Still image → IOSurface-backed BGRA CVPixelBuffer (EXIF orientation applied) |
-| AvfExportSink | [avf_export_sink.mm](platform/macos/src/avf_export_sink.mm) | AVAssetWriter: composes into writer pixel buffers (H.264), PCM → AAC |
+| Player / Impl | [player.cpp](../../core/src/player.cpp) | Public playback API, state machine, receives pipeline events |
+| Exporter / Impl | [exporter.cpp](../../core/src/exporter.cpp) | Public export API; same pipeline with the export driver and sink |
+| Scene, parseScene, validateScene | [scene.cpp](../../core/src/scene.cpp), [json.cpp](../../core/src/json.cpp) | Scene model, easing and keyframe evaluation, JSON parsing, rules R1–R8 |
+| SceneLayout | [layout.cpp](../../core/src/layout.cpp) | Flattens enabled tracks into items; assigns lanes; media ↔ timeline time; what is visible at t; transition gains |
+| Context | [pipeline.h](../../core/src/pipeline.h) | Owns adapters, lanes, items, queues, ring, clock, metrics; seek slot; serials |
+| SourceStage (T1) | [pipeline.cpp](../../core/src/pipeline.cpp) | Probe, build the layout, start seeks, demux every lane by lowest timeline DTS |
+| VideoDecodeStage (T2) | [pipeline.cpp](../../core/src/pipeline.cpp) | Per lane: packets → decoder → frames in PTS order; reconfigure per item |
+| CompositionStage (TC) | [composition.cpp](../../core/src/composition.cpp) | Exact seek frame, then runs the driver; hands composed frames to T3 |
+| FrameSampler | [composition.cpp](../../core/src/composition.cpp) | Per-lane head frame and each item's latest frame; `composeAt(t)` builds the layers |
+| LeadingClipDriver | [leading_clip_driver.cpp](../../core/src/leading_clip_driver.cpp) | One output per frame of the highest-fps visible video |
+| VsyncDriver | [vsync_driver.cpp](../../core/src/vsync_driver.cpp) | One output per display refresh, at the clock time it will be seen |
+| ExportDriver | [export_driver.cpp](../../core/src/export_driver.cpp) | Outputs on the fixed n / fps grid, each once every layer is exact |
+| VideoRenderStage (T3) | [pipeline.cpp](../../core/src/pipeline.cpp) | Complete seeks, A/V sync, present/drop, start/stop output, detect end; on export, write video |
+| AudioStage (T4) | [pipeline.cpp](../../core/src/pipeline.cpp) | Per lane decode; resample, gain, pan, fades; mix into the ring (or the export sink) |
+| AvSync | [av_sync.cpp](../../core/src/av_sync.cpp) | Per-frame present/drop/wait decision on the vsync grid (leading-clip driver) |
+| MasterClock | [master_clock.cpp](../../core/src/master_clock.cpp) | Audio clock, or steady clock when there's no audio or it has ended |
+| AudioRing | [audio_ring.cpp](../../core/src/audio_ring.cpp) | Lock-free SPSC PCM ring that also carries the audio clock |
+| BoundedQueue | [bounded_queue.h](../../core/src/bounded_queue.h) | Non-blocking queue capped by count, bytes and duration, with wake hooks |
+| ThreadScheduler | [thread_scheduler.cpp](../../core/src/thread_scheduler.cpp) | One thread per stage; runs `pump()` and waits on a CV |
+| Metrics | [metrics.cpp](../../core/src/metrics.cpp) | Drops, late layers, jank, A/V offset, TTFF, seek latency |
+| MacPlatform | [mac_platform.mm](../../platform/macos/src/mac_platform.mm) | Factory, host clock, thread names and QoS, `loadScene` (resolves `src` paths) |
+| AvfDemuxer | [avf_demuxer.mm](../../platform/macos/src/avf_demuxer.mm) | AVAssetReader, one output per track |
+| VtVideoDecoder | [vt_video_decoder.mm](../../platform/macos/src/vt_video_decoder.mm) | Async VTDecompressionSession + PTS reorder; session kept across items when the format allows |
+| AtAudioDecoder | [at_audio_decoder.cpp](../../platform/macos/src/at_audio_decoder.cpp) | AudioConverter AAC → S16, synchronous |
+| AuSpeaker | [au_speaker.cpp](../../platform/macos/src/au_speaker.cpp) | DefaultOutput AudioUnit; render callback pulls from the ring |
+| MetalDisplay | [metal_display.mm](../../platform/macos/src/metal_display.mm) | Pending-frame queue drained on each vsync; draws with MetalCompositor |
+| MetalCompositor | [metal_compositor.mm](../../platform/macos/src/metal_compositor.mm) | Draws a `ComposedFrame`: letterbox, layers with geometry, effects, blend, blur, text |
+| ImageIoLoader | [image_loader.mm](../../platform/macos/src/image_loader.mm) | Still image → IOSurface-backed BGRA CVPixelBuffer (EXIF orientation applied) |
+| AvfExportSink | [avf_export_sink.mm](../../platform/macos/src/avf_export_sink.mm) | AVAssetWriter: composes into writer pixel buffers (H.264), PCM → AAC |
 
-### Adapter interfaces ([adapters.h](core/include/mf/adapters.h))
+### Adapter interfaces ([adapters.h](../../core/include/mf/adapters.h))
 
 ```text
 IClock         nowNs()
@@ -371,7 +371,7 @@ Other paths:
 | Metal handlers | system | presented handler → `Sink` → `Player.onPresented` → metrics |
 | `mf.export-video` / `mf.export-audio` | dispatch serial queues | export sink: compose into writer buffers and append; append audio |
 
-### Scheduling model ([thread_scheduler.cpp](core/src/thread_scheduler.cpp))
+### Scheduling model ([thread_scheduler.cpp](../../core/src/thread_scheduler.cpp))
 
 ```text
 worker loop:  p = stage.pump()                 // never blocks
@@ -436,7 +436,7 @@ The probe results (`layout`, `items`, `lanes`, canvas, fps) are written by T1 be
 - **Media time (µs):** packet and frame PTS/DTS, in each item's file. `SceneLayout` maps between them: `media = in + (t − start) × speed`, and back.
 - **Item-local time:** `t − start`, at which keyframes are evaluated.
 
-### Master clock ([master_clock.cpp](core/src/master_clock.cpp))
+### Master clock ([master_clock.cpp](../../core/src/master_clock.cpp))
 
 ```text
 nowUs(now):
@@ -449,7 +449,7 @@ start(now): running, baseNs = now      stop(now): baseUs = value(now), not runni
 reset(pts, serial): baseUs = pts; useAudio = hasAudio        (after each seek)
 ```
 
-### Audio clock ([audio_ring.cpp](core/src/audio_ring.cpp))
+### Audio clock ([audio_ring.cpp](../../core/src/audio_ring.cpp))
 
 - The speaker's render callback passes `audibleHostNs = callbackHostTime + output latency`. The latency is device + stream + AudioUnit latency, measured once in `open()`.
 - `clockUs(now) = basePts + clamp(framesBefore + (now - audibleNs)·rate, 0, framesBefore + frames) / rate`
@@ -460,7 +460,7 @@ reset(pts, serial): baseUs = pts; useAudio = hasAudio        (after each seek)
   - `read == write`,
   - and `now` is past the point where the last delivered frame is heard.
 
-### Layout ([layout.cpp](core/src/layout.cpp))
+### Layout ([layout.cpp](../../core/src/layout.cpp))
 
 - **Items** of enabled tracks are numbered in track order, then item order.
 - **Lanes:** video and audio items are sorted by start and coloured greedily, so items sharing a lane never overlap. Each item's interval is first widened by 1 s of preroll, so its decoder can start before it plays; if that needs more than 8 lanes it retries without the margin, and fails above 8.
@@ -475,7 +475,7 @@ reset(pts, serial): baseUs = pts; useAudio = hasAudio        (after each seek)
 - **Composition:** the FrameSampler consumes each lane's frames in order, keeps each item's latest frame at or before the output time, and drops frames past an item's end. A layer is **exact at t** when its next frame is later than t, or its item has ended.
 - **Audio:** decoded synchronously in packet order, per lane, into a float buffer at the item's own rate. Packets within 1 ms of the previous one continue it exactly; gaps become silence. The mix waits until every item sounding in the next 1024-frame chunk is decoded that far.
 
-### Output drivers ([drivers.h](core/src/drivers.h))
+### Output drivers ([drivers.h](../../core/src/drivers.h))
 
 **LeadingClip** (the default for a single video). Frames go in timeline order, once no other lane can still produce an earlier one. Only a frame of the leading item (highest frame rate among the visible videos, the upper one on a tie) produces an output, so every other layer is exact at that time. T3 paces them with AvSync.
 
@@ -495,7 +495,7 @@ emit frame with presentAtNs = slot
 
 ### Video presentation
 
-**AvSync** ([av_sync.cpp](core/src/av_sync.cpp)), for leading-clip frames (`presentAtNs == 0`):
+**AvSync** ([av_sync.cpp](../../core/src/av_sync.cpp)), for leading-clip frames (`presentAtNs == 0`):
 
 ```text
 lead  = display.latencyNs()                    // how early a frame must be handed over
@@ -512,7 +512,7 @@ vsync period changed             -> re-anchor
 
 **Scheduled** (vsync-driver frames): present at `presentAtNs`, or count it late if that vsync has already passed. The filter is applied at present time, so a change shows at once; while paused, T3 redraws the last frame when `filterVersion` changes. A hidden window drops frames (`countHidden`).
 
-**MetalDisplay** ([metal_display.mm](platform/macos/src/metal_display.mm)) runs on the display link:
+**MetalDisplay** ([metal_display.mm](../../platform/macos/src/metal_display.mm)) runs on the display link:
 
 ```text
 present(frame, atNs): push {frame, atNs}; more than 4 pending -> oldest reported not shown
@@ -521,7 +521,7 @@ vsync(now, output):   period, grid = output time, latency = output - now + perio
                       compositor.encode(show, drawable) → presentDrawable; presented handler reports actual time
 ```
 
-**MetalCompositor** ([metal_compositor.mm](platform/macos/src/metal_compositor.mm)), shared by the display and the export sink:
+**MetalCompositor** ([metal_compositor.mm](../../platform/macos/src/metal_compositor.mm)), shared by the display and the export sink:
 
 ```text
 canvas (scene output size) letterboxed into the target; clear; per layer bottom to top:
