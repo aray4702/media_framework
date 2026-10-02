@@ -1,5 +1,7 @@
 // IExportSink on AVAssetWriter (§2.5): composed frames are rendered by MetalCompositor into
-// the writer's BGRA pixel buffers and encoded to H.264; the mixed PCM is encoded to AAC.
+// the writer's BGRA pixel buffers and encoded to H.264; the mixed PCM is encoded to AAC. A live
+// source (ExportSettings::realtime) is encoded in real-time mode, and a frame that is just a camera
+// image of the file's size goes to the encoder as it is, without a copy.
 // Writes return at once: the work runs on one serial queue per track, each waiting for its
 // writer input. Separate queues matter: the writer holds one input back until the other
 // catches up, so a single queue could wait on itself.
@@ -40,6 +42,9 @@ class AvfExportSink : public IExportSink {
       framing_.cropX = s.cropX;
       framing_.cropY = s.cropY;
       framing_.backgroundBands = true;  // a file's bands are part of the picture: the scene's background
+      realtime_ = s.realtime;
+      width_ = s.width;
+      height_ = s.height;
       NSURL* url = (__bridge NSURL*)target.native.get();
       if (!url) return Result::InvalidArgument;
       [[NSFileManager defaultManager] removeItemAtURL:url error:nil];
@@ -56,6 +61,7 @@ class AvfExportSink : public IExportSink {
         AVVideoMaxKeyFrameIntervalKey : @(s.fps),
       } mutableCopy];
       if (!hevc) compression[AVVideoProfileLevelKey] = AVVideoProfileLevelH264HighAutoLevel;  // HEVC: Main, the default
+      if (s.realtime) compression[AVVideoAllowFrameReorderingKey] = @NO;  // no B-frames: less work and latency per frame
       NSDictionary* video = @{
         AVVideoCodecKey : hevc ? AVVideoCodecTypeHEVC : AVVideoCodecTypeH264,
         AVVideoWidthKey : @(s.width),
@@ -63,7 +69,7 @@ class AvfExportSink : public IExportSink {
         AVVideoCompressionPropertiesKey : compression,
       };
       videoInput_ = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeVideo outputSettings:video];
-      videoInput_.expectsMediaDataInRealTime = NO;
+      videoInput_.expectsMediaDataInRealTime = s.realtime;
       NSDictionary* pixels = @{
         (id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA),
         (id)kCVPixelBufferWidthKey : @(s.width),
@@ -87,7 +93,7 @@ class AvfExportSink : public IExportSink {
           AVChannelLayoutKey : [NSData dataWithBytes:&layout length:sizeof(layout)],
         };
         audioInput_ = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeAudio outputSettings:audio];
-        audioInput_.expectsMediaDataInRealTime = NO;
+        audioInput_.expectsMediaDataInRealTime = s.realtime;
         if (![writer_ canAddInput:audioInput_]) return Result::FileOpenFailed;
         [writer_ addInput:audioInput_];
         AudioStreamBasicDescription pcm{};
@@ -184,8 +190,26 @@ class AvfExportSink : public IExportSink {
     return true;
   }
 
+  // The camera's own pixel buffer when the frame is nothing more: one plain layer filling a frame
+  // of the file's size. The encoder takes it as it is (NV12 from the camera, its native input).
+  CVPixelBufferRef passthrough(const ComposedFrame& f) const {
+    if (!realtime_ || f.layers.size() != 1 || !f.groups.empty() || !(f.filter == VideoFilter{})) return nullptr;
+    const ComposedLayer& l = f.layers[0];
+    bool plain = l.kind == ComposedLayer::Kind::Video && l.fit == Fit::Fill && l.group < 0 && l.x == 0.5f && l.y == 0.5f &&
+                 l.anchorX == 0.5f && l.anchorY == 0.5f && l.scale == 1 && l.rotation == 0 && !l.flipX && l.offsetX == 0 &&
+                 l.offsetY == 0 && l.clip[0] == 0 && l.clip[1] == 0 && l.clip[2] == 1 && l.clip[3] == 1 && l.opacity == 1 &&
+                 l.effects == ComposedEffects{};
+    auto pixels = static_cast<CVPixelBufferRef>(l.frame.image.get());
+    if (!plain || !pixels || CFGetTypeID(pixels) != CVPixelBufferGetTypeID()) return nullptr;
+    if (int(CVPixelBufferGetWidth(pixels)) != width_ || int(CVPixelBufferGetHeight(pixels)) != height_) return nullptr;
+    return pixels;
+  }
+
   bool encodeVideo(const ComposedFrame& f) {
     @autoreleasepool {
+      if (CVPixelBufferRef camera = passthrough(f)) {
+        return waitReady(videoInput_) && [adaptor_ appendPixelBuffer:camera withPresentationTime:CMTimeMake(f.ptsUs, 1000000)];
+      }
       CVPixelBufferRef pixels = nullptr;
       if (!adaptor_.pixelBufferPool || CVPixelBufferPoolCreatePixelBuffer(nullptr, adaptor_.pixelBufferPool, &pixels) != kCVReturnSuccess) {
         return false;
@@ -241,6 +265,8 @@ class AvfExportSink : public IExportSink {
   CVMetalTextureCacheRef cache_ = nullptr;
   MetalCompositor compositor_;  // video queue only
   MetalCompositor::Framing framing_;  // the scene into frames of the file's size
+  bool realtime_ = false;
+  int width_ = 0, height_ = 0;  // the file's frame size
 
   dispatch_queue_t videoQueue_ = nullptr, audioQueue_ = nullptr;
   dispatch_semaphore_t finished_ = dispatch_semaphore_create(0);

@@ -360,15 +360,16 @@ static void cameraTests() {
 }
 
 // A segment recorded into a real file: 30 synthetic frames (320 × 240) with the microphone, read
-// back: about a second long, at the frame size, with audio.
-static void segmentTests() {
+// back: about a second long, at the frame size, with audio. NV12 as the camera delivers it (the
+// frames go to the encoder as they are), and BGRA.
+static void segmentTests(OSType format) {
   NSString* path = [NSTemporaryDirectory() stringByAppendingPathComponent:@"mf_segment_test.mp4"];
   auto platform = macos::createPlatform();
   SegmentRecorder rec(*platform);
   CHECK(rec.start(macos::exportTargetFromPath(path.UTF8String), 320, 240, 30, 48000, 1) == Result::Ok);
   NSDictionary* attrs = @{(id)kCVPixelBufferIOSurfacePropertiesKey : @{}, (id)kCVPixelBufferMetalCompatibilityKey : @YES};
   CVPixelBufferRef pixels = nullptr;
-  CVPixelBufferCreate(nullptr, 320, 240, kCVPixelFormatType_32BGRA, (__bridge CFDictionaryRef)attrs, &pixels);
+  CVPixelBufferCreate(nullptr, 320, 240, format, (__bridge CFDictionaryRef)attrs, &pixels);
   CHECK(pixels != nullptr);
   if (!pixels) return;
   VideoFrame f;
@@ -411,7 +412,8 @@ int main(int argc, char** argv) {
   flipTests();
   pluginTests();
   cameraTests();
-  segmentTests();
+  segmentTests(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange);
+  segmentTests(kCVPixelFormatType_32BGRA);
   if (argc < 2) {
     std::fprintf(stderr, "usage: %s clip.mp4|audio.m4a\n", argv[0]);
     return 2;

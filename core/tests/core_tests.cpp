@@ -1325,6 +1325,7 @@ TEST(segment_recorder_times_frames_and_audio_from_the_first_frame) {
   CHECK(rec.start(ExportTarget{}, 1920, 1080, 30, 48000, 1) == Result::InvalidState);
   fake::ExportSink& sink = *platform.exportSink;
   CHECK(sink.settings.width == 1920 && sink.settings.height == 1080 && sink.settings.fps == 30 && sink.channels == 1);
+  CHECK(sink.settings.realtime);
 
   std::vector<int16_t> pcm(1024);
   for (int i = 0; i < 1024; ++i) pcm[i] = int16_t(i);
@@ -1360,16 +1361,23 @@ TEST(segment_recorder_times_frames_and_audio_from_the_first_frame) {
   rec.video(f);  // after stop: nothing more
   CHECK_EQ(sink.video.size(), size_t(30));
 
-  // The next segment, at once; the encoder busy for every third frame: those are dropped.
+  // The next segment, at once; the encoder busy for every third write: the frame waits and goes
+  // with the next one, at its own capture time. None is lost.
   platform.sinkBusyEvery = 3;
   CHECK(rec.start(ExportTarget{}, 1280, 720, 30, 0, 0) == Result::Ok);
+  fake::ExportSink& busy = *platform.exportSink;
   for (int i = 0; i < 30; ++i) {
     f.ptsUs = 50000000 + i * 33333;
     rec.video(f);
   }
-  CHECK(platform.exportSink->video.size() == 20 && rec.droppedFrames() == 10 && platform.exportSink->channels == 0);
-  rec.stop([&](Result r, int64_t) { result = r; });
-  CHECK(result == Result::Ok);
+  CHECK_EQ(busy.videoCalls, 44);  // frames 2, 4, ... 28 refused once
+  CHECK(busy.video.size() == 30 && rec.droppedFrames() == 0 && busy.channels == 0);
+  for (size_t n = 0; n < busy.video.size(); ++n) CHECK_EQ(busy.video[n].ptsUs, int64_t(n) * 33333);
+  rec.stop([&](Result r, int64_t us) {
+    result = r;
+    length = us;
+  });
+  CHECK(result == Result::Ok && length == 30 * 33333);
 
   // Stopped before any frame: no file.
   CHECK(rec.start(ExportTarget{}, 1280, 720, 30, 0, 0) == Result::Ok);
@@ -1377,6 +1385,174 @@ TEST(segment_recorder_times_frames_and_audio_from_the_first_frame) {
   CHECK(result == Result::WriteFailed);
   rec.stop([&](Result r, int64_t) { result = r; });
   CHECK(result == Result::InvalidState);
+}
+
+// Waits (a while at most) for a recording's `done`, which may run on the recorder's thread.
+static bool waitFor(const std::atomic<bool>& flag) {
+  for (int i = 0; i < 2000 && !flag; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  return flag;
+}
+
+static VideoFrame cameraFrame(int64_t ptsUs) {
+  VideoFrame f;
+  f.image = std::make_shared<int>(1);
+  f.ptsUs = ptsUs;
+  return f;
+}
+
+// The file's frame intervals, from the frames the encoder took.
+static std::vector<int64_t> frameGaps(const fake::ExportSink& sink) {
+  std::vector<int64_t> gaps;
+  for (size_t n = 1; n < sink.video.size(); ++n) gaps.push_back(sink.video[n].ptsUs - sink.video[n - 1].ptsUs);
+  return gaps;
+}
+
+// Only the test's thread writes here: the recorder's own retries are put off.
+static SegmentRecorder::Options testOptions() {
+  SegmentRecorder::Options o;
+  o.idleRetryUs = 60000000;
+  return o;
+}
+
+TEST(segment_recorder_keeps_the_nominal_rate_through_camera_bursts) {
+  fake::Platform platform;
+  SegmentRecorder rec(platform, testOptions());
+  CHECK(rec.start(ExportTarget{}, 640, 480, 30, 0, 0) == Result::Ok);
+  fake::ExportSink& sink = *platform.exportSink;
+  const int64_t t0 = 10000000;
+  // A 60 fps camera for a second: every other frame is kept, on the 30 fps grid.
+  for (int i = 0; i < 60; ++i) rec.video(cameraFrame(t0 + i * 16667));
+  CHECK_EQ(sink.video.size(), size_t(30));
+  CHECK_EQ(rec.stats().skipped, 30);
+  // A stall, then the camera's backlog at once: frames 5 ms apart, of which those a frame apart stay.
+  int64_t t = t0 + 1500000;
+  for (int i = 0; i < 12; ++i) rec.video(cameraFrame(t + i * 5000));
+  // Then the camera's own pace again, a little jittery.
+  for (int i = 1; i <= 30; ++i) rec.video(cameraFrame(t + 60000 + i * 33333 + (i % 2 ? 3000 : -3000)));
+  for (int64_t gap : frameGaps(sink)) CHECK(gap >= 33333 - 8333 || gap == 0);
+  CHECK(rec.stats().dropped == 0 && rec.stats().fps == 30 && rec.stats().rateReductions == 0);
+  std::atomic<bool> stopped{false};
+  rec.stop([&](Result r, int64_t) { stopped = r == Result::Ok; });
+  CHECK(stopped);
+}
+
+TEST(segment_recorder_thins_a_backlog_evenly) {
+  fake::Platform platform;
+  SegmentRecorder rec(platform, testOptions());
+  CHECK(rec.start(ExportTarget{}, 640, 480, 30, 0, 0) == Result::Ok);
+  fake::ExportSink& sink = *platform.exportSink;
+  sink.videoCredits = 0;  // the encoder stalls: nothing is taken
+  const int64_t t0 = 10000000;
+  for (int i = 0; i < 24; ++i) rec.video(cameraFrame(t0 + i * 33333));
+  CHECK_EQ(rec.pendingVideoFrames(), 8);  // the queue's limit: each frame holds a camera buffer
+  CHECK_EQ(rec.droppedFrames(), 16);
+  sink.videoCredits = -1;  // the encoder catches up
+  rec.video(cameraFrame(t0 + 24 * 33333));
+  CHECK_EQ(rec.pendingVideoFrames(), 0);
+  CHECK_EQ(sink.video.size(), size_t(9));
+  CHECK_EQ(sink.video.front().ptsUs, 0);                    // the first frame stays: the file's time 0
+  CHECK_EQ(sink.video.back().ptsUs, int64_t(24) * 33333);  // and the newest
+  // The backlog's 24 frames are spread out over its 8: no long freeze where frames were dropped.
+  std::vector<int64_t> gaps = frameGaps(sink);
+  for (size_t n = 0; n + 1 < gaps.size(); ++n) CHECK(gaps[n] >= 2 * 33333 && gaps[n] <= 4 * 33333);
+  std::atomic<bool> stopped{false};
+  rec.stop([&](Result r, int64_t) { stopped = r == Result::Ok; });
+  CHECK(stopped);
+}
+
+TEST(segment_recorder_lowers_the_rate_for_a_slow_encoder_and_recovers) {
+  fake::Platform platform;
+  SegmentRecorder rec(platform, testOptions());
+  CHECK(rec.start(ExportTarget{}, 640, 480, 30, 0, 0) == Result::Ok);
+  fake::ExportSink& sink = *platform.exportSink;
+  const int64_t t0 = 10000000;
+  // 10 s of a 30 fps camera into an encoder that keeps up with 20 fps (two frames in three).
+  sink.videoCredits = 0;
+  int i = 0;
+  for (; i < 300; ++i) {
+    if (i % 3 != 2) sink.videoCredits = std::min(sink.videoCredits.load() + 1, 2);
+    rec.video(cameraFrame(t0 + i * 33333));
+  }
+  SegmentRecorder::Stats slow = rec.stats();
+  std::fprintf(stderr, "slow encoder: %d written, %d dropped, %d skipped, %d fps, %d reductions\n", slow.written, slow.dropped,
+               slow.skipped, slow.fps, slow.rateReductions);
+  CHECK(slow.rateReductions >= 1 && slow.fps < 30);
+  CHECK(slow.dropped <= 15);  // at most a few before the rate came down, instead of one frame in three
+  CHECK(slow.written >= 150);  // about the encoder's 20 fps of the 10 s
+  // From the rate's step on, frames are kept evenly: no gap longer than a 10 fps frame.
+  size_t from = size_t(slow.dropped > 0 ? 60 : 0);
+  std::vector<int64_t> gaps = frameGaps(sink);
+  for (size_t n = from; n < gaps.size(); ++n) CHECK(gaps[n] <= 3 * 33333 + 8333);
+  // Then the encoder is fast again: back to the camera's rate.
+  sink.videoCredits = -1;
+  for (; i < 900; ++i) rec.video(cameraFrame(t0 + i * 33333));
+  CHECK_EQ(rec.stats().fps, 30);
+  CHECK_EQ(rec.pendingVideoFrames(), 0);
+  std::atomic<bool> stopped{false};
+  rec.stop([&](Result r, int64_t) { stopped = r == Result::Ok; });
+  CHECK(stopped);
+}
+
+TEST(segment_recorder_keeps_audio_in_sync_when_its_queue_overflows) {
+  fake::Platform platform;
+  SegmentRecorder::Options o = testOptions();
+  o.maxPendingAudioUs = 100000;  // 4800 samples at 48 kHz
+  SegmentRecorder rec(platform, o);
+  CHECK(rec.start(ExportTarget{}, 640, 480, 30, 48000, 1) == Result::Ok);
+  fake::ExportSink& sink = *platform.exportSink;
+  const int64_t t0 = 10000000;
+  rec.video(cameraFrame(t0));
+  std::vector<int16_t> pcm(1024, 7);
+  sink.audioCredits = 0;
+  for (int i = 0; i < 10; ++i) rec.audio(pcm.data(), 1024, t0 * 1000 + i * 21333333);
+  CHECK_EQ(rec.stats().audioDropped, int64_t(6 * 1024));  // the oldest went: four chunks fit
+  sink.audioCredits = -1;
+  rec.audio(pcm.data(), 1024, t0 * 1000 + 10 * 21333333);
+  CHECK_EQ(sink.audioFrames, int64_t(5 * 1024));
+  // The lost chunks are silence: what's left is where it was captured.
+  CHECK_EQ(sink.audioPts.front(), int64_t(6 * 1024) * 1000000 / 48000);
+  CHECK_EQ(sink.audioPts.back(), int64_t(10 * 1024) * 1000000 / 48000);
+  std::atomic<bool> stopped{false};
+  rec.stop([&](Result r, int64_t) { stopped = r == Result::Ok; });
+  CHECK(stopped);
+}
+
+TEST(segment_recorder_stop_returns_at_once_and_finishes_later) {
+  fake::Platform platform;
+  SegmentRecorder::Options o;
+  o.idleRetryUs = 1000;
+  {
+    SegmentRecorder rec(platform, o);
+    CHECK(rec.start(ExportTarget{}, 640, 480, 30, 0, 0) == Result::Ok);
+    fake::ExportSink& sink = *platform.exportSink;
+    sink.videoCredits = 1;
+    for (int i = 0; i < 5; ++i) rec.video(cameraFrame(10000000 + i * 33333));
+    std::atomic<bool> done{false};
+    std::atomic<int64_t> length{0};
+    rec.stop([&](Result r, int64_t us) {
+      length = r == Result::Ok ? us : -1;
+      done = true;
+    });
+    CHECK(!done);  // four frames still wait for the encoder
+    // The next segment starts meanwhile.
+    CHECK(rec.start(ExportTarget{}, 640, 480, 30, 0, 0) == Result::Ok);
+    sink.videoCredits = -1;
+    CHECK(waitFor(done));
+    CHECK_EQ(length.load(), int64_t(5 * 33333));
+    CHECK_EQ(sink.video.size(), size_t(5));
+    CHECK(sink.finished);
+    rec.stop([](Result, int64_t) {});
+  }
+  // Destroyed with a segment still waiting for the encoder: the file is abandoned, `done` never runs.
+  std::atomic<bool> called{false};
+  {
+    SegmentRecorder rec(platform, o);
+    CHECK(rec.start(ExportTarget{}, 640, 480, 30, 0, 0) == Result::Ok);
+    platform.exportSink->videoCredits = 0;
+    rec.video(cameraFrame(10000000));
+    rec.stop([&](Result, int64_t) { called = true; });
+  }
+  CHECK(!called);
 }
 
 TEST(player_composes_plugin_effects_and_edits_them_live) {

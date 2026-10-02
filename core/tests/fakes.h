@@ -4,6 +4,7 @@
 // tested deterministically on the host.
 
 #include <algorithm>
+#include <atomic>
 #include <climits>
 #include <deque>
 #include <set>
@@ -235,7 +236,9 @@ class ImageLoader : public IImageLoader {
   }
 };
 
-// Records what an export writes. With busyEvery = n, every n-th write reports Again.
+// Records what an export writes. With busyEvery = n, every n-th write reports Again. With credits
+// of 0 or more, each write takes one and reports Again when there are none: an encoder that keeps
+// up only as fast as the test grants them (-1: no limit).
 class ExportSink : public IExportSink {
  public:
   Result open(const ExportTarget&, const ExportSettings& s, int rate, int ch) override {
@@ -246,12 +249,15 @@ class ExportSink : public IExportSink {
   }
   Result writeVideo(const ComposedFrame& f) override {
     if (busyEvery && ++videoCalls % busyEvery == 0) return Result::Again;
+    if (!take(videoCredits)) return Result::Again;
     video.push_back(f);
     return Result::Ok;
   }
   Result writeAudio(const int16_t* pcm, int frames, int64_t ptsUs) override {
     if (busyEvery && ++audioCalls % busyEvery == 0) return Result::Again;
+    if (!take(audioCredits)) return Result::Again;
     contiguous &= ptsUs == int64_t(audioFrames) * 1000000 / sampleRate;
+    audioPts.push_back(ptsUs);
     audioFrames += frames;
     samples.insert(samples.end(), pcm, pcm + size_t(frames) * channels);
     return Result::Ok;
@@ -261,13 +267,23 @@ class ExportSink : public IExportSink {
     done(Result::Ok);
   }
 
+  static bool take(std::atomic<int>& credits) {
+    int c = credits;
+    while (c != 0 && !credits.compare_exchange_weak(c, c < 0 ? c : c - 1)) {
+    }
+    return c != 0;
+  }
+
   int busyEvery = 0, videoCalls = 0, audioCalls = 0;
+  std::atomic<int> videoCredits{-1}, audioCredits{-1};
   ExportSettings settings;
   int sampleRate = 0, channels = 0;
   std::vector<ComposedFrame> video;
   int64_t audioFrames = 0;
+  std::vector<int64_t> audioPts;
   std::vector<int16_t> samples;
-  bool contiguous = true, finished = false;
+  bool contiguous = true;
+  std::atomic<bool> finished{false};
 };
 
 class ManualScheduler : public IScheduler {

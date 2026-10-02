@@ -739,9 +739,13 @@ NSString* effectList(const mf::SceneEffects& e) {
   _bar.recordingUs = _saving ? 0 : recording;
   _bar.needsDisplay = YES;
   int64_t total = _session->totalUs() + (_saving ? 0 : recording);
-  _time.stringValue = _session->maxDurationUs() == editor::CaptureSession::kUnlimited
-                          ? seconds(total)
-                          : [NSString stringWithFormat:@"%@ / %@", seconds(total), seconds(_session->maxDurationUs())];
+  NSString* time = _session->maxDurationUs() == editor::CaptureSession::kUnlimited
+                       ? seconds(total)
+                       : [NSString stringWithFormat:@"%@ / %@", seconds(total), seconds(_session->maxDurationUs())];
+  // The encoder can't keep up: the recorder keeps fewer frames, evenly. Say so while it lasts.
+  int fps = _session->recording() && !_saving ? _recorder->stats().fps : kFps;
+  if (fps < kFps) time = [time stringByAppendingFormat:@" · %d fps", fps];
+  _time.stringValue = time;
   if (_session->recording() && !_saving) {  // pulses while recording
     _record.alphaValue = 0.65 + 0.35 * std::cos(CACurrentMediaTime() * 4);
   } else {

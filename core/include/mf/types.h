@@ -114,6 +114,9 @@ struct ExportSettings {
   int videoBitrate = 10000000;
   int audioBitrate = 192000;
   VideoCodec codec = VideoCodec::H264;  // the container comes from the target (Mac OS: the file's extension)
+  // A live source (a camera): encode with low latency, trading quality for keeping up, and take a
+  // frame that is just a camera image of the file's size as it is.
+  bool realtime = false;
 };
 
 // Opaque handle made by the platform layer. Mac OS: NSURL of the output file.
