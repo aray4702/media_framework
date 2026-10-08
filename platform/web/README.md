@@ -30,6 +30,21 @@ python3 platform/web/tools/serve.py          # http://localhost:8000
 
 Open `http://localhost:8000/platform/web/app/?scene=stacked2` and press Play. Scenes: `single`, `sync` (a flash and a beep each second), `stacked2` (picture in picture), `stacked4` (four lanes in a grid, one at 60 fps), `features` (a crossfade, a wipe, an image, a caption, color adjust, crop, chroma key, blur, a blend mode), `corrupt` (a clip with damaged data). `seconds=N` sets how long they play.
 
+## Editor
+
+`platform/web/editor/` is the media editor in the browser: `http://localhost:8000/platform/web/editor/`. Its model is the macOS editor's `editor::Document` (`apps/macos-editor/document.cpp`), unchanged, as a C API (`src/editor_api.cpp`) on the page's thread; every edit goes through it, so every track stays valid. After an edit the scene goes to the player (`mf_apply`), which redraws the frame when only the look changed and otherwise reopens the scene at the playhead.
+
+- **Media:** MP4 (H.264, AAC) and M4A files and images, from Add media… or dropped on the page. Click one to add it at the playhead: a video on the lowest free video track, an image, text or color on a layer above what plays there, audio on an audio track.
+- **Text, emoji and colors:** the macOS editor's text presets (heading, subheading, body, caption), emoji as text, solid colors.
+- **Timeline:** select items, tracks and joins; drag items along their track or onto another; trim either end (the start trims into the file); click the diamond between two items for a transition; scrub in the ruler. Space plays, Delete removes the selection.
+- **Properties:** timing (start, duration, in, speed); position, scale, rotation, opacity, fit, blend; color adjust, blur, crop and chroma key; text words, font, size, color and box; sound (mute, gain, pan) and detaching a video's sound; transitions (kind, direction, duration); tracks (on, opacity or gain, order); the project (size, frame rate, background).
+- **Projects:** Save downloads the scene document; Open takes the document together with its media files, matched by file name.
+- **Export:** MP4 at the project's size, 720p or 1080p, downloaded when done.
+
+`tools/run_editor.mjs` drives it in Chrome like a person (import, add, edit, drag, transition, play, export, save and reopen) and checks the scene and the player at each step.
+
+Not yet, compared with the macOS editor: stickers, the camera and voice-over (step 5), editing in the preview (drag and resize on the picture), dragging from the sidebar onto the timeline, waveforms, effect plugins, export formats and framing (MOV, HEVC, fill, several outputs), resizable panes, and keeping media between sessions (projects reopen with their files picked again).
+
 ## Measure
 
 `tools/run_spike.mjs` plays scenes in Chrome and prints each one's metrics as JSON; `tools/summarize.py` shortens them:

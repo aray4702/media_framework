@@ -13,6 +13,7 @@
 #include <functional>
 #include <map>
 #include <mutex>
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -61,8 +62,10 @@ struct Session : mf::PlayerListener {
   std::mutex mu;
   std::string report, reportCopy;
 
+  bool playWhenReady = false;  // mf_apply reopened a playing scene: play again once it's ready
+
   void addEvent(const std::string& e) { events += std::string(events.empty() ? "" : ",") + "\"" + e + "\""; }
-  void onStateChanged(mf::State s) override { addEvent(std::string("state:") + mf::toString(s)); }
+  void onStateChanged(mf::State state) override;
   void onError(mf::Result r, const std::string& reason) override {
     error = std::string(mf::toString(r)) + ": " + reason;
     addEvent("error");
@@ -70,6 +73,17 @@ struct Session : mf::PlayerListener {
   void onEnded() override { addEvent("ended"); }
   void onSeekCompleted(int64_t) override { addEvent("seeked"); }
 };
+
+// Runs f on the player thread, after the calls posted before it.
+void post(Session* s, std::function<void()> f);
+
+void Session::onStateChanged(mf::State state) {
+  addEvent(std::string("state:") + mf::toString(state));
+  if (state == mf::State::Ready && playWhenReady) {
+    playWhenReady = false;
+    post(this, [this] { player->play(); });  // not from inside the player's callback
+  }
+}
 
 void ExportEvents::onCompleted() {
   s->exportMs = emscripten_get_now() - s->exportStartedMs;
@@ -115,7 +129,6 @@ void snapshot(Session* s) {
   s->report = std::move(body);
 }
 
-// Runs f on the player thread, after the calls posted before it.
 void post(Session* s, std::function<void()> f) {
   auto* fn = new std::function<void()>(std::move(f));
   emscripten_proxy_async(emscripten_proxy_get_system_queue(), s->thread, [](void* p) {
@@ -251,6 +264,41 @@ EMSCRIPTEN_KEEPALIVE void mf_export(Session* s, const char* sceneJson, int width
 // changes it then). Read it before the next export.
 EMSCRIPTEN_KEEPALIVE const uint8_t* mf_export_data(Session* s) { return s->exportFile ? s->exportFile->bytes.data() : nullptr; }
 EMSCRIPTEN_KEEPALIVE int mf_export_size(Session* s) { return s->exportFile ? int(s->exportFile->bytes.size()) : 0; }
+
+// The editor's scene after an edit. Only its look changed: the frame on screen is redrawn
+// (Player::updateAppearance). Else the scene is opened again at `atUs`, playing again if it was
+// (as the macOS editor reloads its player). An empty scene leaves nothing open.
+EMSCRIPTEN_KEEPALIVE void mf_apply(Session* s, const char* sceneJson, double atUs) {
+  post(s, [s, json = std::string(sceneJson), atUs] {
+    auto apply = [s, json, atUs] {
+      auto resolve = [s](const std::string& src) {
+        auto it = s->sources.find(src);
+        return it == s->sources.end() ? mf::MediaSource{} : mf::web::mediaSource(it->second);
+      };
+      mf::Scene scene;
+      s->error.clear();
+      if (mf::parseScene(json, resolve, &scene, &s->error) != mf::Result::Ok) return snapshot(s);
+      mf::State state = s->player->state();
+      if ((state == mf::State::Ready || state == mf::State::Play) && s->player->updateAppearance(scene) == mf::Result::Ok) return snapshot(s);
+      bool playing = state == mf::State::Play;
+      s->player->shutdown();
+      s->player = mf::Player::create(*s->platform, s);
+      int64_t duration = scene.durationUs();
+      if (duration > 0) {
+        int64_t at = std::min<int64_t>(std::max<int64_t>(0, int64_t(atUs)), duration - 1);
+        mf::Result r = s->player->open(scene, mf::RenderTarget{const_cast<char*>(s->canvas.c_str())}, mf::OutputDriver::Vsync, &s->error, at);
+        if (r != mf::Result::Ok) s->addEvent(std::string("openFailed:") + mf::toString(r));
+        s->playWhenReady = playing && r == mf::Result::Ok;
+      }
+      snapshot(s);
+    };
+    if (s->pending > 0) {
+      s->whenReady.push_back(apply);
+    } else {
+      apply();
+    }
+  });
+}
 
 EMSCRIPTEN_KEEPALIVE void mf_play(Session* s) { post(s, [s] { s->player->play(); }); }
 EMSCRIPTEN_KEEPALIVE void mf_pause(Session* s) { post(s, [s] { s->player->pause(); }); }

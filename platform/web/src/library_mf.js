@@ -39,7 +39,9 @@ addToLibrary({
 
     absolute: (t) => performance.timeOrigin + t,
 
-    notify(onOutput) { _mf_web_output(onOutput); },
+    // 0 once its decoder is destroyed: WebCodecs can still deliver an output, a flush or a dequeue
+    // event after that, which must not reach the freed C++ object.
+    notify(onOutput) { if (onOutput) _mf_web_output(onOutput); },
 
     addImage(bitmap) {
       const h = MF.nextImage++;
@@ -195,6 +197,7 @@ addToLibrary({
   mf_js_vdec_destroy__deps: ['$MF'],
   mf_js_vdec_destroy: (id) => {
     const st = MF.vdecs[id - 1];
+    st.onOutput = 0;
     st.out.forEach((f) => f.close());
     if (st.decoder.state !== 'closed') st.decoder.close();
     MF.vdecs[id - 1] = null;
@@ -275,6 +278,7 @@ addToLibrary({
   mf_js_adec_destroy__deps: ['$MF'],
   mf_js_adec_destroy: (id) => {
     const st = MF.adecs[id - 1];
+    st.onOutput = 0;
     if (st.decoder.state !== 'closed') st.decoder.close();
     MF.adecs[id - 1] = null;
   },
