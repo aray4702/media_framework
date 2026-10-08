@@ -1,0 +1,9 @@
+{
+  "name": "mf-web-tools",
+  "private": true,
+  "type": "module",
+  "description": "Drives the web platform's spike page in Chrome (run_spike.mjs).",
+  "dependencies": {
+    "puppeteer-core": "^24.0.0"
+  }
+}

@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "mf/audio_ring.h"
+#include "mf/cooperative_scheduler.h"
 #include "mf/exporter.h"
 #include "mf/player.h"
 
@@ -173,15 +174,37 @@ class VideoDecoder : public IVideoDecoder {
   bool eos_ = false;
 };
 
+// Decodes each packet as it is queued; its PCM is taken in order.
 class AudioDecoder : public IAudioDecoder {
  public:
-  Result configure(const TrackInfo&) override { return Result::Ok; }
-  Result decode(const Packet& p, PcmBuffer* out) override {
-    out->ptsUs = p.ptsUs;
-    out->samples.assign(kAudioFrames * 2, 100);
+  Result configure(const TrackInfo&, std::function<void()>) override {
+    out_.clear();
+    eos_ = false;
     return Result::Ok;
   }
-  void flush() override {}
+  void signalEos() override { eos_ = true; }
+  Result queue(const Packet& p) override {
+    if (out_.size() >= 4) return Result::Again;
+    PcmBuffer pcm;
+    pcm.ptsUs = p.ptsUs;
+    pcm.samples.assign(kAudioFrames * 2, 100);
+    out_.push_back(std::move(pcm));
+    return Result::Ok;
+  }
+  Result dequeue(PcmBuffer* out) override {
+    if (out_.empty()) return eos_ ? Result::Eos : Result::Again;
+    *out = std::move(out_.front());
+    out_.pop_front();
+    return Result::Ok;
+  }
+  void flush() override {
+    out_.clear();
+    eos_ = false;
+  }
+
+ private:
+  std::deque<PcmBuffer> out_;
+  bool eos_ = false;
 };
 
 // Presents instantly at the requested time.
@@ -347,6 +370,14 @@ class Platform : public PlatformFactory {
     return d;
   }
   std::unique_ptr<IScheduler> createScheduler() override {
+    if (cooperative) {  // as in a browser: one thread, run when the event loop gets to it
+      auto s = std::make_unique<CooperativeScheduler>(clock_, [this](int64_t delayNs) {
+        runAtNs = std::min(runAtNs, clock_.now + delayNs);
+        ++runRequests;
+      });
+      coop = s.get();
+      return s;
+    }
     auto s = std::make_unique<ManualScheduler>();
     scheduler = s.get();
     return s;
@@ -371,6 +402,11 @@ class Platform : public PlatformFactory {
   Display* display = nullptr;
   Speaker* speaker = nullptr;
   ManualScheduler* scheduler = nullptr;
+  // cooperative: a CooperativeScheduler instead, its runs due at runAtNs (fake time).
+  bool cooperative = false;
+  CooperativeScheduler* coop = nullptr;
+  int64_t runAtNs = INT64_MAX;
+  int runRequests = 0, runs = 0;
 
  private:
   Clock clock_;
@@ -393,12 +429,25 @@ struct Listener : PlayerListener {
 // A player on fake adapters, driven 1 ms at a time.
 struct Harness {
   explicit Harness(Clip c = {}) : Harness(std::vector<Clip>{c}) {}
-  explicit Harness(std::vector<Clip> clips) : platform(std::move(clips)) { player = Player::create(platform, &listener); }
+  // cooperative: stages run on a CooperativeScheduler, as in a browser, instead of the manual one.
+  explicit Harness(std::vector<Clip> clips, bool cooperative = false) : platform(std::move(clips)) {
+    platform.cooperative = cooperative;
+    player = Player::create(platform, &listener);
+  }
   ~Harness() {
     if (player) player->shutdown();
   }
   void step() {
-    platform.scheduler->runUntilIdle();
+    if (platform.coop) {
+      // The event loop: every run that has come due, which may ask for another at once.
+      for (int guard = 0; guard < 10000 && platform.runAtNs <= platform.clockRef().now; ++guard) {
+        platform.runAtNs = INT64_MAX;
+        ++platform.runs;
+        platform.coop->run();
+      }
+    } else {
+      platform.scheduler->runUntilIdle();
+    }
     platform.clockRef().now += kMs;
     if (platform.speaker) platform.speaker->tick(platform.clockRef().now);
   }

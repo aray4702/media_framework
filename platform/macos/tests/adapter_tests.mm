@@ -501,14 +501,17 @@ int main(int argc, char** argv) {
   // Audio decodes to about the track's duration of PCM.
   if (info.audio && info.audio->supported) {
     auto audio = macos::createAudioDecoder();
-    CHECK(audio->configure(*info.audio) == Result::Ok);
+    CHECK(audio->configure(*info.audio, [] {}) == Result::Ok);
     CHECK(demuxer->seekTo(0) == Result::Ok);
     int64_t frames = 0, lastPts = 0;
     int corrupt = 0;
     Packet p;
     while (demuxer->read(kAudio, &p) == Result::Ok) {
+      CHECK(audio->queue(p) == Result::Ok);
       PcmBuffer pcm;
-      if (audio->decode(p, &pcm) != Result::Ok) ++corrupt;
+      Result r = audio->dequeue(&pcm);  // AudioConverter decodes as the packet is queued
+      CHECK(r == Result::Ok || r == Result::CorruptFrame);
+      corrupt += r == Result::CorruptFrame;
       frames += int64_t(pcm.samples.size()) / info.audio->channels;
       lastPts = p.ptsUs;
     }

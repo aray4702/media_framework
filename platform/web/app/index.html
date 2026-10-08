@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Media Framework spike</title>
+  <style>
+    :root { color-scheme: light dark; --bg: #f6f6f4; --fg: #1d1d1b; --muted: #6b6b66; }
+    @media (prefers-color-scheme: dark) { :root { --bg: #161615; --fg: #ecebe8; --muted: #9a9993; } }
+    body { margin: 0; padding: 16px; background: var(--bg); color: var(--fg); font: 14px/1.4 system-ui, sans-serif; }
+    canvas { display: block; width: 100%; max-width: 960px; aspect-ratio: 16 / 9; background: #000; }
+    pre { color: var(--muted); white-space: pre-wrap; max-width: 960px; }
+    button { font: inherit; margin: 8px 8px 8px 0; }
+  </style>
+</head>
+<body>
+  <canvas id="view"></canvas>
+  <div>
+    <button id="play">Play</button>
+    <span id="status">Loading…</span>
+  </div>
+  <pre id="report"></pre>
+  <script src="/build-web/mf.js"></script>
+  <script type="module" src="spike.js"></script>
+</body>
+</html>
