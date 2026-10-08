@@ -14,8 +14,8 @@ CORE=$(ls core/src/*.cpp | grep -v -e thread_scheduler -e segment_recorder -e li
 em++ -std=c++17 -O2 -pthread -Wall -Wno-unused-parameter \
   -Icore/include -Iplatform/web/include -Iplatform/web/src \
   $CORE platform/web/src/mp4_demuxer.cpp platform/web/src/web_platform.cpp platform/web/src/web_api.cpp \
-  --js-library platform/web/src/library_mf.js \
-  -pthread -sWASM_WORKERS -sAUDIO_WORKLET \
+  --js-library platform/web/src/library_mf.js --js-library platform/web/src/library_mf_compositor.js \
+  -pthread -sWASM_WORKERS -sAUDIO_WORKLET -sOFFSCREENCANVAS_SUPPORT \
   -sMODULARIZE -sEXPORT_NAME=createMediaFramework -sENVIRONMENT=web \
   -sINITIAL_MEMORY=536870912 -sSTACK_SIZE=1048576 \
   -sEXPORTED_FUNCTIONS=_malloc,_free \

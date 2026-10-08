@@ -1,15 +1,21 @@
-// The browser side of the web platform (web_platform.cpp): the scheduler's timers, WebCodecs
-// decoders, the WebGPU display and the audio clock mapping. Everything here runs on the page's
-// thread; the AudioWorklet runs only C++.
+// The browser side of the web platform (web_platform.cpp, web_api.cpp): the scheduler's timers,
+// WebCodecs decoders, the WebGPU display, image decoding and the audio clock mapping. All of it runs
+// on the player's thread (a worker), except the audio clock mapping, on the page's thread with the
+// AudioContext; the AudioWorklet runs only C++. Times passed to C++ are absolute
+// (performance.timeOrigin + performance.now()): each thread has its own time origin.
 
 addToLibrary({
-  $MF__postset: "Module['mfStats'] = () => MF.stats();",
+  $MF__postset: "",
+
   $MF: {
     live: new Set(),       // schedulers that may still be run
     queue: [],             // runs waiting for the next message
     channel: null,
     frames: new Map(),     // handle -> VideoFrame held by C++
     nextHandle: 1,
+    images: new Map(),     // handle -> { bitmap: ImageBitmap, texture: GPUTexture once drawn }
+    nextImage: 1,
+    compositor: null,
     maxHeld: 0,            // most frames held by C++ at once
     maxDecoding: 0,        // most frames inside the decoders (queued, not yet output) at once
     vdecs: [],
@@ -19,14 +25,27 @@ addToLibrary({
     gpu: null,
     drawn: 0,
 
+    statsPtr: 0,
+    rafIntervals: [],      // the display's animation-frame intervals (ms), the last 600
+    lastRaf: 0,
+
     stats() {
       let decoding = 0;
       for (const st of MF.vdecs) if (st) decoding += st.decoder.decodeQueueSize + st.out.length;
+      const r = [...MF.rafIntervals].sort((a, b) => a - b), pick = (q) => (r.length ? Math.round(r[Math.floor(q * (r.length - 1))] * 100) / 100 : 0);
       return { heldFrames: MF.frames.size, maxHeldFrames: MF.maxHeld, maxDecodingFrames: MF.maxDecoding, decodingNow: decoding,
-               drawn: MF.drawn };
+               drawn: MF.drawn, rafP50Ms: pick(0.5), rafP99Ms: pick(0.99), rafMaxMs: pick(1) };
     },
 
+    absolute: (t) => performance.timeOrigin + t,
+
     notify(onOutput) { _mf_web_output(onOutput); },
+
+    addImage(bitmap) {
+      const h = MF.nextImage++;
+      MF.images.set(h, { bitmap });
+      return h;
+    },
 
     // The video decoders' frames in flight: queued for decoding plus output not yet taken.
     noteDecoding() {
@@ -35,12 +54,32 @@ addToLibrary({
       MF.maxDecoding = Math.max(MF.maxDecoding, n);
     },
 
+    // A decode error closes a WebCodecs decoder. It is reported once as a corrupt frame (the core
+    // then skips to the next keyframe, holding the last good frame, A14), and the decoder is made
+    // again at that keyframe. Only a failed configure() is fatal.
     makeVideoDecoder(st) {
       st.decoder = new VideoDecoder({
         output: (frame) => { st.out.push(frame); MF.notify(st.onOutput); },
-        error: (e) => { console.error('VideoDecoder:', e.message); st.failed = true; MF.notify(st.onOutput); },
+        error: (e) => MF.broke(st, 'VideoDecoder', e),
       });
       st.decoder.ondequeue = () => MF.notify(st.onOutput);  // room to queue again
+    },
+
+    broke(st, what, e) {
+      console.warn(`${what}: ${e.message}; ${what === 'VideoDecoder' ? 'skipping to the next keyframe' : 'resuming at the next packet'}`);
+      st.broken = st.corrupt = true;
+      MF.notify(st.onOutput);
+    },
+
+    // Before decoding: a broken decoder is made again at a keyframe (every audio packet is one);
+    // other packets are dropped until then. True when the packet should be decoded.
+    revive(st, make, key) {
+      if (!st.broken) return true;
+      if (!key) return false;
+      make(st);
+      st.decoder.configure(st.config);
+      st.broken = false;
+      return true;
     },
 
     makeAudioDecoder(st) {
@@ -56,37 +95,9 @@ addToLibrary({
           data.close();
           MF.notify(st.onOutput);
         },
-        error: (e) => { console.error('AudioDecoder:', e.message); st.failed = true; MF.notify(st.onOutput); },
+        error: (e) => MF.broke(st, 'AudioDecoder', e),
       });
       st.decoder.ondequeue = () => MF.notify(st.onOutput);
-    },
-
-    initPipeline(device, format) {
-      const module = device.createShaderModule({ code: `
-        struct U { rect: vec4f, opacity: vec4f };
-        @group(0) @binding(0) var samp: sampler;
-        @group(0) @binding(1) var tex: texture_external;
-        @group(0) @binding(2) var<uniform> u: U;
-        struct V { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
-        @vertex fn vs(@builtin(vertex_index) i: u32) -> V {
-          var corners = array<vec2f, 6>(vec2f(0, 0), vec2f(1, 0), vec2f(0, 1), vec2f(0, 1), vec2f(1, 0), vec2f(1, 1));
-          let c = corners[i];
-          var o: V;
-          o.pos = vec4f(mix(u.rect.x, u.rect.z, c.x), mix(u.rect.y, u.rect.w, c.y), 0.0, 1.0);
-          o.uv = c;
-          return o;
-        }
-        @fragment fn fs(v: V) -> @location(0) vec4f {
-          let c = textureSampleBaseClampToEdge(tex, samp, v.uv);
-          return vec4f(c.rgb * u.opacity.x, u.opacity.x);
-        }` });
-      const blend = { color: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha' }, alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha' } };
-      return device.createRenderPipeline({
-        layout: 'auto',
-        vertex: { module, entryPoint: 'vs' },
-        fragment: { module, entryPoint: 'fs', targets: [{ format, blend }] },
-        primitive: { topology: 'triangle-list' },
-      });
     },
   },
 
@@ -126,7 +137,7 @@ addToLibrary({
     st.config = { codec: UTF8ToString(codec), description: HEAPU8.slice(description, description + length), optimizeForLatency: true };
     st.out.forEach((f) => f.close());
     st.out = [];
-    st.eos = st.failed = false;
+    st.eos = st.failed = st.broken = st.corrupt = false;
     try {
       if (st.decoder.state === 'closed') MF.makeVideoDecoder(st);
       st.decoder.configure(st.config);
@@ -140,16 +151,20 @@ addToLibrary({
   mf_js_vdec_decode__deps: ['$MF'],
   mf_js_vdec_decode: (id, data, length, ptsUs, key) => {
     const st = MF.vdecs[id - 1];
-    if (st.failed || st.decoder.state !== 'configured') return 2;
+    if (st.failed) return 2;
+    if (!MF.revive(st, MF.makeVideoDecoder, key)) return 0;
     if (st.decoder.decodeQueueSize + st.out.length >= 6) return 1;
     st.decoder.decode(new EncodedVideoChunk({ type: key ? 'key' : 'delta', timestamp: ptsUs, data: HEAPU8.slice(data, data + length) }));
     MF.noteDecoding();
     return 0;
   },
   mf_js_vdec_flush_eos__deps: ['$MF'],
+  // A broken decoder has nothing left to output: its end comes at once.
   mf_js_vdec_flush_eos: (id) => {
     const st = MF.vdecs[id - 1], gen = st.gen;
-    st.decoder.flush().then(() => { if (st.gen === gen) { st.eos = true; MF.notify(st.onOutput); } }, () => {});
+    const done = () => { if (st.gen === gen) { st.eos = true; MF.notify(st.onOutput); } };
+    if (st.broken) done();
+    else st.decoder.flush().then(done, done);
   },
   mf_js_vdec_reset__deps: ['$MF'],
   mf_js_vdec_reset: (id) => {
@@ -157,12 +172,12 @@ addToLibrary({
     ++st.gen;
     st.out.forEach((f) => f.close());
     st.out = [];
-    st.eos = st.failed = false;
+    st.eos = st.failed = st.broken = st.corrupt = false;
     if (st.decoder.state === 'closed') MF.makeVideoDecoder(st);
     else st.decoder.reset();
     if (st.config) st.decoder.configure(st.config);
   },
-  // > 0 a frame handle (its time in *ptsUs), 0 again, -1 Eos, -2 failed.
+  // > 0 a frame handle (its time in *ptsUs), 0 again, -1 Eos, -2 failed, -3 corrupt (skip to a keyframe).
   mf_js_vdec_dequeue__deps: ['$MF'],
   mf_js_vdec_dequeue: (id, ptsUs) => {
     const st = MF.vdecs[id - 1];
@@ -174,6 +189,7 @@ addToLibrary({
       return h;
     }
     if (st.failed) return -2;
+    if (st.corrupt) { st.corrupt = false; return -3; }
     return st.eos ? -1 : 0;
   },
   mf_js_vdec_destroy__deps: ['$MF'],
@@ -204,7 +220,7 @@ addToLibrary({
     st.config = { codec: UTF8ToString(codec), sampleRate, numberOfChannels: channels };
     if (length > 0) st.config.description = HEAPU8.slice(description, description + length);
     st.out = [];
-    st.eos = st.failed = false;
+    st.eos = st.failed = st.broken = st.corrupt = false;
     try {
       if (st.decoder.state === 'closed') MF.makeAudioDecoder(st);
       st.decoder.configure(st.config);
@@ -217,7 +233,8 @@ addToLibrary({
   mf_js_adec_decode__deps: ['$MF'],
   mf_js_adec_decode: (id, data, length, ptsUs) => {
     const st = MF.adecs[id - 1];
-    if (st.failed || st.decoder.state !== 'configured') return 2;
+    if (st.failed) return 2;
+    MF.revive(st, MF.makeAudioDecoder, true);
     if (st.decoder.decodeQueueSize + st.out.length >= 8) return 1;
     st.decoder.decode(new EncodedAudioChunk({ type: 'key', timestamp: ptsUs, data: HEAPU8.slice(data, data + length) }));
     return 0;
@@ -225,19 +242,22 @@ addToLibrary({
   mf_js_adec_flush_eos__deps: ['$MF'],
   mf_js_adec_flush_eos: (id) => {
     const st = MF.adecs[id - 1], gen = st.gen;
-    st.decoder.flush().then(() => { if (st.gen === gen) { st.eos = true; MF.notify(st.onOutput); } }, () => {});
+    const done = () => { if (st.gen === gen) { st.eos = true; MF.notify(st.onOutput); } };
+    if (st.broken) done();
+    else st.decoder.flush().then(done, done);
   },
   mf_js_adec_reset__deps: ['$MF'],
   mf_js_adec_reset: (id) => {
     const st = MF.adecs[id - 1];
     ++st.gen;
     st.out = [];
-    st.eos = st.failed = false;
+    st.eos = st.failed = st.broken = st.corrupt = false;
     if (st.decoder.state === 'closed') MF.makeAudioDecoder(st);
     else st.decoder.reset();
     if (st.config) st.decoder.configure(st.config);
   },
-  // > 0 frames per channel of the next output (its time and channels written), 0 again, -1 Eos, -2 failed.
+  // > 0 frames per channel of the next output (its time and channels written), 0 again, -1 Eos,
+  // -2 failed, -3 corrupt: audio was lost (the mixer fills the gap with silence).
   mf_js_adec_dequeue__deps: ['$MF'],
   mf_js_adec_dequeue: (id, ptsUs, channels) => {
     const st = MF.adecs[id - 1];
@@ -247,6 +267,7 @@ addToLibrary({
       return st.out[0].frames;
     }
     if (st.failed) return -2;
+    if (st.corrupt) { st.corrupt = false; return -3; }
     return st.eos ? -1 : 0;
   },
   mf_js_adec_take__deps: ['$MF'],
@@ -261,18 +282,22 @@ addToLibrary({
   // --- Display (WebGPU) ---
 
   // Module.mfGpuDevice must hold a GPUDevice (the page requests it: that is asynchronous).
-  mf_js_display_attach__deps: ['$MF', 'mf_web_display_tick'],
+  // On the player's thread the canvas is the OffscreenCanvas transferred with it (by its id).
+  mf_js_display_attach__deps: ['$MF', '$MFC', '$GL', 'mf_web_display_tick'],
   mf_js_display_attach: (selector, display) => {
-    const canvas = document.querySelector(UTF8ToString(selector)), device = Module['mfGpuDevice'];
+    const name = UTF8ToString(selector), device = Module['mfGpuDevice'];
+    const canvas = globalThis.document ? document.querySelector(name) : GL.offscreenCanvases[name.replace(/^#/, '')]?.offscreenCanvas;
     if (!canvas || !device) return 0;
     const context = canvas.getContext('webgpu'), format = navigator.gpu.getPreferredCanvasFormat();
     context.configure({ device, format, alphaMode: 'opaque' });
-    MF.gpu = { device, context, canvas, pipeline: MF.initPipeline(device, format), sampler: device.createSampler({ magFilter: 'linear', minFilter: 'linear' }),
-               uniforms: device.createBuffer({ size: 256 * 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }) };
+    MF.gpu = { device, context, canvas };
+    MF.compositor = MFC.create(device, format);
     MF.displays.add(display);
     const loop = (t) => {
       if (!MF.displays.has(display)) return;
-      _mf_web_display_tick(display, t);
+      if (MF.lastRaf) { MF.rafIntervals.push(t - MF.lastRaf); if (MF.rafIntervals.length > 600) MF.rafIntervals.shift(); }
+      MF.lastRaf = t;
+      _mf_web_display_tick(display, MF.absolute(t));
       requestAnimationFrame(loop);
     };
     requestAnimationFrame(loop);
@@ -280,46 +305,49 @@ addToLibrary({
   },
   mf_js_display_detach__deps: ['$MF'],
   mf_js_display_detach: (display) => { MF.displays.delete(display); },
-  mf_js_display_visible: () => (document.visibilityState === 'visible' ? 1 : 0),
-  // layers: per video layer [handle, fit, x, y, anchorX, anchorY, scale, offsetX, offsetY, opacity].
-  mf_js_display_draw__deps: ['$MF'],
-  mf_js_display_draw: (layersPtr, count, backgroundPtr, width, height) => {
+  mf_js_display_visible: () => (globalThis.document?.visibilityState === 'hidden' ? 0 : 1),  // a worker can't tell: visible
+  // frameJson: a composed frame (web_platform.cpp's frameJson); the canvas takes its size.
+  mf_js_display_draw__deps: ['$MF', '$MFC'],
+  mf_js_display_draw: (frameJson) => {
     const g = MF.gpu;
     if (!g) return;
-    if (g.canvas.width !== width || g.canvas.height !== height) { g.canvas.width = width; g.canvas.height = height; }
-    const bg = HEAPF32.subarray(backgroundPtr >> 2, (backgroundPtr >> 2) + 4);
-    const L = HEAPF32.slice(layersPtr >> 2, (layersPtr >> 2) + count * 10);
-    const n = Math.min(count, 16), u = new Float32Array(64 * n), frames = [];
-    for (let i = 0; i < n; ++i) {
-      const [h, fit, x, y, ax, ay, scale, ox, oy, opacity] = L.subarray(i * 10, i * 10 + 10);
-      const f = MF.frames.get(h);
-      frames.push(f);
-      if (!f) continue;
-      const fw = f.displayWidth, fh = f.displayHeight;
-      let sx = 1, sy = 1;
-      if (fit === 0) sx = sy = Math.min(width / fw, height / fh);
-      else if (fit === 1) sx = sy = Math.max(width / fw, height / fh);
-      else if (fit === 2) { sx = width / fw; sy = height / fh; }
-      const bw = fw * sx * scale, bh = fh * sy * scale;
-      const left = x * width - ax * bw + ox * width, top = y * height - ay * bh + oy * height;
-      u.set([left / width * 2 - 1, 1 - top / height * 2, (left + bw) / width * 2 - 1, 1 - (top + bh) / height * 2, opacity], i * 64);
-    }
-    g.device.queue.writeBuffer(g.uniforms, 0, u);
-    const encoder = g.device.createCommandEncoder();
-    const pass = encoder.beginRenderPass({ colorAttachments: [{ view: g.context.getCurrentTexture().createView(),
-      clearValue: { r: bg[0], g: bg[1], b: bg[2], a: 1 }, loadOp: 'clear', storeOp: 'store' }] });
-    pass.setPipeline(g.pipeline);
-    frames.forEach((f, i) => {
-      if (!f) return;
-      pass.setBindGroup(0, g.device.createBindGroup({ layout: g.pipeline.getBindGroupLayout(0), entries: [
-        { binding: 0, resource: g.sampler },
-        { binding: 1, resource: g.device.importExternalTexture({ source: f }) },
-        { binding: 2, resource: { buffer: g.uniforms, offset: i * 256, size: 32 } }] }));
-      pass.draw(6);
-    });
-    pass.end();
-    g.device.queue.submit([encoder.finish()]);
+    const frame = JSON.parse(UTF8ToString(frameJson));
+    if (g.canvas.width !== frame.width || g.canvas.height !== frame.height) { g.canvas.width = frame.width; g.canvas.height = frame.height; }
+    MFC.encode(MF.compositor, frame, g.context.getCurrentTexture().createView(), g.canvas.width, g.canvas.height);
     ++MF.drawn;
+  },
+
+  // --- Player thread setup (web_api.cpp) ---
+
+  // The WebGPU device, requested on the player's thread, where the canvas is.
+  mf_js_gpu_init__deps: ['$MF', 'mf_web_prepared'],
+  mf_js_gpu_init: (session) => {
+    (async () => {
+      const adapter = await navigator.gpu?.requestAdapter();
+      if (adapter) Module['mfGpuDevice'] = await adapter.requestDevice();
+      else console.error('no WebGPU adapter: nothing will be drawn');
+    })().catch((e) => console.error('WebGPU:', e.message)).finally(() => _mf_web_prepared(session));
+  },
+  // Decodes an image file's bytes into an ImageBitmap the compositor draws (handle 0: failed).
+  mf_js_decode_image__deps: ['$MF', 'mf_web_image_ready', '$stringToNewUTF8', 'free'],
+  mf_js_decode_image: (session, name, bytes, length) => {
+    const key = UTF8ToString(name), blob = new Blob([HEAPU8.slice(bytes, bytes + length)]);
+    const done = (h, w, ht) => {
+      const ptr = stringToNewUTF8(key);
+      _mf_web_image_ready(session, ptr, h, w, ht);
+      _free(ptr);
+    };
+    createImageBitmap(blob).then((b) => done(MF.addImage(b), b.width, b.height), (e) => {
+      console.error(`image ${key}:`, e.message);
+      done(0, 0, 0);
+    });
+  },
+  // The frame statistics as JSON, for the report. Valid until the next call.
+  mf_js_stats_json__deps: ['$MF', '$stringToNewUTF8', 'free'],
+  mf_js_stats_json: () => {
+    if (MF.statsPtr) _free(MF.statsPtr);
+    MF.statsPtr = stringToNewUTF8(JSON.stringify(MF.stats()));
+    return MF.statsPtr;
   },
 
   // --- Speaker clock ---
@@ -331,8 +359,8 @@ addToLibrary({
     const update = () => {
       if (ctx.state === 'closed') return;
       const ts = ctx.getOutputTimestamp ? ctx.getOutputTimestamp() : null;
-      if (ts && ts.contextTime > 0 && ts.performanceTime > 0) _mf_web_speaker_clock(speaker, ts.contextTime, ts.performanceTime);
-      else _mf_web_speaker_clock(speaker, ctx.currentTime, performance.now() + ((ctx.baseLatency || 0) + (ctx.outputLatency || 0)) * 1000);
+      if (ts && ts.contextTime > 0 && ts.performanceTime > 0) _mf_web_speaker_clock(speaker, ts.contextTime, MF.absolute(ts.performanceTime));
+      else _mf_web_speaker_clock(speaker, ctx.currentTime, MF.absolute(performance.now() + ((ctx.baseLatency || 0) + (ctx.outputLatency || 0)) * 1000));
     };
     update();
     MF.speakers.set(speaker, setInterval(update, 20));

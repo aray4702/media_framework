@@ -52,7 +52,8 @@ class IAudioDecoder {
   virtual Result queue(const Packet&) = 0;  // Ok | Again (full: retry after an output) | DecoderFailed
   virtual void signalEos() = 0;             // no more input until configure() or flush()
   // Decoded PCM, in packet order: Ok | Again (not decoded yet) | Eos (after signalEos, all taken)
-  // | CorruptFrame (`out` holds silence for the packet's duration, A14) | DecoderFailed.
+  // | CorruptFrame (`out` holds silence for the packet's duration, or no samples: the lost audio is
+  // a gap, mixed as silence; A14) | DecoderFailed.
   virtual Result dequeue(PcmBuffer* out) = 0;
   virtual void flush() = 0;  // drops what was queued and not taken; never waits
 };

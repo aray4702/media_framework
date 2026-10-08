@@ -2,12 +2,18 @@
 // keeps the core's contracts (ordering, flush, Eos) and the frames' lifetimes.
 
 #include <emscripten.h>
-#include <emscripten/html5.h>
+#include <emscripten/proxying.h>
+#include <emscripten/threading.h>
 #include <emscripten/webaudio.h>
+#include <pthread.h>
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
+#include <cstdio>
 #include <deque>
+#include <string>
 #include <vector>
 
 #include "mf/audio_ring.h"
@@ -38,7 +44,7 @@ void mf_js_adec_destroy(int id);
 int mf_js_display_attach(const char* selector, void* display);
 void mf_js_display_detach(void* display);
 int mf_js_display_visible();
-void mf_js_display_draw(const float* layers, int count, const float* background, int width, int height);
+void mf_js_display_draw(const char* frameJson);
 void mf_js_speaker_track(int context, void* speaker);
 void mf_js_speaker_untrack(void* speaker);
 void mf_js_speaker_suspend(int context);
@@ -49,11 +55,12 @@ namespace {
 
 constexpr int64_t kMs = 1000000;  // ns
 
-// performance.now(), the time base rAF timestamps and the audio clock mapping use. (Not
-// emscripten_get_now(): with threads it adds performance.timeOrigin, an absolute time.)
+// Absolute time (performance.timeOrigin + performance.now()), as emscripten_get_now() is with
+// threads: the player's thread and the page's have different time origins, so library_mf.js
+// makes rAF timestamps and the audio clock mapping absolute too.
 class WebClock : public IClock {
  public:
-  int64_t nowNs() const override { return int64_t(emscripten_performance_now() * 1e6); }
+  int64_t nowNs() const override { return int64_t(emscripten_get_now() * 1e6); }
 };
 
 // A CooperativeScheduler whose runs are timers on the page's event loop.
@@ -62,6 +69,133 @@ class WebScheduler : public CooperativeScheduler {
   explicit WebScheduler(IClock& clock) : CooperativeScheduler(clock, [this](int64_t delayNs) { mf_js_request_run(this, double(delayNs) / 1e6); }) {}
   ~WebScheduler() override { mf_js_scheduler_gone(this); }  // its pending timers find it gone
 };
+
+// --- Composed frames as JSON, for the compositor (library_mf_compositor.js) ---
+
+void num(std::string& s, double v) {
+  char b[32];
+  std::snprintf(b, sizeof(b), "%.6g", std::isfinite(v) ? v : 0.0);
+  s += b;
+}
+void key(std::string& s, const char* k) {
+  if (s.back() != '{') s += ',';
+  s += '"';
+  s += k;
+  s += "\":";
+}
+void field(std::string& s, const char* k, double v) {
+  key(s, k);
+  num(s, v);
+}
+void color(std::string& s, const char* k, const Color& c) {
+  key(s, k);
+  s += '[';
+  for (float v : {c.r, c.g, c.b, c.a}) num(s, v), s += ',';
+  s.back() = ']';
+}
+void string(std::string& s, const char* k, const std::string& v) {
+  key(s, k);
+  s += '"';
+  for (unsigned char c : v) {
+    if (c == '"' || c == '\\') {
+      s += '\\';
+      s += char(c);
+    } else if (c < 0x20) {
+      char b[8];
+      std::snprintf(b, sizeof(b), "\\u%04x", c);
+      s += b;
+    } else {
+      s += char(c);
+    }
+  }
+  s += '"';
+}
+void effects(std::string& s, const ComposedEffects& e) {
+  key(s, "fx");
+  s += "{\"crop\":[";
+  for (float v : e.crop) num(s, v), s += ',';
+  s.back() = ']';
+  field(s, "brightness", e.brightness);
+  field(s, "contrast", e.contrast);
+  field(s, "saturation", e.saturation);
+  field(s, "blur", e.blur);
+  if (e.chromaKey) {
+    key(s, "key");
+    s += '{';
+    color(s, "color", e.keyColor);
+    field(s, "tolerance", e.keyTolerance);
+    field(s, "softness", e.keySoftness);
+    s += '}';
+  }
+  s += '}';
+}
+
+std::string frameJson(const ComposedFrame& f) {
+  std::string s = "{";
+  field(s, "width", f.width);
+  field(s, "height", f.height);
+  color(s, "background", f.background);
+  key(s, "filter");
+  s += '[';
+  num(s, f.filter.brightness);
+  s += ',';
+  num(s, f.filter.contrast);
+  s += ']';
+  key(s, "layers");
+  s += '[';
+  for (const ComposedLayer& l : f.layers) {
+    s += '{';
+    field(s, "kind", int(l.kind));
+    if (l.frame.image) field(s, "h", *static_cast<int*>(l.frame.image.get()));
+    field(s, "group", l.group);
+    field(s, "fit", int(l.fit));
+    field(s, "x", l.x);
+    field(s, "y", l.y);
+    field(s, "anchorX", l.anchorX);
+    field(s, "anchorY", l.anchorY);
+    field(s, "scale", l.scale);
+    field(s, "rotation", l.rotation);
+    field(s, "flipX", l.flipX);
+    field(s, "offsetX", l.offsetX);
+    field(s, "offsetY", l.offsetY);
+    key(s, "clip");
+    s += '[';
+    for (float v : l.clip) num(s, v), s += ',';
+    s.back() = ']';
+    field(s, "opacity", l.opacity);
+    field(s, "blend", int(l.blend));
+    color(s, "color", l.color);
+    effects(s, l.effects);
+    if (l.kind == ComposedLayer::Kind::Text && l.text) {
+      string(s, "text", *l.text);
+      key(s, "style");
+      s += '{';
+      string(s, "font", l.style.font);
+      field(s, "size", l.style.size);
+      color(s, "color", l.style.color);
+      field(s, "align", int(l.style.align));
+      field(s, "hasBox", l.style.hasBox);
+      color(s, "box", l.style.box);
+      field(s, "maxWidth", l.style.maxWidth);
+      s += '}';
+    }
+    s += "},";
+  }
+  if (s.back() == ',') s.back() = ']';
+  else s += ']';
+  key(s, "groups");
+  s += '[';
+  for (const ComposedGroup& g : f.groups) {
+    s += '{';
+    field(s, "opacity", g.opacity);
+    field(s, "blend", int(g.blend));
+    effects(s, g.effects);
+    s += "},";
+  }
+  if (s.back() == ',') s.back() = ']';
+  else s += ']';
+  return s + "}";
+}
 
 // A frame the display can draw: the handle of a WebCodecs VideoFrame, closed with the last reference.
 std::shared_ptr<void> frameHandle(int handle) {
@@ -110,6 +244,7 @@ class WebVideoDecoder : public IVideoDecoder {
       out->image = frameHandle(h);
       return Result::Ok;
     }
+    if (h == -3) return Result::CorruptFrame;  // a decode error: the core skips to the next keyframe
     return h == 0 ? Result::Again : h == -1 ? Result::Eos : Result::DecoderFailed;
   }
 
@@ -153,6 +288,10 @@ class WebAudioDecoder : public IAudioDecoder {
       mf_js_adec_take(id_, out->samples.data());
       return Result::Ok;
     }
+    if (frames == -3) {  // audio lost to a decode error: no samples; the mixer fills the gap with silence
+      out->samples.clear();
+      return Result::CorruptFrame;
+    }
     return frames == 0 ? Result::Again : frames == -1 ? Result::Eos : Result::DecoderFailed;
   }
 
@@ -192,12 +331,16 @@ class WebDisplay : public IDisplay {
 
   // A requestAnimationFrame callback at `rafNs`.
   void tick(int64_t rafNs) {
-    // The refresh period, smoothed over intervals (skipping stalls). The one reported changes only
-    // when the refresh rate does (more than 5%): A/V sync re-anchors its slots on every change.
+    // The refresh period: the median of the last intervals, which a stall doesn't move. The one
+    // reported changes only when the refresh rate does (more than 5%): A/V sync re-anchors its
+    // slots on every change.
     if (lastRafNs_ > 0) {
-      int64_t d = rafNs - lastRafNs_;
-      if (d > 4 * kMs && d < 50 * kMs) measuredNs_ = (measuredNs_ * 7 + d) / 8;
-      if (std::llabs(measuredNs_ - periodNs_) * 20 > periodNs_) periodNs_ = measuredNs_;
+      intervals_[nextInterval_++ % intervals_.size()] = rafNs - lastRafNs_;
+      size_t n = std::min(nextInterval_, intervals_.size());
+      std::array<int64_t, 15> sorted = intervals_;
+      std::nth_element(sorted.begin(), sorted.begin() + n / 2, sorted.begin() + n);
+      int64_t median = sorted[n / 2];
+      if (median > 4 * kMs && std::llabs(median - periodNs_) * 20 > periodNs_) periodNs_ = median;
     }
     lastRafNs_ = rafNs;
     int due = -1;
@@ -219,53 +362,42 @@ class WebDisplay : public IDisplay {
     int64_t atNs;
   };
 
-  // Video layers only in the spike: fit, position, scale, slide offsets and opacity.
-  void draw(const ComposedFrame& f) {
-    std::vector<float> layers;
-    for (const ComposedLayer& l : f.layers) {
-      if (l.kind != ComposedLayer::Kind::Video || !l.frame.image) continue;
-      layers.insert(layers.end(), {float(*static_cast<int*>(l.frame.image.get())), float(int(l.fit)), l.x, l.y, l.anchorX,
-                                   l.anchorY, l.scale, l.offsetX, l.offsetY, l.opacity});
-    }
-    float background[4] = {f.background.r, f.background.g, f.background.b, f.background.a};
-    mf_js_display_draw(layers.data(), int(layers.size() / 10), background, f.width, f.height);
-  }
+  void draw(const ComposedFrame& f) { mf_js_display_draw(frameJson(f).c_str()); }
 
   PresentedFn presented_;
   std::deque<Pending> pending_;
-  int64_t periodNs_ = 16666667, measuredNs_ = 16666667, lastRafNs_ = 0;
+  int64_t periodNs_ = 16666667, lastRafNs_ = 0;
+  std::array<int64_t, 15> intervals_{};
+  size_t nextInterval_ = 0;
 };
 
 // ISpeaker on an AudioWorklet that runs C++ on the audio thread: it pulls from the AudioRing in
-// the shared memory, as the Core Audio render callback does on macOS. The AudioContext and the
-// worklet start asynchronously; until then the master clock holds, as before audio is first heard.
+// the shared memory, as the Core Audio render callback does on macOS. Browsers allow an
+// AudioContext only on the page's thread, so the speaker's calls are carried out there; the
+// player's thread only writes the ring. The AudioContext and the worklet start asynchronously;
+// until then the master clock holds, as before audio is first heard.
 class WebSpeaker : public ISpeaker {
  public:
-  ~WebSpeaker() override {
-    mf_js_speaker_untrack(this);
-    if (context_) emscripten_destroy_audio_context(context_);
-  }
+  ~WebSpeaker() override { onPage(&WebSpeaker::destroyOnPage, true); }
 
   Result open(int sampleRate, int channels, AudioRing* ring) override {
     ring_ = ring;
     channels_ = channels;
+    sampleRate_ = sampleRate;
     scratch_.assign(size_t(kMaxQuantum) * size_t(channels), 0);
-    EmscriptenWebAudioCreateAttributes attrs{"interactive", uint32_t(sampleRate), AUDIO_CONTEXT_RENDER_SIZE_DEFAULT};
-    context_ = emscripten_create_audio_context(&attrs);
-    if (!context_) return Result::AudioDeviceFailed;
-    emscripten_start_wasm_audio_worklet_thread_async(context_, stack_, sizeof(stack_), &WebSpeaker::onThread, this);
-    return Result::Ok;
+    onPage(&WebSpeaker::openOnPage);
+    return Result::Ok;  // a failure to start shows as audio never heard: the clock falls back
   }
 
   Result start() override {
     wantRunning_ = true;
-    if (node_) emscripten_resume_audio_context_sync(context_);
+    onPage(&WebSpeaker::resumeOnPage);
     return Result::Ok;
   }
 
   void pause() override {
     wantRunning_ = false;
-    if (context_) mf_js_speaker_suspend(context_);
+    onPage(&WebSpeaker::suspendOnPage);
   }
 
   // From library_mf.js on the page's thread: audio rendered at context time `contextSec` is heard
@@ -279,6 +411,42 @@ class WebSpeaker : public ISpeaker {
 
  private:
   static constexpr int kMaxQuantum = 4096;
+
+  // Runs fn on the page's thread: at once when already there; `wait`: before returning.
+  void onPage(void (WebSpeaker::*fn)(), bool wait = false) {
+    if (emscripten_is_main_runtime_thread()) return (this->*fn)();
+    struct Call {
+      WebSpeaker* self;
+      void (WebSpeaker::*fn)();
+    };
+    auto run = [](void* p) {
+      auto* c = static_cast<Call*>(p);
+      (c->self->*c->fn)();
+      delete c;
+    };
+    pthread_t page = emscripten_main_runtime_thread_id();
+    if (wait) {
+      emscripten_proxy_sync(emscripten_proxy_get_system_queue(), page, run, new Call{this, fn});
+    } else {
+      emscripten_proxy_async(emscripten_proxy_get_system_queue(), page, run, new Call{this, fn});
+    }
+  }
+
+  void openOnPage() {
+    EmscriptenWebAudioCreateAttributes attrs{"interactive", uint32_t(sampleRate_), AUDIO_CONTEXT_RENDER_SIZE_DEFAULT};
+    context_ = emscripten_create_audio_context(&attrs);
+    if (context_) emscripten_start_wasm_audio_worklet_thread_async(context_, stack_, sizeof(stack_), &WebSpeaker::onThread, this);
+  }
+  void resumeOnPage() {
+    if (node_) emscripten_resume_audio_context_sync(context_);
+  }
+  void suspendOnPage() {
+    if (context_) mf_js_speaker_suspend(context_);
+  }
+  void destroyOnPage() {
+    mf_js_speaker_untrack(this);
+    if (context_) emscripten_destroy_audio_context(context_);
+  }
 
   static void onThread(EMSCRIPTEN_WEBAUDIO_T context, bool ok, void* self) {
     if (!ok) return;
@@ -327,17 +495,32 @@ class WebSpeaker : public ISpeaker {
   }
 
   AudioRing* ring_ = nullptr;
-  int channels_ = 2;
-  EMSCRIPTEN_WEBAUDIO_T context_ = 0, node_ = 0;
-  bool wantRunning_ = false;
+  int channels_ = 2, sampleRate_ = 48000;
+  EMSCRIPTEN_WEBAUDIO_T context_ = 0, node_ = 0;  // on the page's thread
+  std::atomic<bool> wantRunning_{false};
   std::vector<int16_t> scratch_;
   std::atomic<uint32_t> seq_{0};
   std::atomic<int64_t> contextNs_{0}, perfNs_{0};
   alignas(16) uint8_t stack_[16384];
 };
 
+// Images are decoded by the page before the scene opens (the core loads them synchronously, the
+// browser decodes asynchronously): an image source names the decoded ImageBitmap.
+class WebImageLoader : public IImageLoader {
+ public:
+  Result load(const MediaSource& source, VideoFrame* out, int* width, int* height) override {
+    auto image = std::dynamic_pointer_cast<ImageSource>(std::static_pointer_cast<ByteSource>(source.native));
+    if (!image) return Result::UnsupportedFormat;
+    out->image = std::make_shared<int>(image->handle);  // stays decoded for the session
+    *width = image->width;
+    *height = image->height;
+    return Result::Ok;
+  }
+};
+
 class WebPlatform : public PlatformFactory {
  public:
+  std::unique_ptr<IImageLoader> createImageLoader() override { return std::make_unique<WebImageLoader>(); }
   std::unique_ptr<IDemuxer> createDemuxer() override { return createMp4Demuxer(); }
   std::unique_ptr<IVideoDecoder> createVideoDecoder() override { return std::make_unique<WebVideoDecoder>(); }
   std::unique_ptr<IAudioDecoder> createAudioDecoder() override { return std::make_unique<WebAudioDecoder>(); }

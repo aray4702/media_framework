@@ -50,6 +50,9 @@ ffmpeg -loglevel error -y \
   -f lavfi -i "aevalsrc='0.3*sin(2*PI*1000*t)*lt(mod(t,1),0.1)':sample_rate=48000:duration=$SECONDS_LONG" \
   $X264 -g 30 $AAC $MP4 sync_flash_beep.mp4 && echo clips/sync_flash_beep.mp4
 
+# A still image for image items: the test pattern, 640x360 PNG.
+ffmpeg -loglevel error -y -f lavfi -i "testsrc2=size=640x360:rate=1" -frames:v 1 image.png && echo clips/image.png
+
 # Damaged files, made from the 1080p30 clip.
 python3 - <<'EOF'
 import os, random

@@ -19,10 +19,15 @@ for (const scene of scenes) {
   page.on('pageerror', (e) => logs.push(`pageerror: ${e.message}`));
   page.on('response', (r) => { if (r.status() >= 400) logs.push(`http ${r.status()}: ${r.url()}`); });
   await page.goto(`http://127.0.0.1:8000/platform/web/app/?scene=${scene}&seconds=${seconds}&autoplay=1`);
-  if (process.env.SCREENSHOT) {  // a picture mid-playback: SCREENSHOT=dir saves <dir>/<scene>.png
+  // SCREENSHOT=dir saves <dir>/<scene>-<t>.png at each of SHOTS (seconds into playback; default
+  // halfway through).
+  if (process.env.SCREENSHOT) {
     await page.waitForFunction(() => document.getElementById('status').textContent === 'Playing', { timeout: 30000 }).catch(() => {});
-    await new Promise((r) => setTimeout(r, seconds * 500));
-    await page.screenshot({ path: `${process.env.SCREENSHOT}/${scene}.png` });
+    const start = Date.now();
+    for (const t of (process.env.SHOTS || String(seconds / 2)).split(',').map(Number)) {
+      await new Promise((r) => setTimeout(r, Math.max(0, start + t * 1000 - Date.now())));
+      await page.screenshot({ path: `${process.env.SCREENSHOT}/${scene}-${t}.png`, clip: { x: 0, y: 0, width: 1000, height: 560 } });
+    }
   }
   await page.waitForFunction(() => window.spikeResult, { timeout: (seconds + 30) * 1000 }).catch(() => {});
   const result = await page.evaluate(() => window.spikeResult || null);

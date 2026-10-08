@@ -1006,7 +1006,7 @@ class AudioStage : public Stage {
       Result r = decoder.dequeue(&pcm);  // on CorruptFrame, pcm is silence (A14)
       if (r == Result::Ok || r == Result::CorruptFrame) {
         if (r == Result::CorruptFrame) ctx_.metrics.countCorrupt();
-        append(lane, pcm);
+        if (!pcm.samples.empty()) append(lane, pcm);  // a lost packet with no samples: a gap, mixed as silence
         return Progress::did();
       }
       if (r == Result::Eos) {

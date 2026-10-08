@@ -25,6 +25,15 @@ std::shared_ptr<ByteSource> memorySource(std::vector<uint8_t> bytes);
 // The MediaSource the MP4 demuxer opens: native holds a ByteSource.
 MediaSource mediaSource(std::shared_ptr<ByteSource>);
 
+// An image the page has decoded (an ImageBitmap, by its handle in library_mf.js). A ByteSource
+// with no bytes, so a video item pointed at it fails to open instead of misreading it.
+struct ImageSource : ByteSource {
+  ImageSource(int handle, int width, int height) : handle(handle), width(width), height(height) {}
+  int64_t size() const override { return 0; }
+  bool read(int64_t, void*, size_t) override { return false; }
+  int handle, width, height;
+};
+
 // TrackInfo::format on the web platform: what a WebCodecs decoder's configure() takes.
 struct CodecConfig {
   std::string codec;                 // "avc1.64002a", "mp4a.40.2", "mp3"
