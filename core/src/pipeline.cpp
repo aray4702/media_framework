@@ -180,7 +180,7 @@ class SourceStage : public Stage {
       bool usable = false;
       if (rt.info.audio) {
         const TrackInfo& a = *rt.info.audio;
-        usable = a.supported && a.sampleRate > 0 && a.channels > 0 && lane.audioDecoder->configure(a) == Result::Ok;
+        usable = a.supported && a.sampleRate > 0 && a.channels > 0 && lane.audioDecoder->configure(a, [] {}) == Result::Ok;
       }
       if (it.type == ItemType::Audio && !usable) return ctx_.fatal(Result::NoDecoder, name + "has no AAC-LC or MP3 audio track (R9)");
       if (it.type == ItemType::Video && rt.info.audio && !usable && !it.mute) {
@@ -911,6 +911,9 @@ class AudioStage : public Stage {
     int64_t bufStart = 0;     // media sample index of buf's first frame
     std::vector<float> buf;   // interleaved
     int64_t nextStart = -1;   // where the next packet continues, once one is decoded
+    bool queued = false;      // packets went to the decoder since it was configured
+    bool draining = false;    // the item ended: its last audio is coming out (signalEos)
+    std::optional<Packet> pending;  // the next packet, waiting for the decoder
     int item() const { return pos < int(seq.size()) ? seq[pos] : -1; }
     int64_t bufEnd() const { return channels ? bufStart + int64_t(buf.size()) / channels : bufStart; }
   };
@@ -940,6 +943,8 @@ class AudioStage : public Stage {
     for (int li = 0; li < int(lanes_.size()); ++li) {
       ctx_.lanes[li]->audioDecoder->flush();
       LaneMix& lane = lanes_[li];
+      lane.queued = lane.draining = false;
+      lane.pending.reset();
       lane.pos = 0;
       while (lane.pos < int(lane.seq.size()) && lane.seqPos[lane.pos] < target.lanePos[li]) ++lane.pos;
       resetBuffer(lane);
@@ -989,42 +994,76 @@ class AudioStage : public Stage {
     return lane.bufEnd() >= int64_t(std::ceil(sourcePos(i, end, lane.rate))) + 2;
   }
 
+  // Takes the lane's decoded audio, in packet order, then feeds it the next packet. When an item
+  // ends, the decoder is drained (signalEos, then Eos) before the lane moves on to its next item
+  // or ends, so a decoder that holds its last output back still delivers it. Waiting on the
+  // decoder returns idle: its output callback wakes us.
   Progress pull(int li) {
     LaneMix& lane = lanes_[li];
-    Packet p;
-    if (!ctx_.lanes[li]->audioPackets.tryPop(&p)) return Progress::idle();
-    if (p.serial != serial_) return Progress::did();
+    IAudioDecoder& decoder = *ctx_.lanes[li]->audioDecoder;
+    if (lane.queued) {
+      PcmBuffer pcm;
+      Result r = decoder.dequeue(&pcm);  // on CorruptFrame, pcm is silence (A14)
+      if (r == Result::Ok || r == Result::CorruptFrame) {
+        if (r == Result::CorruptFrame) ctx_.metrics.countCorrupt();
+        if (!pcm.samples.empty()) append(lane, pcm);  // a lost packet with no samples: a gap, mixed as silence
+        return Progress::did();
+      }
+      if (r == Result::Eos) {
+        lane.queued = lane.draining = false;
+      } else if (r != Result::Again) {
+        return decoderFailed(lane.decoderItem);
+      } else if (lane.draining) {
+        return Progress::idle();
+      }
+    }
+    if (!lane.pending) {
+      Packet p;
+      if (!ctx_.lanes[li]->audioPackets.tryPop(&p)) return Progress::idle();
+      if (p.serial != serial_) return Progress::did();
+      lane.pending = std::move(p);
+    }
+    const Packet& p = *lane.pending;
     int k = seqIndex_[p.item];
-    if (k < lane.pos) return Progress::did();  // an item the mix is already past
+    if (k < lane.pos) {  // an item the mix is already past
+      lane.pending.reset();
+      return Progress::did();
+    }
+    if ((k > lane.pos || p.eos) && lane.queued) {  // the item ended: its last audio comes out first
+      decoder.signalEos();
+      lane.draining = true;
+      return Progress::did();
+    }
     while (k > lane.pos) {  // the previous item ended (its end marker came first)
       ++lane.pos;
       resetBuffer(lane);
     }
     if (p.eos) {
       lane.ended = true;
+      lane.pending.reset();
       return Progress::did();
     }
     const TrackInfo& format = *ctx_.items[p.item].info.audio;
-    IAudioDecoder& decoder = *ctx_.lanes[li]->audioDecoder;
     if (lane.decoderItem != p.item) {
-      if (decoder.configure(format) != Result::Ok) {
+      if (decoder.configure(format, [this] { ctx_.wake(StageId::Audio); }) != Result::Ok) {
         ctx_.fatal(Result::DecoderFailed, ctx_.itemName(p.item) + ": audio decoder configuration failed");
         return Progress::idle();
       }
       lane.decoderItem = p.item;
     }
-    PcmBuffer pcm;
-    Result r = decoder.decode(p, &pcm);  // on CorruptFrame, pcm is silence (A14)
-    if (r == Result::CorruptFrame) {
-      ctx_.metrics.countCorrupt();
-    } else if (r != Result::Ok) {
-      ctx_.fatal(Result::DecoderFailed, ctx_.itemName(p.item) + ": audio decoder failed");
-      return Progress::idle();
-    }
+    Result r = decoder.queue(p);
+    if (r == Result::Again) return Progress::idle();  // full: its output wakes us
+    if (r != Result::Ok) return decoderFailed(p.item);
     lane.rate = format.sampleRate;
     lane.channels = format.channels;
-    append(lane, pcm);
+    lane.queued = true;
+    lane.pending.reset();
     return Progress::did();
+  }
+
+  Progress decoderFailed(int item) {
+    ctx_.fatal(Result::DecoderFailed, ctx_.itemName(item) + ": audio decoder failed");
+    return Progress::idle();
   }
 
   // Adds a decoded packet to the lane's buffer. Timestamps are rounded (to 1 us here, often

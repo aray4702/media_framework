@@ -16,6 +16,7 @@ add_library(mf_core STATIC
   core/src/audio_ring.cpp
   core/src/av_sync.cpp
   core/src/composition.cpp
+  core/src/cooperative_scheduler.cpp
   core/src/decode_control.cpp
   core/src/decode_rate.cpp
   core/src/effects.cpp
@@ -46,6 +47,7 @@ add_test(NAME core_tests COMMAND core_tests)
 if(APPLE)
   enable_language(OBJCXX)
   add_subdirectory(platform/macos)
+  add_subdirectory(platform/web)
   add_subdirectory(plugins/beauty)
   add_subdirectory(apps/macos-demo)
   add_subdirectory(apps/macos-editor)

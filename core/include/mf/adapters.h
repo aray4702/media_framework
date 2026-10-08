@@ -41,13 +41,21 @@ class IVideoDecoder {
   virtual void flush() = 0;                     // never waits
 };
 
+// Decodes like IVideoDecoder: packets go in and their PCM comes out in the same order, possibly
+// later (a browser decodes asynchronously).
 class IAudioDecoder {
  public:
   virtual ~IAudioDecoder() = default;
-  virtual Result configure(const TrackInfo&) = 0;  // may be called again for the next clip
-  // Synchronous. On CorruptFrame `out` holds silence for the packet's duration.
-  virtual Result decode(const Packet&, PcmBuffer* out) = 0;
-  virtual void flush() = 0;
+  // onOutput is called from any thread when output may be ready; it must not block. Called again
+  // for the next clip once the previous one's output has all been taken.
+  virtual Result configure(const TrackInfo&, std::function<void()> onOutput) = 0;
+  virtual Result queue(const Packet&) = 0;  // Ok | Again (full: retry after an output) | DecoderFailed
+  virtual void signalEos() = 0;             // no more input until configure() or flush()
+  // Decoded PCM, in packet order: Ok | Again (not decoded yet) | Eos (after signalEos, all taken)
+  // | CorruptFrame (`out` holds silence for the packet's duration, or no samples: the lost audio is
+  // a gap, mixed as silence; A14) | DecoderFailed.
+  virtual Result dequeue(PcmBuffer* out) = 0;
+  virtual void flush() = 0;  // drops what was queued and not taken; never waits
 };
 
 class IDisplay {

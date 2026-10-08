@@ -2394,3 +2394,46 @@ TEST(leading_clip_steps_decoding_down_when_the_decoder_falls_behind) {
     CHECK(shownBetweenKeyframes(*h, 5000000) >= 10);  // stepped back up to more than keyframes
   }
 }
+
+TEST(cooperative_scheduler_plays_a_clip_in_sync_to_the_end) {
+  fake::Clip clip;
+  clip.durationUs = 1000000;
+  fake::Harness h({clip}, true);
+  CHECK(h.open() == Result::Ok);
+  h.run(20);
+  CHECK(h.player->state() == State::Ready);
+  CHECK(h.player->play() == Result::Ok);
+  h.run(1500);
+  CHECK_EQ(h.listener.ended, 1);
+  MetricsReport m = h.player->metrics();
+  CHECK(m.presented >= 28);
+  CHECK_EQ(m.lateDrops, 0);
+  CHECK_EQ(m.janks, 0);
+  CHECK(m.avP95AbsMs <= 10);
+  // It yields between runs: not a busy loop on the host's thread.
+  CHECK(h.platform.runs < 4 * 1520);
+}
+
+TEST(cooperative_scheduler_seeks_to_the_exact_frame) {
+  fake::Harness h({fake::Clip{}}, true);
+  CHECK(h.open() == Result::Ok);
+  h.run(20);
+  CHECK(h.player->seek(1250000) == Result::Ok);
+  h.run(50);
+  CHECK_EQ(h.listener.seeks.size(), size_t(1));
+  CHECK_EQ(h.lastShown(), 1250000);
+  CHECK_EQ(h.lastComposed().layers[0].frame.ptsUs, 37 * 1000000 / 30);
+}
+
+TEST(cooperative_scheduler_composites_stacked_lanes) {
+  fake::Clip c;
+  c.durationUs = 3000000;
+  fake::Harness h({c, c}, true);
+  CHECK(h.openScene(videoTracks({{{0, 3}}, {{0, 3}}}), OutputDriver::Vsync) == Result::Ok);
+  h.run(50);
+  CHECK(h.player->play() == Result::Ok);
+  h.run(3300);
+  CHECK_EQ(h.listener.ended, 1);
+  CHECK(worstLag(h, 0, 3000000) < 34000);
+  CHECK(h.platform.display->composed.size() >= 85);
+}
