@@ -1,6 +1,8 @@
-// Runs the step 1 spike in Chrome and prints each scene's result as JSON.
+// Runs the web platform's test page in Chrome and prints each scene's result as JSON.
 // Usage: node run_spike.mjs [scene...] (default: single sync stacked2 stacked4), with
 // tools/serve.py running on port 8000. CHROME=path overrides the browser; HEADLESS=0 shows it.
+// EXPORT=dir exports each scene instead of playing it, saving <dir>/<scene>.mp4.
+import { writeFileSync } from 'node:fs';
 import puppeteer from 'puppeteer-core';
 
 const chrome = process.env.CHROME || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
@@ -18,7 +20,8 @@ for (const scene of scenes) {
   page.on('console', (m) => logs.push(`${m.type()}: ${m.text()}`));
   page.on('pageerror', (e) => logs.push(`pageerror: ${e.message}`));
   page.on('response', (r) => { if (r.status() >= 400) logs.push(`http ${r.status()}: ${r.url()}`); });
-  await page.goto(`http://127.0.0.1:8000/platform/web/app/?scene=${scene}&seconds=${seconds}&autoplay=1`);
+  const mode = process.env.EXPORT ? '&export=1' : '';
+  await page.goto(`http://127.0.0.1:8000/platform/web/app/?scene=${scene}&seconds=${seconds}&autoplay=1${mode}`);
   // SCREENSHOT=dir saves <dir>/<scene>-<t>.png at each of SHOTS (seconds into playback; default
   // halfway through).
   if (process.env.SCREENSHOT) {
@@ -31,6 +34,20 @@ for (const scene of scenes) {
   }
   await page.waitForFunction(() => window.spikeResult, { timeout: (seconds + 30) * 1000 }).catch(() => {});
   const result = await page.evaluate(() => window.spikeResult || null);
+  if (process.env.EXPORT && result && !result.failed) {
+    const b64 = await page.evaluate(() => {
+      let s = '';
+      const bytes = window.exportBytes;
+      for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+      return btoa(s);
+    });
+    writeFileSync(`${process.env.EXPORT}/${scene}.mp4`, Buffer.from(b64, 'base64'));
+    // The scene itself, its sources as the clips' paths, for export_reference (the macOS export).
+    const doc = JSON.parse(await page.evaluate(() => window.sceneDoc));
+    const clips = new URL('../../../clips/', import.meta.url).pathname;
+    for (const t of doc.tracks) for (const i of t.items) if (i.src) i.src = `${clips}${i.src}.${i.type === 'image' ? 'png' : 'mp4'}`;
+    writeFileSync(`${process.env.EXPORT}/${scene}.json`, JSON.stringify(doc, null, 1));
+  }
   console.log(JSON.stringify({ ...(result || { scene, failed: 'no result' }), logs: logs.slice(0, 20) }));
   await page.close();
 }

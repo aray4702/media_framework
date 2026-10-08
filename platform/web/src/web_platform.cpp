@@ -20,6 +20,7 @@
 #include "mf/cooperative_scheduler.h"
 #include "mf/web.h"
 #include "mp4_demuxer.h"
+#include "mp4_muxer.h"
 
 extern "C" {
 // library_mf.js
@@ -48,6 +49,11 @@ void mf_js_display_draw(const char* frameJson);
 void mf_js_speaker_track(int context, void* speaker);
 void mf_js_speaker_untrack(void* speaker);
 void mf_js_speaker_suspend(int context);
+int mf_js_export_open(void* sink, int width, int height, int fps, int videoBitrate, int sampleRate, int channels, int audioBitrate);
+int mf_js_export_video(const char* frameJson, double ptsUs, double durationUs, int key);
+int mf_js_export_audio(const int16_t* pcm, int frames, double ptsUs);
+void mf_js_export_finish(void* sink);
+void mf_js_export_close();
 }
 
 namespace mf::web {
@@ -504,6 +510,78 @@ class WebSpeaker : public ISpeaker {
   alignas(16) uint8_t stack_[16384];
 };
 
+// IExportSink on WebCodecs encoders and the portable MP4 muxer. A frame is drawn by the compositor
+// into an export-sized canvas and encoded; audio is encoded from the mixed PCM. Encoded chunks come
+// back (mf_web_export_chunk) to be muxed; the file goes to the ExportTarget, a MemoryWriter. Writes
+// return Again while an encoder's queue is full: the core retries.
+class WebExportSink : public IExportSink {
+ public:
+  ~WebExportSink() override { mf_js_export_close(); }
+
+  Result open(const ExportTarget& target, const ExportSettings& s, int sampleRate, int channels) override {
+    writer_ = static_cast<MemoryWriter*>(target.native.get());
+    if (!writer_) return Result::WriteFailed;
+    muxer_ = std::make_unique<Mp4Muxer>(*writer_);
+    fps_ = std::max(1, s.fps);
+    frameUs_ = 1000000 / fps_;
+    width_ = s.width;
+    height_ = s.height;
+    sampleRate_ = sampleRate;
+    channels_ = channels;
+    return mf_js_export_open(this, s.width, s.height, fps_, s.videoBitrate, sampleRate, channels, s.audioBitrate) ? Result::Ok : Result::Unsupported;
+  }
+
+  Result writeVideo(const ComposedFrame& f) override {
+    if (failed_) return Result::WriteFailed;
+    int r = mf_js_export_video(frameJson(f).c_str(), double(f.ptsUs), double(frameUs_), frames_ % (2 * fps_) == 0);
+    if (r == 1) return Result::Again;
+    if (r != 0) return Result::WriteFailed;
+    ++frames_;
+    return Result::Ok;
+  }
+
+  Result writeAudio(const int16_t* pcm, int frames, int64_t ptsUs) override {
+    if (failed_) return Result::WriteFailed;
+    int r = mf_js_export_audio(pcm, frames, double(ptsUs));
+    return r == 0 ? Result::Ok : r == 1 ? Result::Again : Result::WriteFailed;
+  }
+
+  void finish(std::function<void(Result)> done) override {
+    done_ = std::move(done);
+    mf_js_export_finish(this);  // flushes the encoders, then mf_web_export_finished()
+  }
+
+  // From library_mf.js: an encoded chunk (track 0 video, 1 audio), with the codec's description
+  // (avcC, AudioSpecificConfig) on a track's first chunk.
+  void chunk(int track, const uint8_t* data, int size, double ptsUs, double durationUs, int key, const uint8_t* config, int configSize) {
+    if (ids_[track] < 0) {
+      Mp4Muxer::Track t;
+      t.video = track == 0;
+      t.width = width_;
+      t.height = height_;
+      t.sampleRate = sampleRate_;
+      t.channels = channels_;
+      t.config.assign(config, config + configSize);
+      ids_[track] = muxer_->addTrack(t);
+    }
+    if (!muxer_->write(ids_[track], data, size_t(size), std::llround(ptsUs), std::llround(durationUs), key)) failed_ = true;
+  }
+
+  void finished(bool ok) {
+    ok = ok && !failed_ && muxer_->finish();
+    if (done_) done_(ok ? Result::Ok : Result::WriteFailed);
+  }
+
+ private:
+  MemoryWriter* writer_ = nullptr;
+  std::unique_ptr<Mp4Muxer> muxer_;
+  std::function<void(Result)> done_;
+  int ids_[2] = {-1, -1};
+  int fps_ = 30, width_ = 0, height_ = 0, sampleRate_ = 0, channels_ = 0;
+  int64_t frameUs_ = 33333, frames_ = 0;
+  bool failed_ = false;
+};
+
 // Images are decoded by the page before the scene opens (the core loads them synchronously, the
 // browser decodes asynchronously): an image source names the decoded ImageBitmap.
 class WebImageLoader : public IImageLoader {
@@ -521,6 +599,7 @@ class WebImageLoader : public IImageLoader {
 class WebPlatform : public PlatformFactory {
  public:
   std::unique_ptr<IImageLoader> createImageLoader() override { return std::make_unique<WebImageLoader>(); }
+  std::unique_ptr<IExportSink> createExportSink() override { return std::make_unique<WebExportSink>(); }
   std::unique_ptr<IDemuxer> createDemuxer() override { return createMp4Demuxer(); }
   std::unique_ptr<IVideoDecoder> createVideoDecoder() override { return std::make_unique<WebVideoDecoder>(); }
   std::unique_ptr<IAudioDecoder> createAudioDecoder() override { return std::make_unique<WebAudioDecoder>(); }
@@ -549,6 +628,11 @@ EMSCRIPTEN_KEEPALIVE void mf_web_output(void* onOutput) {
 EMSCRIPTEN_KEEPALIVE void mf_web_display_tick(void* display, double rafMs) {
   static_cast<mf::web::WebDisplay*>(display)->tick(int64_t(rafMs * 1e6));
 }
+EMSCRIPTEN_KEEPALIVE void mf_web_export_chunk(void* sink, int track, const uint8_t* data, int size, double ptsUs, double durationUs,
+                                              int key, const uint8_t* config, int configSize) {
+  static_cast<mf::web::WebExportSink*>(sink)->chunk(track, data, size, ptsUs, durationUs, key, config, configSize);
+}
+EMSCRIPTEN_KEEPALIVE void mf_web_export_finished(void* sink, int ok) { static_cast<mf::web::WebExportSink*>(sink)->finished(ok); }
 EMSCRIPTEN_KEEPALIVE void mf_web_speaker_clock(void* speaker, double contextSec, double performanceMs) {
   static_cast<mf::web::WebSpeaker*>(speaker)->setClock(contextSec, performanceMs);
 }

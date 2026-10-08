@@ -1,12 +1,12 @@
 # Web platform
 
-The portable core compiled to WebAssembly, with browser adapters: WebCodecs decoders, a WebGPU compositor, an AudioWorklet speaker, a portable MP4 demuxer, and a cooperative scheduler that runs every pipeline stage on one thread.
+The portable core compiled to WebAssembly, with browser adapters: WebCodecs decoders and encoders, a WebGPU compositor, an AudioWorklet speaker, a portable MP4 demuxer and muxer, and a cooperative scheduler that runs every pipeline stage on one thread.
 
 ## Threads
 
 | Thread | Runs |
 | --- | --- |
-| Player (a worker) | The player and its five stages (`CooperativeScheduler`), WebCodecs, the WebGPU compositor on the transferred canvas (`OffscreenCanvas`), image decoding |
+| Player (a worker) | The player and its five stages (`CooperativeScheduler`), WebCodecs, the WebGPU compositor on the transferred canvas (`OffscreenCanvas`), image decoding, export |
 | Page | The page's calls (`web_api.cpp`, carried out on the player's thread in order), the `AudioContext` (browsers allow it only here) |
 | Audio | The AudioWorklet: C++ pulling PCM from the shared `AudioRing` |
 
@@ -41,12 +41,26 @@ SECONDS=8 node run_spike.mjs single sync stacked2 stacked4 | python3 summarize.p
 
 `HEADLESS=0` shows the browser; `SCREENSHOT=<dir>` saves pictures of each scene, at `SHOTS=1.5,3` seconds into playback (default: halfway).
 
-## Tests
+## Export
 
-The MP4 demuxer is plain C++, built natively too and checked against the macOS (AVFoundation) demuxer, packet for packet:
+`mf_export` renders a scene on the player's thread through the same compositor into an export-sized canvas, encodes it with WebCodecs (H.264 High, AAC-LC) and muxes it with the portable MP4 muxer. The file is kept in memory; `mf_export_data` / `mf_export_size` give it to the page once the report has the `exported` event. The test page exports instead of playing with `export=1`, and the runner saves the file with `EXPORT=<dir>`.
+
+To compare with the macOS export of the same scenes (the runner also saves each scene's JSON, its sources as the clips' paths):
 
 ```sh
-cmake --build build --target web_demuxer_tests && build/platform/web/web_demuxer_tests clips/*.mp4
+cd platform/web/tools && SECONDS=6 EXPORT=/tmp/exports node run_spike.mjs single features
+cd ../../.. && for s in single features; do build/platform/web/export_reference /tmp/exports/$s.json /tmp/exports/$s-mac.mp4; done
+python3 platform/web/tools/compare_exports.py /tmp/exports single features   # needs numpy
+```
+
+## Tests
+
+The MP4 demuxer and muxer are plain C++, built natively too and checked against the macOS (AVFoundation) demuxer: the demuxer packet for packet, the muxer by re-muxing every clip's packets and reading them back:
+
+```sh
+cmake --build build --target web_demuxer_tests web_muxer_tests
+build/platform/web/web_demuxer_tests clips/*.mp4
+build/platform/web/web_muxer_tests clips/*.mp4
 ```
 
 ## Decode errors
@@ -56,5 +70,7 @@ A decode error closes a WebCodecs decoder. The adapters report it as one corrupt
 ## Limits
 
 - Effect plugins (`beauty`) are macOS only: each needs a WGSL version. A layer's plugin effects are skipped.
-- No export or camera yet.
+- An export is kept in memory until it is done: a long one at a high bitrate needs that much memory. Writing to a file as it goes (the File System Access API, or the origin's private storage) would remove that.
+- The export frame size letterboxes (`frameFit` fit); `fill` cropping is not implemented on the web.
+- No camera yet.
 - The browser does not report when a frame reached the screen: present times are estimated as the refresh after the one a frame is drawn in.

@@ -14,11 +14,14 @@
 #include <map>
 #include <mutex>
 #include <string>
+#include <vector>
 
+#include "mf/exporter.h"
 #include "mf/player.h"
 #include "mf/scene.h"
 #include "mf/web.h"
 #include "mp4_demuxer.h"
+#include "mp4_muxer.h"
 
 extern "C" {
 // library_mf.js, on the player thread.
@@ -29,6 +32,15 @@ const char* mf_js_stats_json();
 
 namespace {
 
+struct Session;
+
+// An export's events, into the session's.
+struct ExportEvents : mf::ExportListener {
+  Session* s = nullptr;
+  void onCompleted() override;
+  void onError(mf::Result, const std::string& reason) override;
+};
+
 struct Session : mf::PlayerListener {
   pthread_t thread{};
   std::string canvas;  // the transferred canvas's selector
@@ -38,8 +50,12 @@ struct Session : mf::PlayerListener {
   std::unique_ptr<mf::Player> player;
   std::map<std::string, std::shared_ptr<mf::web::ByteSource>> sources;
   int pending = 0;                      // the WebGPU device and images still being prepared
-  std::function<void()> whenReady;      // an open() waiting for them
+  std::vector<std::function<void()>> whenReady;  // open() and export() calls waiting for them, in order
   std::string error, events;
+  std::unique_ptr<mf::Exporter> exporter;
+  ExportEvents exportEvents;
+  std::shared_ptr<mf::web::MemoryWriter> exportFile;  // the exported MP4, complete once "exported"
+  double exportStartedMs = 0, exportMs = 0;
 
   // The snapshot the page reads.
   std::mutex mu;
@@ -54,6 +70,15 @@ struct Session : mf::PlayerListener {
   void onEnded() override { addEvent("ended"); }
   void onSeekCompleted(int64_t) override { addEvent("seeked"); }
 };
+
+void ExportEvents::onCompleted() {
+  s->exportMs = emscripten_get_now() - s->exportStartedMs;
+  s->addEvent("exported");
+}
+void ExportEvents::onError(mf::Result r, const std::string& reason) {
+  s->error = std::string(mf::toString(r)) + ": " + reason;
+  s->addEvent("exportFailed");
+}
 
 std::string quoted(const std::string& s) {
   std::string out = "\"";
@@ -77,6 +102,12 @@ void snapshot(Session* s) {
                   (long long)m.lateLayers, m.droppedRate, (long long)m.janks, (long long)m.intervals, m.jankRate, (long long)m.avSamples,
                   m.avMeanMs, m.avMeanAbsMs, m.avP95AbsMs, m.ttffMs, (long long)m.decodeSkips, (long long)m.decodeStepDowns,
                   (long long)m.decodeStepUps, (long long)m.holdExpiries, (long long)m.corruptSkips);
+    body += buf;
+  }
+  if (s->exporter) {
+    char buf[160];
+    std::snprintf(buf, sizeof(buf), ",\"export\":{\"progress\":%.4f,\"bytes\":%llu,\"ms\":%.0f}", s->exporter->progress(),
+                  (unsigned long long)(s->exportFile ? s->exportFile->bytes.size() : 0), s->exportMs);
     body += buf;
   }
   body += std::string(",\"frames\":") + mf_js_stats_json() + "}";
@@ -114,6 +145,7 @@ extern "C" {
 // draw into it or resize its pixels.
 EMSCRIPTEN_KEEPALIVE Session* mf_create(const char* canvasSelector) {
   auto* s = new Session;
+  s->exportEvents.s = s;
   s->canvas = canvasSelector;
   pthread_attr_t attr;
   pthread_attr_init(&attr);
@@ -127,11 +159,10 @@ EMSCRIPTEN_KEEPALIVE Session* mf_create(const char* canvasSelector) {
 
 // A preparation step (the WebGPU device, an image) finished; a waiting open() runs once all have.
 EMSCRIPTEN_KEEPALIVE void mf_web_prepared(Session* s) {
-  if (--s->pending == 0 && s->whenReady) {
-    auto f = std::move(s->whenReady);
-    s->whenReady = nullptr;
-    f();
-  }
+  if (--s->pending > 0) return;
+  auto waiting = std::move(s->whenReady);
+  s->whenReady.clear();
+  for (auto& f : waiting) f();
 }
 
 // Called by library_mf.js on the player thread once an image is decoded.
@@ -174,12 +205,52 @@ EMSCRIPTEN_KEEPALIVE void mf_open(Session* s, const char* sceneJson, int driver)
       snapshot(s);
     };
     if (s->pending > 0) {
-      s->whenReady = open;
+      s->whenReady.push_back(open);
     } else {
       open();
     }
   });
 }
+
+// Exports a scene to MP4 (H.264 + AAC) at width x height (0: the scene's size), alongside the
+// player, once the device and images are ready. Its progress is in mf_report()'s "export"; on the
+// "exported" event, mf_export_data() / mf_export_size() hold the file.
+EMSCRIPTEN_KEEPALIVE void mf_export(Session* s, const char* sceneJson, int width, int height, int videoBitrate) {
+  post(s, [s, json = std::string(sceneJson), width, height, videoBitrate] {
+    auto start = [s, json, width, height, videoBitrate] {
+      auto resolve = [s](const std::string& src) {
+        auto it = s->sources.find(src);
+        return it == s->sources.end() ? mf::MediaSource{} : mf::web::mediaSource(it->second);
+      };
+      mf::Scene scene;
+      s->error.clear();
+      mf::Result r = mf::parseScene(json, resolve, &scene, &s->error);
+      if (r == mf::Result::Ok) {
+        if (s->exporter) s->exporter->shutdown();
+        s->exportFile = std::make_shared<mf::web::MemoryWriter>();
+        s->exporter = mf::Exporter::create(*s->platform, &s->exportEvents);
+        mf::ExportSettings settings;
+        settings.frameWidth = width;
+        settings.frameHeight = height;
+        if (videoBitrate > 0) settings.videoBitrate = videoBitrate;
+        s->exportStartedMs = emscripten_get_now();
+        r = s->exporter->start(scene, mf::ExportTarget{s->exportFile}, settings, &s->error);
+      }
+      if (r != mf::Result::Ok) s->addEvent(std::string("exportFailed:") + mf::toString(r));
+      snapshot(s);
+    };
+    if (s->pending > 0) {
+      s->whenReady.push_back(start);
+    } else {
+      start();
+    }
+  });
+}
+
+// The exported file, once mf_report() has the "exported" event (the player's thread no longer
+// changes it then). Read it before the next export.
+EMSCRIPTEN_KEEPALIVE const uint8_t* mf_export_data(Session* s) { return s->exportFile ? s->exportFile->bytes.data() : nullptr; }
+EMSCRIPTEN_KEEPALIVE int mf_export_size(Session* s) { return s->exportFile ? int(s->exportFile->bytes.size()) : 0; }
 
 EMSCRIPTEN_KEEPALIVE void mf_play(Session* s) { post(s, [s] { s->player->play(); }); }
 EMSCRIPTEN_KEEPALIVE void mf_pause(Session* s) { post(s, [s] { s->player->pause(); }); }

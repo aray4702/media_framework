@@ -1,6 +1,7 @@
 // The web platform's test page: the core in WebAssembly playing a scene in the browser, on its own
 // thread (the canvas is transferred to it), with its metrics. URL parameters: scene (single, stacked2, stacked4, sync, features), seconds (how long to play),
-// autoplay=1 (start without a click: needs Chrome's --autoplay-policy=no-user-gesture-required).
+// autoplay=1 (start without a click: needs Chrome's --autoplay-policy=no-user-gesture-required),
+// export=1 (export the scene to MP4 instead of playing it: window.exportBytes holds the file).
 // The result is shown on the page and left in window.spikeResult for tools/run_spike.mjs.
 
 const params = new URLSearchParams(location.search);
@@ -82,7 +83,9 @@ async function main() {
     M._free(ptr);
   }
   const doc = JSON.stringify({ version: 1, output, tracks: scene.tracks });
+  window.sceneDoc = doc;  // for tools/run_spike.mjs, to export the same scene natively
   const report = () => JSON.parse(M.UTF8ToString(M._mf_report(session)));
+  if (params.get('export') === '1') return exportScene(M, session, cstr(doc), report, environment);
   M._mf_open(session, cstr(doc), 0);
 
   const openedAt = performance.now();
@@ -113,6 +116,28 @@ async function main() {
                    rafIntervalP50Ms: intervals[intervals.length >> 1], rafIntervalP99Ms: intervals[Math.floor(intervals.length * 0.99)] };
   document.getElementById('report').textContent = JSON.stringify(result, null, 2);
   status.textContent = result.state;
+  window.spikeResult = result;
+}
+
+// Exports the scene at its output size, then reports how fast it ran and what it wrote.
+async function exportScene(M, session, doc, report, environment) {
+  status.textContent = 'Exporting…';
+  const started = performance.now();
+  M._mf_export(session, doc, 0, 0, 8000000);
+  for (;;) {
+    const r = report();
+    if (r.events.includes('exported')) break;
+    if (r.events.some((e) => e.startsWith('exportFailed'))) throw new Error('export failed: ' + r.error);
+    if (performance.now() - started > 120000) throw new Error('export not done after 120 s: ' + JSON.stringify(r));
+    await new Promise((res) => setTimeout(res, 50));
+  }
+  const r = report(), size = M._mf_export_size(session);
+  window.exportBytes = M.HEAPU8.slice(M._mf_export_data(session), M._mf_export_data(session) + size);
+  const sceneSeconds = Math.max(...scene.tracks.flatMap((t) => t.items.map((i) => (i.start || 0) + (i.duration || 0))));
+  const result = { scene: sceneName, mode: 'export', environment, state: r.state, events: r.events, error: r.error, export: r.export,
+                   bytes: size, sceneSeconds, speed: Math.round(sceneSeconds / (r.export.ms / 1000) * 100) / 100 };
+  document.getElementById('report').textContent = JSON.stringify(result, null, 2);
+  status.textContent = 'Exported';
   window.spikeResult = result;
 }
 

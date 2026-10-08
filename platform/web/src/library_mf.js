@@ -350,6 +350,92 @@ addToLibrary({
     return MF.statsPtr;
   },
 
+  // --- Export (WebExportSink): the compositor into an export-sized canvas, WebCodecs encoders ---
+
+  mf_js_export_open__deps: ['$MF', '$MFC', 'mf_web_export_chunk', 'malloc', 'free'],
+  mf_js_export_open: (sink, width, height, fps, videoBitrate, sampleRate, channels, audioBitrate) => {
+    const device = Module['mfGpuDevice'];
+    if (!device) return 0;
+    const canvas = new OffscreenCanvas(width, height), format = navigator.gpu.getPreferredCanvasFormat();
+    const context = canvas.getContext('webgpu');
+    context.configure({ device, format, alphaMode: 'opaque' });
+    const ex = MF.export = { canvas, context, compositor: MFC.create(device, format), failed: false, configSent: [false, false],
+                             sampleRate, channels };
+    // An encoded chunk to the muxer, with the codec's description (avcC, AudioSpecificConfig) once.
+    const deliver = (track, chunk, meta) => {
+      const bytes = new Uint8Array(chunk.byteLength);
+      chunk.copyTo(bytes);
+      const ptr = _malloc(bytes.length);
+      HEAPU8.set(bytes, ptr);
+      let config = 0, configLength = 0;
+      const desc = meta?.decoderConfig?.description;
+      if (desc && !ex.configSent[track]) {
+        const d = ArrayBuffer.isView(desc) ? new Uint8Array(desc.buffer, desc.byteOffset, desc.byteLength) : new Uint8Array(desc);
+        config = _malloc(d.length);
+        HEAPU8.set(d, config);
+        configLength = d.length;
+        ex.configSent[track] = true;
+      }
+      _mf_web_export_chunk(sink, track, ptr, bytes.length, chunk.timestamp, chunk.duration ?? 0, chunk.type === 'key' ? 1 : 0, config, configLength);
+      _free(ptr);
+      if (config) _free(config);
+    };
+    const failed = (what) => (e) => { console.error(`${what}: ${e.message}`); ex.failed = true; };
+    try {
+      ex.video = new VideoEncoder({ output: (c, m) => deliver(0, c, m), error: failed('VideoEncoder') });
+      ex.video.configure({ codec: width * height <= 1920 * 1088 ? 'avc1.640028' : 'avc1.640033', width, height, bitrate: videoBitrate,
+                           framerate: fps, avc: { format: 'avc' }, latencyMode: 'quality' });
+      if (channels > 0) {
+        ex.audio = new AudioEncoder({ output: (c, m) => deliver(1, c, m), error: failed('AudioEncoder') });
+        ex.audio.configure({ codec: 'mp4a.40.2', sampleRate, numberOfChannels: channels, bitrate: audioBitrate });
+      }
+      return 1;
+    } catch (e) {
+      console.error('export:', e.message);
+      return 0;
+    }
+  },
+  // 0 encoding, 1 the encoder is busy (again later), 2 failed.
+  mf_js_export_video__deps: ['$MF', '$MFC'],
+  mf_js_export_video: (frameJson, ptsUs, durationUs, key) => {
+    const ex = MF.export;
+    if (!ex || ex.failed) return 2;
+    if (ex.video.encodeQueueSize >= 4) return 1;
+    MFC.encode(ex.compositor, JSON.parse(UTF8ToString(frameJson)), ex.context.getCurrentTexture().createView(), ex.canvas.width, ex.canvas.height);
+    const bitmap = ex.canvas.transferToImageBitmap();
+    const frame = new VideoFrame(bitmap, { timestamp: ptsUs, duration: durationUs });
+    bitmap.close();
+    ex.video.encode(frame, { keyFrame: !!key });
+    frame.close();
+    return 0;
+  },
+  mf_js_export_audio__deps: ['$MF'],
+  mf_js_export_audio: (pcm, frames, ptsUs) => {
+    const ex = MF.export;
+    if (!ex || ex.failed) return 2;
+    if (!ex.audio) return 0;
+    if (ex.audio.encodeQueueSize >= 8) return 1;
+    const data = HEAP16.slice(pcm >> 1, (pcm >> 1) + frames * ex.channels);
+    const audio = new AudioData({ format: 's16', sampleRate: ex.sampleRate, numberOfFrames: frames, numberOfChannels: ex.channels,
+                                  timestamp: ptsUs, data });
+    ex.audio.encode(audio);
+    audio.close();
+    return 0;
+  },
+  mf_js_export_finish__deps: ['$MF', 'mf_web_export_finished'],
+  mf_js_export_finish: (sink) => {
+    const ex = MF.export;
+    Promise.all([ex.video.flush(), ex.audio?.flush()])
+      .then(() => _mf_web_export_finished(sink, ex.failed ? 0 : 1), (e) => { console.error('export:', e.message); _mf_web_export_finished(sink, 0); });
+  },
+  mf_js_export_close__deps: ['$MF'],
+  mf_js_export_close: () => {
+    const ex = MF.export;
+    if (!ex) return;
+    for (const e of [ex.video, ex.audio]) if (e && e.state !== 'closed') e.close();
+    MF.export = null;
+  },
+
   // --- Speaker clock ---
 
   // Keeps the worklet's map from AudioContext time to performance.now() time up to date.
