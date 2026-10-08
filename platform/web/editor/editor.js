@@ -4,6 +4,7 @@
 // changed, else reopens the scene at the playhead.
 
 import { Inspector } from './inspector.js';
+import { Recording, warmVideoEncoder } from './record.js';
 import { Timeline } from './timeline.js';
 
 const M = await createMediaFramework();
@@ -100,30 +101,36 @@ async function importFiles(files) {
   let project = null;
   for (const f of files) {
     if (f.name.toLowerCase().endsWith('.json')) { project = f; continue; }
-    const bytes = new Uint8Array(await f.arrayBuffer());
-    const name = uniqueName(f.name);
-    if (f.type.startsWith('image/')) {
-      try {
-        const bitmap = await createImageBitmap(new Blob([bytes], { type: f.type }));
-        app.media.set(name, { kind: 'image', width: bitmap.width, height: bitmap.height });
-        bitmap.close();
-        withBytes(bytes, (ptr) => withStr(name, (n) => M._mf_add_image(app.session, n, ptr, bytes.length)));
-      } catch {
-        say(`${f.name}: not an image this browser decodes`, true);
-      }
-      continue;
-    }
-    const probe = JSON.parse(withBytes(bytes, (ptr) => M.UTF8ToString(M._ed_probe(ptr, bytes.length))));
-    if (probe.error || (!probe.video && !probe.audio)) {
-      say(`${f.name}: not an MP4 with H.264 video or AAC audio (${probe.error || 'no usable track'})`, true);
-      continue;
-    }
-    app.media.set(name, { kind: probe.video ? 'video' : 'audio', lengthUs: probe.durationUs, width: probe.video?.width, height: probe.video?.height });
-    withBytes(bytes, (ptr) => withStr(name, (n) => M._mf_add_source(app.session, n, ptr, bytes.length)));
+    await importBytes(f.name, new Uint8Array(await f.arrayBuffer()), f.type);
   }
   sidebar.render();
   if (project) await openProject(project);
   else if (files.length) say(`${app.media.size} file${app.media.size === 1 ? '' : 's'} in the project`);
+}
+
+// A media file's bytes into the project, under a name not yet taken (returned; null: not media).
+async function importBytes(fileName, bytes, type) {
+  const name = uniqueName(fileName);
+  if (type.startsWith('image/')) {
+    try {
+      const bitmap = await createImageBitmap(new Blob([bytes], { type }));
+      app.media.set(name, { kind: 'image', width: bitmap.width, height: bitmap.height });
+      bitmap.close();
+      withBytes(bytes, (ptr) => withStr(name, (n) => M._mf_add_image(app.session, n, ptr, bytes.length)));
+      return name;
+    } catch {
+      say(`${fileName}: not an image this browser decodes`, true);
+      return null;
+    }
+  }
+  const probe = JSON.parse(withBytes(bytes, (ptr) => M.UTF8ToString(M._ed_probe(ptr, bytes.length))));
+  if (probe.error || (!probe.video && !probe.audio)) {
+    say(`${fileName}: not an MP4 with H.264 video or AAC audio (${probe.error || 'no usable track'})`, true);
+    return null;
+  }
+  app.media.set(name, { kind: probe.video ? 'video' : 'audio', lengthUs: probe.durationUs, width: probe.video?.width, height: probe.video?.height, audio: probe.audio });
+  withBytes(bytes, (ptr) => withStr(name, (n) => M._mf_add_source(app.session, n, ptr, bytes.length)));
+  return name;
 }
 
 async function openProject(file) {
@@ -167,10 +174,10 @@ function trackFor(item, startUs, endUs) {
   return M._ed_add_track(app.doc, 1);
 }
 
-// Adds an item (as in a document) at the playhead and selects it.
-app.addItem = (item, lengthUs = 0) => {
+// Adds an item (as in a document) at the playhead (or atUs) and selects it.
+app.addItem = (item, lengthUs = 0, atUs = app.playheadUs) => {
   readScene();
-  const startUs = app.playheadUs, endUs = startUs + (item.duration ? us(item.duration) : lengthUs);
+  const startUs = atUs, endUs = startUs + (item.duration ? us(item.duration) : lengthUs);
   const t = trackFor(item, startUs, endUs);
   if (t < 0) return say('There are already 16 tracks', true);
   const k = withStr(JSON.stringify({ start: 0, ...item }), (p) => M._ed_insert_item(app.doc, t, p, startUs, lengthUs));  // insertItem places it
@@ -179,10 +186,10 @@ app.addItem = (item, lengthUs = 0) => {
   app.commit();
 };
 
-app.addMedia = (name) => {
+app.addMedia = (name, atUs = app.playheadUs) => {
   const m = app.media.get(name);
-  if (m.kind === 'image') return app.addItem({ type: 'image', src: name, duration: kStillUs / 1e6 });
-  app.addItem({ type: m.kind, src: name, duration: m.lengthUs / 1e6 }, m.lengthUs);
+  if (m.kind === 'image') return app.addItem({ type: 'image', src: name, duration: kStillUs / 1e6 }, 0, atUs);
+  app.addItem({ type: m.kind, src: name, duration: m.lengthUs / 1e6 }, m.lengthUs, atUs);
 };
 
 // --- Playback ---
@@ -248,7 +255,7 @@ function save() {
 
 const sidebar = {
   tab: 'Media',
-  tabs: ['Media', 'Text', 'Emoji', 'Colors', 'Export'],
+  tabs: ['Media', 'Text', 'Emoji', 'Colors', 'Record', 'Export'],
   render() {
     const bar = document.getElementById('tabs'), body = document.getElementById('tab-body');
     bar.replaceChildren(...this.tabs.map((name) => {
@@ -303,9 +310,12 @@ const sidebar = {
       }
       body.append(row);
       hint('A color fills the output: put it under other layers as a background.');
+    } else if (this.tab === 'Record') {
+      recordPanel(body, hint);
     } else if (this.tab === 'Export') {
       exportPanel(body, hint);
     }
+    if (this.tab !== 'Record') recorder.closePreview();
   },
 };
 
@@ -344,6 +354,127 @@ function exportPanel(body, hint) {
   };
   body.append(select, go, progress);
   hint('Exports run alongside the preview, faster than real time.');
+}
+
+// --- Recording ---
+
+// The Record tab, as the macOS editor's camera window and voice-over: a camera recording (video and
+// sound) goes in at the playhead where it started; a voice-over plays the timeline from the
+// playhead while the microphone records, and goes on an audio track from there. Recordings are
+// MP4s made in the page (record.js) and join the project's media like imported files.
+const recorder = {
+  stream: null,     // the camera preview's stream, while the Record tab shows it
+  recording: null,  // the Recording under way
+  mode: null,       // 'camera' | 'voice'
+  atUs: 0,          // where the recording goes on the timeline
+  count: { camera: 0, voice: 0 },
+
+  warm: null,       // the next camera recording's video encoder, configured while the preview shows
+
+  async openPreview() {
+    if (!this.stream) this.stream = await navigator.mediaDevices.getUserMedia({ video: { width: 1280, height: 720 }, audio: true });
+    if (!this.warm && 'VideoEncoder' in window) this.warm = warmVideoEncoder(this.stream.getVideoTracks()[0]);
+    return this.stream;
+  },
+  closePreview() {  // a camera recording has its own clone of the stream, so it goes on
+    this.stream?.getTracks().forEach((t) => t.stop());
+    this.stream = null;
+    if (this.warm?.encoder.state !== 'closed') this.warm?.encoder.close();
+    this.warm = null;
+  },
+
+  async start(mode) {
+    if (this.recording || this.starting) return;
+    this.starting = true;
+    try {
+      await this.begin(mode);
+    } finally {
+      this.starting = false;
+    }
+  },
+
+  async begin(mode) {
+    if (!('MediaStreamTrackProcessor' in window)) return say('Recording needs Chrome or Edge (MediaStreamTrackProcessor)', true);
+    let stream;
+    try {
+      stream = mode === 'camera' ? (await this.openPreview()).clone()
+                                 : await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
+    } catch (e) {
+      return say(`No ${mode === 'camera' ? 'camera' : 'microphone'}: ${e.message}`, true);
+    }
+    this.mode = mode;
+    this.atUs = app.playheadUs;
+    let warm = null;
+    if (mode === 'camera') {
+      say('Getting the camera ready…');
+      warm = await this.warm.ready;
+      this.warm = null;
+    }
+    this.recording = new Recording(M, stream, warm);
+    this.recording.start();
+    this.startedAt = performance.now();
+    if (mode === 'voice' && app.state === 'READY') {
+      if (app.playheadUs >= app.durationUs() - 50000) {
+        app.seek(0);
+        this.atUs = 0;
+      }
+      M._mf_play(app.session);
+    }
+    say(mode === 'camera' ? 'Recording the camera…' : 'Recording a voice-over…');
+    sidebar.render();
+  },
+
+  async stop() {
+    const r = this.recording;
+    if (!r) return;
+    if (this.mode === 'voice' && app.state === 'PLAY') M._mf_pause(app.session);
+    let file;
+    try {
+      file = await r.stop();
+    } catch (e) {
+      this.recording = null;
+      sidebar.render();
+      return say(`The recording failed: ${e.message}`, true);
+    }
+    this.recording = null;
+    if (this.stream && this.mode === 'camera') this.openPreview();  // the next recording's encoder
+    const kind = this.mode;
+    const n = ++this.count[kind];
+    const name = await importBytes(kind === 'camera' ? `Camera ${n}.mp4` : `Voice-over ${n}.m4a`, file.bytes, kind === 'camera' ? 'video/mp4' : 'audio/mp4');
+    app.lastRecording = { name, ...file };  // for tests
+    if (name) {
+      app.addMedia(name, this.atUs);
+      const dropped = file.dropped ? `, ${file.dropped} frame${file.dropped === 1 ? '' : 's'} dropped` : '';
+      say(`Recorded ${name} (${fmt(app.media.get(name).lengthUs)}${dropped})`);
+    }
+    sidebar.render();
+  },
+};
+app.recorder = recorder;
+
+function recordPanel(body, hint) {
+  const busy = recorder.recording;
+  const video = Object.assign(document.createElement('video'), { muted: true, autoplay: true, playsInline: true });
+  video.className = 'camera';
+  const go = (text, onclick, primary) => {
+    const b = Object.assign(document.createElement('button'), { textContent: text, onclick, disabled: busy && !primary });
+    if (primary) b.className = 'primary';
+    return b;
+  };
+  if (busy) {
+    const elapsed = Object.assign(document.createElement('div'), { className: 'hint' });
+    const tick = setInterval(() => {
+      if (!elapsed.isConnected) return clearInterval(tick);
+      elapsed.textContent = `● ${fmt((performance.now() - recorder.startedAt) * 1000)}${busy.dropped ? ` · ${busy.dropped} dropped` : ''}`;
+    }, 200);
+    if (recorder.mode === 'camera') { video.srcObject = recorder.stream; body.append(video); }
+    body.append(go('■ Stop recording', () => recorder.stop(), true), elapsed);
+    return;
+  }
+  body.append(video);
+  recorder.openPreview().then((s) => { if (video.isConnected) video.srcObject = s; }, (e) => { video.remove(); hint(`No camera: ${e.message}`); });
+  body.append(go('● Record camera', () => recorder.start('camera')), go('● Record voice-over', () => recorder.start('voice')));
+  hint('A camera recording goes in at the playhead. A voice-over plays the timeline from the playhead while it records the microphone. Needs Chrome or Edge.');
 }
 
 // --- Wiring ---

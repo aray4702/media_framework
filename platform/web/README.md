@@ -40,10 +40,11 @@ Open `http://localhost:8000/platform/web/app/?scene=stacked2` and press Play. Sc
 - **Properties:** timing (start, duration, in, speed); position, scale, rotation, opacity, fit, blend; color adjust, blur, crop and chroma key; text words, font, size, color and box; sound (mute, gain, pan) and detaching a video's sound; transitions (kind, direction, duration); tracks (on, opacity or gain, order); the project (size, frame rate, background).
 - **Projects:** Save downloads the scene document; Open takes the document together with its media files, matched by file name.
 - **Export:** MP4 at the project's size, 720p or 1080p, downloaded when done.
+- **Record:** the camera (video and sound), added at the playhead where it started; or a voice-over, recorded from the microphone while the timeline plays from the playhead, added on an audio track there. Recordings join the project's media as `Camera n.mp4` and `Voice-over n.m4a`.
 
-`tools/run_editor.mjs` drives it in Chrome like a person (import, add, edit, drag, transition, play, export, save and reopen) and checks the scene and the player at each step.
+`tools/run_editor.mjs` drives it in Chrome like a person (import, add, edit, drag, transition, play, export, save and reopen) and checks the scene and the player at each step. `tools/run_record.mjs` records with Chrome's fake camera and microphone (`--use-fake-device-for-media-stream`): a camera recording and a voice-over, each checked for length, place and dropped frames, then played.
 
-Not yet, compared with the macOS editor: stickers, the camera and voice-over (step 5), editing in the preview (drag and resize on the picture), dragging from the sidebar onto the timeline, waveforms, effect plugins, export formats and framing (MOV, HEVC, fill, several outputs), resizable panes, and keeping media between sessions (projects reopen with their files picked again).
+Not yet, compared with the macOS editor: stickers, editing in the preview (drag and resize on the picture), dragging from the sidebar onto the timeline, waveforms, effect plugins, export formats and framing (MOV, HEVC, fill, several outputs), resizable panes, and keeping media between sessions (projects reopen with their files picked again).
 
 ## Measure
 
@@ -78,6 +79,16 @@ build/platform/web/web_demuxer_tests clips/*.mp4
 build/platform/web/web_muxer_tests clips/*.mp4
 ```
 
+## Recording
+
+`editor/record.js` records on the page's thread: `getUserMedia`, each track read frame by frame with `MediaStreamTrackProcessor`, encoded with WebCodecs (H.264 in real-time mode with a keyframe every 2 s, AAC) and muxed by the portable MP4 muxer (`src/recorder_api.cpp`) into memory, then imported like a dropped file.
+
+- **Times:** capture times, counted from the first video frame. Chrome stamps camera frames and microphone audio on different clocks (the audio on `performance.now`, the video on the system's), so each track is moved onto the page's clock by the offset its first sample showed on arrival.
+- **Falling behind:** when the video encoder has more than 2 frames queued, a frame is dropped and counted rather than queued; the count shows while recording and after.
+- **The encoder is made ahead:** configuring the hardware H.264 encoder on macOS holds up the camera's frames for about 1.7 s, which would cut the start of the recording; the editor configures it when the camera preview opens.
+- **Voice-over:** the item starts where the timeline started playing; how long the player takes to start (a refresh or two) is not taken off.
+- **Browsers:** tested in Chrome. It needs `MediaStreamTrackProcessor` on the page's thread, which Chrome and Edge have and Firefox does not; Safari is untested.
+
 ## Decode errors
 
 A decode error closes a WebCodecs decoder. The adapters report it as one corrupt frame and make the decoder again: video at the next keyframe (the last good frame holds meanwhile), audio at the next packet (the gap plays as silence).
@@ -87,5 +98,5 @@ A decode error closes a WebCodecs decoder. The adapters report it as one corrupt
 - Effect plugins (`beauty`) are macOS only: each needs a WGSL version. A layer's plugin effects are skipped.
 - An export is kept in memory until it is done: a long one at a high bitrate needs that much memory. Writing to a file as it goes (the File System Access API, or the origin's private storage) would remove that.
 - The export frame size letterboxes (`frameFit` fit); `fill` cropping is not implemented on the web.
-- No camera yet.
+- Recording needs `MediaStreamTrackProcessor` on the page's thread (Chrome, Edge); not in Firefox, untested in Safari.
 - The browser does not report when a frame reached the screen: present times are estimated as the refresh after the one a frame is drawn in.

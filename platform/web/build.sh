@@ -14,7 +14,7 @@ CORE=$(ls core/src/*.cpp | grep -v -e thread_scheduler -e segment_recorder -e li
 em++ -std=c++17 -O2 -pthread -Wall -Wno-unused-parameter \
   -Icore/include -Iplatform/web/include -Iplatform/web/src \
   $CORE platform/web/src/mp4_demuxer.cpp platform/web/src/mp4_muxer.cpp platform/web/src/web_platform.cpp platform/web/src/web_api.cpp \
-  platform/web/src/editor_api.cpp apps/macos-editor/document.cpp \
+  platform/web/src/editor_api.cpp platform/web/src/recorder_api.cpp apps/macos-editor/document.cpp \
   --js-library platform/web/src/library_mf.js --js-library platform/web/src/library_mf_compositor.js \
   -pthread -sWASM_WORKERS -sAUDIO_WORKLET -sOFFSCREENCANVAS_SUPPORT \
   -sMODULARIZE -sEXPORT_NAME=createMediaFramework -sENVIRONMENT=web \
