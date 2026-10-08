@@ -11,14 +11,17 @@ namespace mf {
 // Where every item sits and plays (scene_graph_spec.md §2, §5), for the enabled tracks.
 // Items are numbered in track order, then item order. Decodable items (video, audio) get a
 // lane: a set of decoders and queues reused by items that never overlap (§7). Lanes are
-// assigned greedily in start order, with each item's interval widened by a preroll margin so
-// its decoder can start before the item does.
+// assigned greedily in start order, each item on a lane free a preroll margin before its start
+// whenever the lane limit allows, so its decoder can start before the item does.
 class SceneLayout {
  public:
   static constexpr int kMaxLanes = 8;
-  static constexpr int64_t kPrerollUs = 1000000;
+  // When lanes allow, an item's decoder is reserved from this far before its own start until its
+  // end.  This is deliberately an item-local interval: a clip in the middle of an otherwise empty
+  // timeline needs the same lead time as the incoming half of a cut.
+  static constexpr int64_t kPrerollUs = 2000000;
 
-  bool build(const Scene&, std::string* error);  // fails when more than kMaxLanes would be needed
+  bool build(const Scene&, std::string* error);  // fails when more than kMaxLanes items play at once
 
   int items() const { return static_cast<int>(flat_.size()); }
   const SceneItem& item(int i) const { return scene_->tracks[flat_[i].track].items[flat_[i].index]; }

@@ -46,6 +46,7 @@ struct Packet {
   int64_t ptsUs = 0;
   int64_t dtsUs = 0;
   bool key = false;
+  bool disposable = false;  // no other frame references it: it can be skipped without corrupting any
   bool eos = false;  // end-of-track marker, carries no data
   uint32_t serial = 0;
   int item = 0;  // scene item the packet belongs to; ptsUs/dtsUs are in that item's media time
@@ -58,6 +59,7 @@ struct TrackInfo {
   int64_t frameDurationUs = 0;
   int width = 0, height = 0;
   bool rotated = false;  // non-identity track matrix (A21)
+  int maxBFrames = -1;   // longest run of B-frames (shown before a frame decoded earlier); -1: unknown
   int sampleRate = 0, channels = 0;
   std::shared_ptr<void> format;  // platform codec config (Mac OS: CMFormatDescriptionRef)
 };

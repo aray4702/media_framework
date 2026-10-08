@@ -224,7 +224,7 @@ The **schema** checks structure, types, enumerations, required fields and fixed 
 | R8 | At least one enabled track has an item |
 | R9 *(runtime)* | Each `src` opens and has the needed track: video for `video`, audio for `audio`, a decodable image for `image` |
 | R10 *(runtime)* | A media item's `in` lies inside its file (for duration 0 as well). If the file ends before `in + duration × speed`, the item holds its last frame (video) or goes silent (audio) |
-| R11 *(runtime)* | At most 8 video and audio items play at once, counting each item from 1 s before its start (so its decoder can start early). Each such item needs its own decoder, and the platform's hardware limits still apply (e.g. two 4K H.264 streams at once on Apple silicon) |
+| R11 *(runtime)* | At most 8 video and audio items play at once. Preroll doesn't count toward the limit: an item's decoder starts 2 s before its start when a lane is free for it, and later otherwise. Each item playing needs its own decoder, and the platform's hardware limits still apply (e.g. two 4K H.264 streams at once on Apple silicon) |
 | R12 | An item or a track has at most one effect of each type and 8 in all, each built in or from a loaded effect plugin (§4.4); only video tracks have effects |
 
 A document that fails R1–R8 or R12 is rejected by `open()` or `Exporter::start()` with `InvalidArgument`, before anything is decoded. R9–R11 fail asynchronously through `onError`, like media errors today.

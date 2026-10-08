@@ -5,6 +5,8 @@
 
 #include "../src/av_sync.h"
 #include "../src/bounded_queue.h"
+#include "../src/decode_rate.h"
+#include "../src/drivers.h"
 #include "../src/master_clock.h"
 #include "../src/json.h"
 #include "../src/layout.h"
@@ -700,6 +702,180 @@ TEST(composition_cut_has_no_overlap) {
   h.run(2500);
   CHECK_EQ(h.listener.ended, 1);
   for (const ComposedFrame& f : h.platform.display->composed) CHECK(f.layers.size() <= 1);
+}
+
+TEST(composition_prerolls_a_lone_future_video_from_its_own_start) {
+  fake::Clip clip;
+  clip.durationUs = 2000000;
+  fake::Harness h(clip);
+  Scene scene;
+  SceneTrack track;
+  SceneItem item;
+  item.type = ItemType::Video;
+  item.source = fake::clipSource(0);
+  item.startUs = 4000000;
+  item.durationUs = 2000000;
+  track.items.push_back(item);
+  scene.tracks.push_back(track);
+  CHECK(h.openScene(scene, OutputDriver::Vsync) == Result::Ok);
+  h.run(20);
+  CHECK(h.player->state() == State::Ready);
+  h.player->play();
+  h.run(4500);  // B's 2 s preroll window opens at 2 s, before it becomes visible at 4 s.
+  bool shown = false;
+  for (const ComposedFrame& f : h.platform.display->composed) {
+    shown |= f.ptsUs >= item.startUs && videoLayers(f) == 1 && f.layers[0].frame.item == 0;
+  }
+  CHECK(shown);
+}
+
+TEST(composition_prerolls_an_abutting_video_on_another_track) {
+  std::vector<fake::Clip> clips = {fake::Clip{}, fake::Clip{}};
+  clips[0].durationUs = 4000000;
+  clips[1].durationUs = 2000000;
+  fake::Harness h(clips);
+  Scene scene;
+  SceneTrack a, b;
+  SceneItem first, second;
+  first.type = second.type = ItemType::Video;
+  first.source = fake::clipSource(0);
+  first.durationUs = 4000000;
+  second.source = fake::clipSource(1);
+  second.startUs = 4000000;
+  second.durationUs = 2000000;
+  a.items.push_back(first);
+  b.items.push_back(second);
+  scene.tracks = {a, b};
+  CHECK(h.openScene(scene, OutputDriver::Vsync) == Result::Ok);
+  h.run(20);
+  h.player->play();
+  h.run(4500);
+  bool shown = false;
+  for (const ComposedFrame& f : h.platform.display->composed) {
+    shown |= f.ptsUs >= second.startUs && videoLayers(f) == 1 && f.layers[0].frame.item == 1;
+  }
+  CHECK(shown);
+}
+
+TEST(composition_keeps_going_past_a_video_that_never_decodes) {
+  std::vector<fake::Clip> clips = {fake::Clip{}, fake::Clip{}};
+  clips[0].durationUs = clips[1].durationUs = 4000000;
+  for (int i = 0; i < 120; ++i) clips[0].corruptFrames.insert(i);  // no frame of the bottom video decodes
+  fake::Harness h(clips);
+  Scene scene;
+  SceneTrack a, b;
+  SceneItem broken, healthy;
+  broken.type = healthy.type = ItemType::Video;
+  broken.source = fake::clipSource(0);
+  broken.durationUs = 4000000;
+  healthy.source = fake::clipSource(1);
+  healthy.durationUs = 4000000;
+  a.items.push_back(broken);
+  b.items.push_back(healthy);
+  scene.tracks = {a, b};
+  CHECK(h.openScene(scene, OutputDriver::Vsync) == Result::Ok);
+  h.run(20);
+  h.player->play();
+  h.run(3000);
+  // The broken layer is left out; the healthy one keeps playing rather than freezing with it.
+  int64_t last = -1;
+  for (const ComposedFrame& f : h.platform.display->composed) {
+    if (videoLayers(f) == 1 && f.layers[0].frame.item == 1) last = std::max(last, f.ptsUs);
+  }
+  CHECK(last >= 2500000);
+}
+
+TEST(export_starts_future_items_without_a_presentation_clock) {
+  fake::Clip clip;
+  clip.durationUs = 2000000;
+  fake::ExportHarness h({clip});
+  Scene scene;
+  scene.output = SceneOutput{};
+  SceneTrack track;
+  SceneItem item;
+  item.type = ItemType::Video;
+  item.source = fake::clipSource(0);
+  item.startUs = 4000000;
+  item.durationUs = 2000000;
+  track.items.push_back(item);
+  scene.tracks.push_back(track);
+  CHECK(h.start(scene) == Result::Ok);
+  h.run(20000);
+  CHECK_EQ(h.listener.completed, 1);
+  CHECK_EQ(h.platform.exportSink->video.size(), size_t(180));
+  // Every frame of the item is exported from its first: none is skipped as if already played.
+  for (const ComposedFrame& f : h.platform.exportSink->video) {
+    if (f.ptsUs < item.startUs) continue;
+    CHECK_EQ(videoLayers(f), 1);
+    int64_t mediaUs = f.ptsUs - item.startUs;  // the frame at or before it, not one from a later position
+    if (videoLayers(f) == 1) CHECK(f.layers[0].frame.ptsUs <= mediaUs && mediaUs - f.layers[0].frame.ptsUs < 33334);
+  }
+}
+
+TEST(seek_back_while_paused_starts_a_future_item_at_its_start) {
+  fake::Clip clip;
+  clip.durationUs = 5000000;
+  fake::Harness h(clip);
+  Scene scene;
+  SceneTrack track;
+  SceneItem item;
+  item.type = ItemType::Video;
+  item.source = fake::clipSource(0);
+  item.startUs = 3000000;
+  item.durationUs = 5000000;
+  track.items.push_back(item);
+  scene.tracks.push_back(track);
+  CHECK(h.openScene(scene, OutputDriver::Vsync) == Result::Ok);
+  h.run(20);
+  CHECK(h.player->seek(7000000) == Result::Ok);
+  h.run(50);
+  // The item's preroll window (from 1 s) is after this target but before the old playhead.
+  CHECK(h.player->seek(0) == Result::Ok);
+  h.run(50);
+  CHECK_EQ(h.listener.seeks.size(), size_t(2));
+  h.player->play();
+  h.run(3500);
+  bool fromStart = false;
+  for (const ComposedFrame& f : h.platform.display->composed) {
+    fromStart |= f.ptsUs >= item.startUs && videoLayers(f) == 1 && f.layers[0].frame.ptsUs < 100000;
+  }
+  CHECK(fromStart);
+}
+
+TEST(open_without_a_decodable_frame_fails_with_a_later_item_pending) {
+  std::vector<fake::Clip> clips = {fake::Clip{}, fake::Clip{}};
+  for (int i = 0; i < 60; ++i) clips[0].corruptFrames.insert(i);
+  fake::Harness h(clips);
+  Scene scene;
+  SceneTrack a, b;
+  SceneItem first, second;
+  first.type = second.type = ItemType::Video;
+  first.source = fake::clipSource(0);
+  first.durationUs = 2000000;
+  second.source = fake::clipSource(1);
+  second.startUs = 3000000;  // on another lane, whose preroll window opens after the open's target
+  second.durationUs = 2000000;
+  a.items.push_back(first);
+  b.items.push_back(second);
+  scene.tracks = {a, b};
+  CHECK(h.openScene(scene, OutputDriver::Vsync) == Result::Ok);
+  h.run(100);
+  CHECK(h.player->state() == State::Error);
+  CHECK(h.listener.errors == std::vector<Result>{Result::MalformedMedia});
+}
+
+TEST(seek_without_a_frame_reports_its_target) {
+  fake::Clip clip;
+  for (int i = 30; i < 60; ++i) clip.corruptFrames.insert(i);  // nothing decodes after 1 s
+  fake::Harness h(clip);
+  h.open();
+  h.run(20);
+  CHECK(h.player->state() == State::Ready);
+  CHECK(h.player->seek(1500000) == Result::Ok);
+  h.run(50);
+  CHECK_EQ(h.listener.seeks.size(), size_t(1));
+  CHECK_EQ(h.listener.seeks.back(), 1500000);
+  CHECK_EQ(h.player->positionUs(), 1500000);
 }
 
 TEST(composition_shows_captions_in_their_time_range) {
@@ -1586,6 +1762,105 @@ TEST(player_composes_plugin_effects_and_edits_them_live) {
   CHECK(h.lastComposed().layers[0].effects.plugins[0].params[0] == 0.75f);
 }
 
+// Ticks the decode rate control every 1/60 s from `from` until `to`, with the lanes' signals as
+// set. Returns how many ticks stepped down and up.
+static std::pair<int, int> tickRate(DecodeRate& rate, std::vector<DecodeRate::Lane>& lanes, int64_t from, int64_t to,
+                                    bool holdExpired = false) {
+  int down = 0, up = 0;
+  for (int64_t t = from; t < to; t += 16667) {
+    DecodeRate::Change c = rate.tick(t, lanes, holdExpired && t == from).change;
+    down += c == DecodeRate::Change::Down;
+    up += c == DecodeRate::Change::Up;
+  }
+  return {down, up};
+}
+
+static std::vector<DecodeRate::Lane> rateLanes(std::vector<int> steps) {
+  std::vector<DecodeRate::Lane> lanes(steps.size());
+  for (size_t i = 0; i < steps.size(); ++i) {
+    lanes[i].active = true;
+    lanes[i].step = steps[i];
+  }
+  return lanes;
+}
+
+TEST(decode_rate_steps_every_lane_down_evenly) {
+  DecodeRate rate;
+  std::vector<DecodeRate::Lane> lanes = rateLanes({0, 0});
+  lanes.push_back(DecodeRate::Lane{});  // a lane decoding nothing takes no part
+  lanes[0].behind = true;               // only one lane is late; both share the decoder
+  CHECK(tickRate(rate, lanes, 0, 450000).first == 0);  // a short stall is not a slow decoder
+  CHECK(tickRate(rate, lanes, 450000, 600000).first == 1);
+  CHECK(lanes[0].step == 1 && lanes[1].step == 1 && lanes[2].step == 0);
+  CHECK(tickRate(rate, lanes, 600000, 1500000).first == 0);  // the step needs time to take effect
+  CHECK(tickRate(rate, lanes, 1500000, 1700000).first == 1);
+  CHECK(lanes[0].step == 2 && lanes[1].step == 2);
+  CHECK(tickRate(rate, lanes, 1700000, 5000000).first == 0);  // the bottom of the ladder
+}
+
+TEST(decode_rate_moves_the_least_and_most_reduced_lanes_first) {
+  DecodeRate rate;
+  std::vector<DecodeRate::Lane> lanes = rateLanes({1, 1, 0});
+  for (auto& l : lanes) l.behind = true;
+  tickRate(rate, lanes, 0, 600000);
+  CHECK(lanes[0].step == 1 && lanes[1].step == 1 && lanes[2].step == 1);  // level, never two apart
+  lanes = rateLanes({1, 1, 0});
+  lanes[0].ahead = lanes[1].ahead = true;  // the most reduced lanes have decoded well ahead
+  CHECK(tickRate(rate, lanes, 1000000, 3900000).second == 0);
+  CHECK(tickRate(rate, lanes, 3900000, 4200000).second == 1);
+  CHECK(lanes[0].step == 0 && lanes[1].step == 0 && lanes[2].step == 0);
+}
+
+TEST(decode_rate_backs_off_after_a_step_up_that_does_not_hold) {
+  DecodeRate rate;
+  std::vector<DecodeRate::Lane> lanes = rateLanes({1});
+  lanes[0].ahead = true;
+  CHECK(tickRate(rate, lanes, 0, 3100000).second == 1);
+  CHECK(lanes[0].step == 0);
+  lanes[0].ahead = false;
+  lanes[0].behind = true;  // too slow again at once: the step up didn't hold
+  CHECK(tickRate(rate, lanes, 3100000, 3900000).first == 0);  // 1 s after the last step, as in the recorder
+  CHECK(tickRate(rate, lanes, 3900000, 4200000).first == 1);
+  CHECK_EQ(rate.stepUpAfterUs(), int64_t{6000000});
+  lanes[0].behind = false;
+  lanes[0].ahead = true;
+  CHECK(tickRate(rate, lanes, 4200000, 10100000).second == 0);  // now waits 6 s
+  CHECK(tickRate(rate, lanes, 10100000, 10500000).second == 1);
+  rate.restart();  // a seek keeps the backoff
+  CHECK_EQ(rate.stepUpAfterUs(), int64_t{6000000});
+}
+
+TEST(decode_rate_steps_down_at_once_when_a_hold_expires) {
+  DecodeRate rate;
+  std::vector<DecodeRate::Lane> lanes = rateLanes({0, 0});
+  lanes[1].behind = true;
+  CHECK(tickRate(rate, lanes, 0, 16667, true).first == 1);
+  CHECK(lanes[0].step == 1 && lanes[1].step == 1);
+  CHECK(tickRate(rate, lanes, 500000, 516667, true).first == 0);  // still the gap between steps
+  CHECK(tickRate(rate, lanes, 1000000, 1016667, true).first == 1);
+}
+
+TEST(decode_rate_momentum_carries_only_a_sustained_level) {
+  DecodeRate held;
+  std::vector<DecodeRate::Lane> lanes = rateLanes({1, 1});
+  tickRate(held, lanes, 0, 4000000);  // past τ·ln 2 ≈ 3.5 s at step 1
+  CHECK(held.momentum() > 0.5);
+  CHECK_EQ(held.startStep(lanes), 1);
+  held.restart();  // a seek keeps the momentum
+  CHECK_EQ(held.startStep(lanes), 1);
+  CHECK_EQ(held.startStep(rateLanes({0, 0})), 1);  // within one step of the lanes still decoding
+  CHECK_EQ(held.startStep(rateLanes({2, 2})), 1);
+
+  DecodeRate brief;
+  lanes = rateLanes({1, 1});
+  tickRate(brief, lanes, 0, 1000000);  // a 1 s excursion
+  lanes = rateLanes({0, 0});
+  CHECK(brief.momentum() > 0.15 && brief.momentum() < 0.25);
+  CHECK_EQ(brief.startStep(lanes), 0);
+  tickRate(brief, lanes, 1000000, 2000000);
+  CHECK(brief.momentum() < 0.18);  // fades back toward the lanes' level
+}
+
 TEST(scene_layout_assigns_lanes_by_overlap) {
   Scene stacked = sceneFrom(R"({"version": 1, "output": {"width": 640, "height": 360, "fps": 30}, "tracks": [
       {"kind": "video", "items": [{"type": "video", "src": "clip0", "start": 0, "duration": 2}]},
@@ -1601,11 +1876,92 @@ TEST(scene_layout_assigns_lanes_by_overlap) {
                                   {"type": "video", "src": "clip1", "start": 3, "duration": 1},
                                   {"type": "video", "src": "clip2", "start": 6, "duration": 1})"));
   CHECK(layout.build(apart, &error));
-  CHECK_EQ(layout.lanes(), 1);
+  CHECK_EQ(layout.lanes(), 1);  // each clip's preroll starts as the one before it ends
   std::string tooMany = R"({"version": 1, "output": {"width": 640, "height": 360, "fps": 30}, "tracks": [)";
   for (int i = 0; i < 9; ++i) tooMany += std::string(i ? "," : "") + R"({"kind": "video", "items": [{"type": "video", "src": "clip0", "start": 0, "duration": 1}]})";
   CHECK(layout.build(sceneFrom(tooMany + "]}"), &error) == false);
   CHECK(error.find("more than 8") != std::string::npos);
+}
+
+TEST(scene_layout_reserves_two_seconds_before_each_item) {
+  // These clips are visibly separated by 1.5 s, but the incoming decoder must begin 2 s
+  // before its own start.  They therefore cannot share a lane.
+  Scene scene = sceneFrom(doc(R"({"type": "video", "src": "clip0", "start": 0, "duration": 1},
+                                  {"type": "video", "src": "clip1", "start": 2.5, "duration": 1})"));
+  SceneLayout layout;
+  std::string error;
+  CHECK(layout.build(scene, &error));
+  CHECK_EQ(layout.lanes(), 2);
+  CHECK(layout.laneOf(0) != layout.laneOf(1));
+}
+
+// A scene of video tracks, each a list of {start, duration} items in seconds.
+static Scene videoTracks(const std::vector<std::vector<std::pair<double, double>>>& tracks) {
+  std::string text = R"({"version": 1, "output": {"width": 640, "height": 360, "fps": 30}, "tracks": [)";
+  for (size_t t = 0; t < tracks.size(); ++t) {
+    text += std::string(t ? "," : "") + R"({"kind": "video", "items": [)";
+    for (size_t k = 0; k < tracks[t].size(); ++k) {
+      text += std::string(k ? "," : "") + R"({"type": "video", "src": "clip0", "start": )" + std::to_string(tracks[t][k].first) +
+              R"(, "duration": )" + std::to_string(tracks[t][k].second) + "}";
+    }
+    text += "]}";
+  }
+  return sceneFrom(text + "]}");
+}
+
+TEST(scene_layout_adds_lanes_for_preroll_while_the_limit_allows) {
+  // Four tracks of two abutting clips: every incoming clip gets its own lane for its preroll.
+  SceneLayout layout;
+  std::string error;
+  Scene four = videoTracks(std::vector<std::vector<std::pair<double, double>>>(4, {{0, 2}, {2, 2}}));
+  CHECK(layout.build(four, &error));
+  CHECK_EQ(layout.lanes(), 8);
+  for (int t = 0; t < 4; ++t) CHECK(layout.laneOf(2 * t) != layout.laneOf(2 * t + 1));
+  // Five tracks: preroll everywhere would need ten lanes, but only five clips ever play at once.
+  // The last two incoming clips go without preroll instead of failing R11.
+  Scene five = videoTracks(std::vector<std::vector<std::pair<double, double>>>(5, {{0, 2}, {2, 2}}));
+  CHECK(layout.build(five, &error));
+  CHECK_EQ(layout.lanes(), 8);
+}
+
+TEST(scene_layout_skips_preroll_only_where_every_lane_is_held) {
+  // Seven long clips hold seven lanes; the eighth track's cuts can't have a lane of their own
+  // for preroll, so they share the eighth lane back to back.
+  std::vector<std::vector<std::pair<double, double>>> tracks(7, {{0, 10}});
+  tracks.push_back({{0, 2}, {2, 2}, {4, 2}});
+  Scene scene = videoTracks(tracks);
+  SceneLayout layout;
+  std::string error;
+  CHECK(layout.build(scene, &error));
+  CHECK_EQ(layout.lanes(), 8);
+  CHECK_EQ(layout.laneOf(8), layout.laneOf(7));
+  CHECK_EQ(layout.laneOf(9), layout.laneOf(7));
+  // Once the long clips end, a later cut gets its preroll again on a lane they freed.
+  tracks.push_back({{14, 2}});
+  CHECK(layout.build(videoTracks(tracks), &error));
+  CHECK(layout.laneOf(10) != layout.laneOf(9));
+}
+
+TEST(scene_plays_cuts_that_share_a_lane_without_preroll) {
+  std::vector<std::vector<std::pair<double, double>>> tracks(7, {{0, 6}});
+  tracks.push_back({{0, 2}, {2, 2}, {4, 2}});
+  fake::Harness h(clips(1, 10000000, false));
+  CHECK(h.openScene(videoTracks(tracks), OutputDriver::Vsync) == Result::Ok);
+  h.run(20);
+  CHECK(h.player->state() == State::Ready);
+  h.player->play();
+  h.run(6500);
+  // Each cut on the shared lane is shown during its own time, its frames from its own start.
+  for (int item = 7; item < 10; ++item) {
+    int64_t start = (item - 7) * 2000000;
+    bool shown = false;
+    for (const ComposedFrame& f : h.platform.display->composed) {
+      if (f.ptsUs < start || f.ptsUs >= start + 2000000 || f.layers.size() != 8) continue;
+      shown |= f.layers[7].item == item && std::llabs(f.layers[7].frame.ptsUs - (f.ptsUs - start)) < 100000;
+    }
+    CHECK(shown);
+  }
+  CHECK_EQ(h.listener.ended, 1);
 }
 
 TEST(scene_composites_three_stacked_videos) {
@@ -1860,4 +2216,181 @@ int main() {
   }
   std::fprintf(stderr, "%zu tests, %d failed checks\n", test::cases().size(), test::failures());
   return test::failures() == 0 ? 0 : 1;
+}
+
+// Two stacked 8 s videos, played to the end on a decoder (shared by both lanes) that takes
+// `decodeUs` per frame. Returns the harness for its metrics and output.
+static std::unique_ptr<fake::Harness> playStacked(int64_t decodeUs, bool disposable) {
+  fake::Clip c;
+  c.durationUs = 8000000;
+  c.audio = false;
+  c.decodeUs = decodeUs;
+  c.disposable = disposable;
+  auto h = std::make_unique<fake::Harness>(std::vector<fake::Clip>{c, c});
+  CHECK(h->openScene(videoTracks({{{0, 8}}, {{0, 8}}}), OutputDriver::Vsync) == Result::Ok);
+  for (int i = 0; i < 2000 && h->player->state() != State::Ready; ++i) h->run(1);
+  CHECK(h->player->play() == Result::Ok);
+  h->run(8600);
+  CHECK_EQ(h->listener.ended, 1);
+  return h;
+}
+
+// The most any layer of the frames composed in [from, to) lags behind the frame's time.
+static int64_t worstLag(const fake::Harness& h, int64_t from, int64_t to) {
+  int64_t worst = 0;
+  for (const ComposedFrame& f : h.platform.display->composed) {
+    if (f.ptsUs < from || f.ptsUs >= to) continue;
+    for (const ComposedLayer& l : f.layers) worst = std::max(worst, f.ptsUs - l.frame.ptsUs);
+  }
+  return worst;
+}
+
+TEST(playback_decodes_everything_when_the_decoder_keeps_up) {
+  auto h = playStacked(10000, true);  // 2 lanes × 30 fps × 10 ms: 60% of the decoder
+  MetricsReport m = h->player->metrics();
+  CHECK_EQ(m.decodeStepDowns, 0);
+  CHECK_EQ(m.decodeSkips, 0);
+  CHECK(worstLag(*h, 0, 8000000) < 34000);
+}
+
+TEST(playback_steps_decoding_down_when_the_decoder_falls_behind) {
+  // 2 lanes × 30 fps × 25 ms needs 150% of the decoder; without the disposable half, 75%.
+  auto h = playStacked(25000, true);
+  MetricsReport m = h->player->metrics();
+  CHECK(m.decodeStepDowns >= 1);
+  CHECK(m.decodeSkips > 0);
+  CHECK(m.decodeReducedUs > 4000000);
+  // Caught up once stepped down: every layer within a frame of the playhead, instead of falling
+  // further behind for the rest of the clip.
+  CHECK(worstLag(*h, 2500000, 5000000) < 34000);
+  CHECK(h->lastShown() >= 7900000);
+  // A step up was tried once the lanes kept up, didn't hold (decoding everything is too slow)
+  // and was undone.
+  CHECK(m.decodeStepUps >= 1);
+  CHECK(m.decodeStepDowns >= m.decodeStepUps + 1);
+}
+
+// Frames shown at or after `from` that aren't keyframes (the fake clips have one a second).
+static int shownBetweenKeyframes(const fake::Harness& h, int64_t from) {
+  int n = 0;
+  for (int64_t pts : h.platform.display->shown) n += pts >= from && pts % 1000000 != 0;
+  return n;
+}
+
+TEST(playback_recovers_from_keyframes_only) {
+  // Nothing is disposable, so the lanes go down to keyframes only. Skipping is paced to the
+  // playhead, so a step back up takes effect within the clip instead of after it.
+  auto h = playStacked(25000, false);
+  MetricsReport m = h->player->metrics();
+  CHECK(m.decodeStepDowns >= 2);
+  CHECK(m.decodeStepUps >= 1);
+  CHECK(shownBetweenKeyframes(*h, 5000000) >= 10);  // full-rate frames again after the step up
+}
+
+TEST(seek_after_stepping_down_shows_its_exact_frame) {
+  fake::Clip c;
+  c.durationUs = 8000000;
+  c.audio = false;
+  c.decodeUs = 25000;
+  c.disposable = true;
+  fake::Harness h(std::vector<fake::Clip>{c, c});
+  CHECK(h.openScene(videoTracks({{{0, 8}}, {{0, 8}}}), OutputDriver::Vsync) == Result::Ok);
+  for (int i = 0; i < 2000 && h.player->state() != State::Ready; ++i) h.run(1);
+  CHECK(h.player->play() == Result::Ok);
+  h.run(3000);
+  CHECK(h.player->metrics().decodeStepDowns >= 1);
+  CHECK(h.player->pause() == Result::Ok);
+  h.run(50);
+  CHECK(h.player->seek(1033333) == Result::Ok);  // a disposable frame: skipped while stepped down
+  h.run(1000);
+  CHECK_EQ(h.listener.seeks.back(), 1033333);
+  const ComposedFrame& f = h.lastComposed();
+  CHECK_EQ(f.layers.size(), size_t(2));
+  for (const ComposedLayer& l : f.layers) CHECK_EQ(l.frame.ptsUs, 1033333);
+}
+
+TEST(export_never_skips_a_frame_on_a_slow_decoder) {
+  fake::Clip c;
+  c.durationUs = 2000000;
+  c.audio = false;
+  c.decodeUs = 25000;
+  c.disposable = true;
+  fake::ExportHarness h({c, c});
+  Scene scene = videoTracks({{{0, 2}}, {{0, 2}}});
+  scene.output = SceneOutput{};
+  CHECK(h.start(scene) == Result::Ok);
+  h.run(20000);
+  CHECK_EQ(h.listener.completed, 1);
+  CHECK_EQ(h.platform.exportSink->video.size(), size_t(60));
+  for (const ComposedFrame& f : h.platform.exportSink->video) {
+    CHECK_EQ(f.layers.size(), size_t(2));
+    for (const ComposedLayer& l : f.layers) CHECK(l.frame.ptsUs <= f.ptsUs && f.ptsUs - l.frame.ptsUs < 33334);
+  }
+  int decoded = 0;
+  for (fake::VideoDecoder* d : h.platform.videoDecoders) decoded += d->decoded;
+  CHECK_EQ(decoded, 120);  // every frame of both clips
+}
+
+TEST(playback_holds_a_late_cut_only_briefly) {
+  // The cuts on the eighth lane have no preroll, and eight lanes keep the decoder busy, so each
+  // cut's first frame comes late. The picture is held for it only up to kMaxHoldUs; past that the
+  // output moves on (without the bound it froze for over a second at each cut).
+  std::vector<std::vector<std::pair<double, double>>> tracks(7, {{0, 6}});
+  tracks.push_back({{0, 2}, {2, 2}, {4, 2}});
+  std::vector<fake::Clip> c = clips(1, 10000000, false);
+  c[0].decodeUs = 3000;
+  c[0].disposable = true;
+  fake::Harness h(c);
+  CHECK(h.openScene(videoTracks(tracks), OutputDriver::Vsync) == Result::Ok);
+  for (int i = 0; i < 3000 && h.player->state() != State::Ready; ++i) h.run(1);
+  CHECK(h.player->play() == Result::Ok);
+  h.run(6500);
+  CHECK_EQ(h.listener.ended, 1);
+  MetricsReport m = h.player->metrics();
+  CHECK(m.holdExpiries >= 1);
+  CHECK(m.decodeStepDowns >= 1);  // an expired hold steps the lanes down at once
+  int64_t gap = 0, prev = -1;
+  for (const ComposedFrame& f : h.platform.display->composed) {
+    if (prev >= 0) gap = std::max(gap, f.ptsUs - prev);
+    prev = f.ptsUs;
+  }
+  CHECK(gap < VsyncDriver::kMaxHoldUs + 100000);
+}
+
+// One 8 s clip with audio (the LeadingClip driver), on a decoder that takes `decodeUs` per frame.
+static std::unique_ptr<fake::Harness> playLeading(int64_t decodeUs, bool disposable) {
+  fake::Clip c;
+  c.durationUs = 8000000;
+  c.decodeUs = decodeUs;
+  c.disposable = disposable;
+  auto h = std::make_unique<fake::Harness>(c);
+  CHECK(h->open() == Result::Ok);
+  for (int i = 0; i < 3000 && h->player->state() != State::Ready; ++i) h->run(1);
+  CHECK(h->player->play() == Result::Ok);
+  h->run(9000);
+  return h;
+}
+
+TEST(leading_clip_decodes_everything_when_the_decoder_keeps_up) {
+  auto h = playLeading(20000, true);  // 30 fps × 20 ms: 60% of the decoder
+  MetricsReport m = h->player->metrics();
+  CHECK_EQ(h->listener.ended, 1);
+  CHECK_EQ(m.decodeStepDowns, 0);
+  CHECK_EQ(m.decodeSkips, 0);
+  CHECK(m.presented >= 230);
+}
+
+TEST(leading_clip_steps_decoding_down_when_the_decoder_falls_behind) {
+  // 30 fps × 50 ms needs 150% of the decoder. Without the ladder, every frame after the first
+  // few is late and dropped, and playback gets no further than 0.2 s in 9 s.
+  for (bool disposable : {true, false}) {
+    auto h = playLeading(50000, disposable);
+    MetricsReport m = h->player->metrics();
+    CHECK_EQ(h->listener.ended, 1);
+    CHECK(m.decodeStepDowns >= 1);
+    CHECK(m.decodeSkips > 0);
+    CHECK(m.decodeStepUps >= 1);
+    CHECK(h->lastShown() >= 7900000);
+    CHECK(shownBetweenKeyframes(*h, 5000000) >= 10);  // stepped back up to more than keyframes
+  }
 }

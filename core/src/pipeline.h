@@ -47,6 +47,12 @@ struct Lane {
   BoundedQueue<Packet> videoPackets{{60, 32u << 20, 2000000}};
   BoundedQueue<Packet> audioPackets{{120, 1u << 20, 2000000}};
   BoundedQueue<VideoFrame> frames{{4}};
+  // Decode rate control (rate_mismatch_buffering.md §9): the step on the decode ladder, set by the
+  // Vsync driver and read by T2; and whether T2 is decoding a video item (from its preroll to its
+  // end of stream), so the driver knows which lanes take part.
+  std::atomic<int> decodeStep{0};
+  std::atomic<bool> decodingVideo{false};
+  std::atomic<int64_t> decodedToUs{-1};  // timeline time of the newest frame T2 handed over (the item's end once drained)
 };
 
 // What an item needs while playing, found by T1 while probing.
@@ -83,6 +89,11 @@ struct Context {
   void setSeekTarget(const PendingSeek& s);
   PendingSeek seekTarget() const;
 
+  // Where live playback is on the timeline: the target while a seek is in flight (until T3 shows
+  // it, the clock and shownPtsUs still describe the position before it), the master clock while
+  // output runs, else the frame on screen.
+  int64_t playheadUs();
+
   PlatformFactory& factory;
   IClock& hostClock;
   PipelineEvents& events;
@@ -116,6 +127,7 @@ struct Context {
 
   MasterClock master{ring};
   Metrics metrics;
+  std::atomic<int> decodeStartStep{0};  // the step a lane's next item starts at (momentum); set by the Vsync driver
 
   std::atomic<uint32_t> serial{0};       // latest seek started by T1
   std::atomic<uint32_t> shownSerial{0};  // latest seek completed by T3

@@ -16,6 +16,8 @@ add_library(mf_core STATIC
   core/src/audio_ring.cpp
   core/src/av_sync.cpp
   core/src/composition.cpp
+  core/src/decode_control.cpp
+  core/src/decode_rate.cpp
   core/src/effects.cpp
   core/src/export_driver.cpp
   core/src/exporter.cpp

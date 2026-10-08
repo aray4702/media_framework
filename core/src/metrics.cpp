@@ -58,6 +58,26 @@ void Metrics::countLateLayer() {
   ++r_.lateLayers;
 }
 
+void Metrics::countDecodeSkip() {
+  std::lock_guard<std::mutex> lock(mu_);
+  ++r_.decodeSkips;
+}
+
+void Metrics::countDecodeStep(bool down) {
+  std::lock_guard<std::mutex> lock(mu_);
+  ++(down ? r_.decodeStepDowns : r_.decodeStepUps);
+}
+
+void Metrics::addDecodeReduced(int64_t us) {
+  std::lock_guard<std::mutex> lock(mu_);
+  r_.decodeReducedUs += us;
+}
+
+void Metrics::countHoldExpiry() {
+  std::lock_guard<std::mutex> lock(mu_);
+  ++r_.holdExpiries;
+}
+
 void Metrics::seekLatency(int64_t ns) {
   std::lock_guard<std::mutex> lock(mu_);
   seek_.add(double(ns) / 1e6);
@@ -123,15 +143,17 @@ MetricsReport Metrics::report() const {
 }
 
 std::string MetricsReport::toString() const {
-  char buf[512];
+  char buf[768];
   std::snprintf(buf, sizeof(buf),
                 "presented=%lld dropped=%.2f%% (late=%lld) rateCapped=%lld hidden=%lld lateLayers=%lld decodeOnly=%lld "
-                "corruptSkips=%lld jank=%.2f%% (%lld/%lld) av mean=%+.1fms |mean|=%.1fms |p95|<=%.0fms (n=%lld) "
+                "corruptSkips=%lld decodeSkips=%lld steps=-%lld/+%lld reduced=%.1fs holdExpiries=%lld "
+                "jank=%.2f%% (%lld/%lld) av mean=%+.1fms |mean|=%.1fms |p95|<=%.0fms (n=%lld) "
                 "ttff=%.0fms seeks=%lld p50<=%.0fms p95<=%.0fms",
                 (long long)presented, droppedRate * 100, (long long)lateDrops, (long long)rateCapDrops,
-                (long long)hiddenDrops, (long long)lateLayers, (long long)decodeOnly, (long long)corruptSkips, jankRate * 100,
-                (long long)janks, (long long)intervals, avMeanMs, avMeanAbsMs, avP95AbsMs, (long long)avSamples, ttffMs,
-                (long long)seeks, seekP50Ms, seekP95Ms);
+                (long long)hiddenDrops, (long long)lateLayers, (long long)decodeOnly, (long long)corruptSkips,
+                (long long)decodeSkips, (long long)decodeStepDowns, (long long)decodeStepUps, double(decodeReducedUs) / 1e6,
+                (long long)holdExpiries, jankRate * 100, (long long)janks, (long long)intervals, avMeanMs, avMeanAbsMs,
+                avP95AbsMs, (long long)avSamples, ttffMs, (long long)seeks, seekP50Ms, seekP95Ms);
   return buf;
 }
 

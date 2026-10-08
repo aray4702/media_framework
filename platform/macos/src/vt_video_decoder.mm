@@ -14,9 +14,9 @@ namespace {
 
 constexpr size_t kMaxInFlight = 4;
 
-// Reorder depth: the H.264 DPB size for the stream's level (the spec's fallback when the SPS
+// Upper bound from the H.264 DPB size for the stream's level (the spec's fallback when the SPS
 // has no max_num_reorder_frames). Baseline profile has no B-frames.
-int reorderDepth(CMVideoFormatDescriptionRef fd) {
+int dpbDepth(CMVideoFormatDescriptionRef fd) {
   CMVideoDimensions dims = CMVideoFormatDescriptionGetDimensions(fd);
   NSDictionary* atoms = (__bridge NSDictionary*)CMFormatDescriptionGetExtension(
       fd, kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms);
@@ -32,6 +32,14 @@ int reorderDepth(CMVideoFormatDescriptionRef fd) {
   if (it == maxDpbMbs.end()) return 16;
   int frameMbs = ((dims.width + 15) / 16) * ((dims.height + 15) / 16);
   return std::max(1, std::min(16, it->second / std::max(1, frameMbs)));
+}
+
+// Reorder depth: the DPB bound, capped by the stream's longest run of B-frames when the demuxer
+// probed it. No picture waits for more than that many later-decoded pictures, and the DPB bound
+// alone can hold a dozen frames back, so an incoming clip would stall on its decode delay.
+int reorderDepth(const TrackInfo& track) {
+  int dpb = dpbDepth(static_cast<CMVideoFormatDescriptionRef>(track.format.get()));
+  return track.maxBFrames >= 0 ? std::min(dpb, track.maxBFrames) : dpb;
 }
 
 class VtVideoDecoder : public IVideoDecoder {
@@ -51,7 +59,7 @@ class VtVideoDecoder : public IVideoDecoder {
     formatHolder_ = track.format;
     format_ = static_cast<CMVideoFormatDescriptionRef>(track.format.get());
     onOutput_ = std::move(onOutput);
-    depth_ = static_cast<size_t>(reorderDepth(format_));
+    depth_ = static_cast<size_t>(reorderDepth(track));
     if (session_ && VTDecompressionSessionCanAcceptFormatDescription(session_, format_)) return Result::Ok;
     destroySession();
     recreated_ = false;
