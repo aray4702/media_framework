@@ -36,6 +36,10 @@ struct Clip {
   std::set<int> corruptFrames;   // video frame indices that fail to decode
   int64_t failDecodeAtUs = -1;   // decoder fails fatally at this pts
   bool failOpen = false;
+  // Every lane's decoder takes this long per frame (the first clip's value), one frame at a time
+  // across all lanes, like one hardware decoder shared by the lanes. 0: frames come out at once.
+  int64_t decodeUs = 0;
+  bool disposable = false;       // odd non-key frames are disposable (nothing references them)
 };
 
 constexpr int kAudioFrames = 1024;
@@ -59,6 +63,7 @@ class Demuxer : public IDemuxer {
       p.track = kVideo;
       p.ptsUs = p.dtsUs = int64_t{i} * 1000000 / clip_.fps;
       p.key = i % clip_.gop == 0;
+      p.disposable = clip_.disposable && !p.key && i % 2 == 1;
       p.data = {uint8_t(clip_.corruptFrames.count(i) ? 0xFF : 0x00)};
       packets_[kVideo].push_back(p);
     }
@@ -117,7 +122,8 @@ class Demuxer : public IDemuxer {
 
 class VideoDecoder : public IVideoDecoder {
  public:
-  explicit VideoDecoder(const Clip& c) : clip_(c) {}
+  // `busyUntil`: when the decode engine shared by every lane's decoder is next free.
+  VideoDecoder(const Clip& c, Clock& clock, int64_t* busyUntil) : clip_(c), clock_(clock), busyUntil_(busyUntil) {}
   Result configure(const TrackInfo&, std::function<void()> onOutput) override {
     onOutput_ = std::move(onOutput);
     out_.clear();
@@ -128,9 +134,11 @@ class VideoDecoder : public IVideoDecoder {
     if (clip_.failDecodeAtUs >= 0 && p.ptsUs >= clip_.failDecodeAtUs) return Result::DecoderFailed;
     if (out_.size() >= 4) return Result::Again;
     if (p.data[0] == 0xFF) return Result::CorruptFrame;
-    VideoFrame f;
-    f.ptsUs = p.ptsUs;
-    f.serial = p.serial;
+    Pending f;
+    f.frame.ptsUs = p.ptsUs;
+    f.frame.serial = p.serial;
+    if (clip_.decodeUs > 0) *busyUntil_ = f.readyNs = std::max(clock_.now, *busyUntil_) + clip_.decodeUs * 1000;
+    ++decoded;
     out_.push_back(f);
     onOutput_();
     return Result::Ok;
@@ -138,7 +146,8 @@ class VideoDecoder : public IVideoDecoder {
   void signalEos() override { eos_ = true; }
   Result dequeue(VideoFrame* out) override {
     if (!out_.empty()) {
-      *out = out_.front();
+      if (out_.front().readyNs > clock_.now) return Result::Again;  // still decoding
+      *out = out_.front().frame;
       out_.pop_front();
       return Result::Ok;
     }
@@ -149,10 +158,18 @@ class VideoDecoder : public IVideoDecoder {
     eos_ = false;
   }
 
+  int decoded = 0;  // frames queued for decoding
+
  private:
+  struct Pending {
+    VideoFrame frame;
+    int64_t readyNs = 0;
+  };
   Clip clip_;
+  Clock& clock_;
+  int64_t* busyUntil_;
   std::function<void()> onOutput_;
-  std::deque<VideoFrame> out_;
+  std::deque<Pending> out_;
   bool eos_ = false;
 };
 
@@ -313,7 +330,11 @@ class Platform : public PlatformFactory {
     return std::make_unique<Demuxer>(clips, clips[demuxers++ % clips.size()]);
   }
   std::unique_ptr<IImageLoader> createImageLoader() override { return std::make_unique<ImageLoader>(); }
-  std::unique_ptr<IVideoDecoder> createVideoDecoder() override { return std::make_unique<VideoDecoder>(clips[0]); }
+  std::unique_ptr<IVideoDecoder> createVideoDecoder() override {
+    auto d = std::make_unique<VideoDecoder>(clips[0], clock_, &decodeBusyUntilNs);
+    videoDecoders.push_back(d.get());
+    return d;
+  }
   std::unique_ptr<IAudioDecoder> createAudioDecoder() override { return std::make_unique<AudioDecoder>(); }
   std::unique_ptr<ISpeaker> createSpeaker() override {
     auto s = std::make_unique<Speaker>();
@@ -344,6 +365,8 @@ class Platform : public PlatformFactory {
   ExportSink* exportSink = nullptr;
   std::vector<Clip> clips;
   size_t demuxers = 0;
+  std::vector<VideoDecoder*> videoDecoders;  // one per lane, in lane order
+  int64_t decodeBusyUntilNs = 0;
   Clock& clockRef() { return clock_; }
   Display* display = nullptr;
   Speaker* speaker = nullptr;

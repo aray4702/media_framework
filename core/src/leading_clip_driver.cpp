@@ -25,8 +25,23 @@ Progress LeadingClipDriver::step(FrameSampler& s, CompositionOutput& out) {
   int item = s.head(next)->item;
   s.take(next);
   const VideoFrame* taken = s.frameOf(item);
-  if (taken && s.timeOf(*taken) == t && item == s.leadItem(t)) out.emit(s.composeAt(t));
+  if (taken && s.timeOf(*taken) == t && item == s.leadItem(t)) {
+    adaptDecode(s, item, t);
+    out.emit(s.composeAt(t));
+  }
   return Progress::did();
+}
+
+// One tick of the decode rate control per output frame, at the master clock's time: the leading
+// item's lane is behind when the frame's time has already passed. Frames composed ahead of the
+// clock (while paused, or with a lead in the queues) are on time.
+void LeadingClipDriver::adaptDecode(FrameSampler& s, int item, int64_t t) {
+  int64_t playheadUs = ctx_.master.nowUs(ctx_.hostClock.nowNs());
+  std::vector<int> visible(size_t(s.lanes()), -1);
+  std::vector<bool> behind(size_t(s.lanes()), false);
+  for (int i : s.videoAt(t)) visible[size_t(ctx_.layout.laneOf(i))] = i;
+  behind[size_t(ctx_.layout.laneOf(item))] = t < playheadUs;
+  control_.tick(ctx_, playheadUs, visible, behind, false);
 }
 
 }  // namespace mf

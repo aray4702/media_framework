@@ -41,8 +41,12 @@ class SourceStage : public Stage {
         return Progress::did();
       }
     }
-    if (advanceLanes()) return Progress::did();
-    return readOne();
+    int64_t nowUs = playbackUs();
+    if (beginEligible(nowUs)) return Progress::did();
+    if (advanceLanes(nowUs)) return Progress::did();
+    Progress read = readOne();
+    if (read.kind != Progress::Kind::Idle) return read;
+    return waitForPreroll(nowUs);
   }
 
  private:
@@ -53,12 +57,36 @@ class SourceStage : public Stage {
   struct LaneRead {
     int pos = kNoItem;  // position in layout.laneItems(lane)
     bool eos[2] = {true, true};
+    bool begun = false;
+    bool startup = false;  // give a newly eligible item's video packets priority until its queue is full
   };
 
   const SceneLayout& layout() const { return ctx_.layout; }
   int itemAt(int li) const {
     const std::vector<int>& list = layout().laneItems(li);
     return reads_[li].pos < int(list.size()) ? list[reads_[li].pos] : -1;
+  }
+
+  int64_t prerollStart(int i) const { return std::max<int64_t>(0, layout().item(i).startUs - SceneLayout::kPrerollUs); }
+
+  // The source must be driven by timeline time, not the wall time at which open() happened.
+  int64_t playbackUs() const {
+    // Export is demand-driven by its fixed-grid composition driver, not a running presentation
+    // clock.  It must make every item eligible so ExportDriver can wait for its exact frame.
+    if (ctx_.driver == Driver::Export) return layout().durationUs();
+    return ctx_.playheadUs();
+  }
+
+  // Where an eligible item starts: its own start, or the playhead once that has passed it.  In
+  // export, nowUs only opens the preroll windows; it is not a playhead, and no frame may be skipped.
+  int64_t startPositionUs(int i, int64_t nowUs) const {
+    int64_t start = layout().item(i).startUs;
+    return ctx_.driver == Driver::Export ? start : std::max(start, nowUs);
+  }
+
+  bool outputRunning() const {
+    std::lock_guard<std::mutex> lock(ctx_.playMu);
+    return ctx_.outputRunning;
   }
 
   // Items with duration 0 play to the end of their file: their files are opened first, so the
@@ -205,8 +233,8 @@ class SourceStage : public Stage {
     ctx_.requestSeek(std::min<int64_t>(ctx_.startUs, std::max<int64_t>(0, ctx_.durationUs - 1)));
   }
 
-  // Each lane starts at its first item that hasn't ended by the target: the one playing, or
-  // the next one, which is read ahead.
+  // Each lane is positioned at the first item that has not ended by the seek.  It is started
+  // only once that item's own preroll window is reached.
   void startSeek(PendingSeek seek) {
     for (auto& lane : ctx_.lanes) {
       lane->videoPackets.flush();
@@ -219,7 +247,7 @@ class SourceStage : public Stage {
       while (pos < int(list.size()) && layout().item(list[pos]).endUs() <= seek.targetUs) ++pos;
       reads_[li] = LaneRead{};
       reads_[li].pos = seek.lanePos[li] = pos;
-      if (pos < int(list.size()) && !begin(li, seek.targetUs)) return;
+      if (pos < int(list.size()) && seek.targetUs >= prerollStart(itemAt(li)) && !begin(li, seek.targetUs)) return;
     }
     ctx_.setSeekTarget(seek);
     serial_ = ctx_.serial + 1;
@@ -238,17 +266,30 @@ class SourceStage : public Stage {
     }
     reads_[li].eos[kVideo] = layout().item(i).type != ItemType::Video;
     reads_[li].eos[kAudio] = !rt.info.audio;  // read (and maybe drop) audio when the file has it
+    reads_[li].begun = true;
+    reads_[li].startup = layout().item(i).type == ItemType::Video;
     return true;
   }
 
+  // Start every pending item whose own preroll window has arrived.  Returning after one keeps
+  // a pump non-blocking and lets the scheduler interleave the other stages.
+  bool beginEligible(int64_t nowUs) {
+    for (int li = 0; li < layout().lanes(); ++li) {
+      if (reads_[li].begun || itemAt(li) < 0 || nowUs < prerollStart(itemAt(li))) continue;
+      return begin(li, startPositionUs(itemAt(li), nowUs));
+    }
+    return false;
+  }
+
   // A lane whose item is fully read moves on to its next item.
-  bool advanceLanes() {
+  bool advanceLanes(int64_t nowUs) {
     for (int li = 0; li < layout().lanes(); ++li) {
       LaneRead& lane = reads_[li];
-      if (itemAt(li) < 0 || !lane.eos[kVideo] || !lane.eos[kAudio]) continue;
+      if (!lane.begun || itemAt(li) < 0 || !lane.eos[kVideo] || !lane.eos[kAudio]) continue;
       ++lane.pos;
+      lane.begun = lane.startup = false;
       int i = itemAt(li);
-      if (i >= 0) begin(li, layout().item(i).startUs);
+      if (i >= 0 && nowUs >= prerollStart(i)) begin(li, startPositionUs(i, nowUs));
       return true;
     }
     return false;
@@ -261,11 +302,21 @@ class SourceStage : public Stage {
   }
 
   Progress readOne() {
+    // A newly eligible video must fill its packet queue before ordinary look-ahead work.  This
+    // gives its decoder the full preroll interval even when other lanes have earlier DTSes.
+    int startupLane = -1;
+    for (int li = 0; li < layout().lanes(); ++li) {
+      int i = itemAt(li);
+      if (!reads_[li].begun || !reads_[li].startup || i < 0 || reads_[li].eos[kVideo] || ctx_.lanes[li]->videoPackets.full()) continue;
+      if (startupLane < 0 || layout().item(i).startUs < layout().item(itemAt(startupLane)).startUs) startupLane = li;
+    }
+    if (startupLane >= 0) return read(startupLane, kVideo);
+
     int bestLane = -1, bestTrack = kVideo;
     int64_t bestDts = 0;
     for (int li = 0; li < layout().lanes(); ++li) {
       int i = itemAt(li);
-      if (i < 0) continue;
+      if (!reads_[li].begun || i < 0) continue;
       for (int track : {kVideo, kAudio}) {
         if (reads_[li].eos[track]) continue;
         BoundedQueue<Packet>* q = queueFor(li, track);
@@ -291,11 +342,15 @@ class SourceStage : public Stage {
     }
     if (bestLane < 0) return Progress::idle();  // queues full or every lane ended
 
-    int i = itemAt(bestLane);
+    return read(bestLane, bestTrack);
+  }
+
+  Progress read(int li, int track) {
+    int i = itemAt(li);
     Packet p;
-    Result r = ctx_.items[i].demuxer->read(bestTrack, &p);
+    Result r = ctx_.items[i].demuxer->read(track, &p);
     if (r == Result::Eos) {
-      pushEos(bestLane, bestTrack);
+      pushEos(li, track);
       return Progress::did();
     }
     if (r != Result::Ok || p.data.size() > kMaxSampleBytes) {
@@ -304,9 +359,20 @@ class SourceStage : public Stage {
     }
     p.serial = serial_;
     p.item = i;
-    bool keep = bestTrack == kVideo || ctx_.items[i].mixAudio;
-    if (BoundedQueue<Packet>* q = queueFor(bestLane, bestTrack); q && keep) q->tryPush(p);  // has room: checked above
+    bool keep = track == kVideo || ctx_.items[i].mixAudio;
+    if (BoundedQueue<Packet>* q = queueFor(li, track); q && keep) q->tryPush(p);  // has room: checked above
     return Progress::did();
+  }
+
+  Progress waitForPreroll(int64_t nowUs) const {
+    if (!outputRunning()) return Progress::idle();
+    int64_t next = kNever;
+    for (int li = 0; li < layout().lanes(); ++li) {
+      if (!reads_[li].begun && itemAt(li) >= 0) next = std::min(next, prerollStart(itemAt(li)));
+    }
+    if (next == kNever) return Progress::idle();
+    if (next <= nowUs) return Progress::did();
+    return Progress::waitUntil(ctx_.hostClock.nowNs() + (next - nowUs) * 1000);
   }
 
   // The end of an item's track, so T2 (video) or T4 (mixed audio) knows the lane moved on.
@@ -342,8 +408,11 @@ class VideoDecodeStage : public Stage {
     if (ctx_.halted || !ctx_.probed) return Progress::idle();
     if (lanes_.size() != ctx_.lanes.size()) lanes_.resize(ctx_.lanes.size());
     bool did = false;
+    wakeNs_ = kNever;
     for (size_t li = 0; li < lanes_.size() && !ctx_.halted; ++li) did |= pumpLane(lanes_[li], *ctx_.lanes[li]);
-    return did && !ctx_.halted ? Progress::did() : Progress::idle();
+    if (ctx_.halted) return Progress::idle();
+    if (did) return Progress::did();
+    return wakeNs_ != kNever ? Progress::waitUntil(wakeNs_) : Progress::idle();
   }
 
  private:
@@ -354,6 +423,10 @@ class VideoDecodeStage : public Stage {
     std::optional<Packet> input;
     std::optional<VideoFrame> output;
     bool skipToKey = false, eosSent = false;
+    bool keyOnly = false;  // decode ladder step 2: keyframes only, until the keyframe after it ends
+    bool skippedSinceKey = false;  // a frame was skipped after the last keyframe decoded (its references are broken)
+    bool atSeek = true;    // no packet of this serial handled yet
+    int inDecoder = 0;     // packets queued whose frame hasn't come out yet
   };
 
   bool pumpLane(LaneState& st, Lane& lane) {
@@ -363,8 +436,12 @@ class VideoDecodeStage : public Stage {
       lane.videoDecoder->flush();
       st.input.reset();
       st.output.reset();
-      st.skipToKey = st.eosSent = false;
-      st.drained = true;
+      st.skipToKey = st.eosSent = st.keyOnly = st.skippedSinceKey = false;
+      st.drained = st.atSeek = true;
+      st.inDecoder = 0;
+      lane.decodeStep = 0;  // a seek decodes its target exactly; the ladder starts again from the bottom
+      lane.decodingVideo = false;
+      lane.decodedToUs = -1;
     }
     bool did = drainOutput(st, lane);
     did |= feedInput(st, lane);
@@ -381,11 +458,13 @@ class VideoDecodeStage : public Stage {
             f.item = st.item;
             st.output = std::move(f);
           }
+          st.inDecoder = std::max(0, st.inDecoder - 1);
           did = true;
           break;
         case Result::Eos:
           if (!st.eosSent) {
             st.eosSent = st.drained = true;
+            lane.decodingVideo = false;
             st.output = VideoFrame{};
             st.output->eos = true;
             st.output->serial = st.serial;
@@ -395,6 +474,7 @@ class VideoDecodeStage : public Stage {
         case Result::CorruptFrame:  // hold the last good frame; skip to the next keyframe (A14)
           ctx_.metrics.countCorrupt();
           st.skipToKey = true;
+          st.inDecoder = std::max(0, st.inDecoder - 1);
           did = true;
           break;
         case Result::Again:
@@ -405,6 +485,10 @@ class VideoDecodeStage : public Stage {
       }
     }
     if (st.output && lane.frames.tryPush(*st.output)) {
+      // How far ahead the lane has decoded, for the decode rate control: the item's end once drained.
+      const SceneLayout& layout = ctx_.layout;
+      int item = st.output->item;
+      lane.decodedToUs = st.output->eos ? layout.item(item).endUs() : layout.timelineUs(item, st.output->ptsUs);
       st.output.reset();
       did = true;
     }
@@ -428,8 +512,12 @@ class VideoDecodeStage : public Stage {
         return false;
       }
       st.item = st.input->item;
-      st.skipToKey = st.eosSent = false;
+      st.skipToKey = st.eosSent = st.keyOnly = st.skippedSinceKey = false;
+      st.inDecoder = 0;
+      // A new item starts at the lanes' recent level (momentum), except the one a seek lands in.
+      lane.decodeStep = st.atSeek ? 0 : ctx_.decodeStartStep.load();
     }
+    st.atSeek = false;
     if (st.input->eos) {
       lane.videoDecoder->signalEos();
       st.input.reset();
@@ -440,9 +528,21 @@ class VideoDecodeStage : public Stage {
       st.input.reset();
       return true;
     }
+    switch (stepAction(st, lane, *st.input)) {
+      case StepAction::Decode:
+        break;
+      case StepAction::Skip:
+        ctx_.metrics.countDecodeSkip();
+        st.input.reset();
+        return true;
+      case StepAction::Wait:  // the frame queue's space, or the decoder's output, wakes us
+        return did;
+    }
     switch (lane.videoDecoder->queue(*st.input)) {
       case Result::Ok:
         st.skipToKey = st.drained = false;
+        ++st.inDecoder;
+        lane.decodingVideo = true;
         st.input.reset();
         return true;
       case Result::Again:  // decoder full; its output callback wakes us
@@ -459,8 +559,42 @@ class VideoDecodeStage : public Stage {
     }
   }
 
+  // The decode ladder (rate_mismatch_buffering.md §9.3), applied before the decoder so a skipped
+  // frame costs nothing. Step 1 skips disposable frames. Step 2 decodes keyframes only, from the
+  // first packet at that step until the lane leaves it: at once if nothing was skipped since the
+  // last keyframe decoded (the lane was waiting on the playhead), else at the next keyframe. Skipping is free, so at
+  // step 2 it would race to the item's end and leave no frames for a step back up to apply to: it
+  // moves on to the next keyframe only once the decoder is empty and the lane has decoded less
+  // than kKeyframeLeadUs past the playhead. A wait for the playhead is timed (wakeNs_); one for the
+  // decoder is woken by its output.
+  static constexpr int64_t kKeyframeLeadUs = 1000000;
+  enum class StepAction { Decode, Skip, Wait };
+  StepAction stepAction(LaneState& st, const Lane& lane, const Packet& p) {
+    int step = lane.decodeStep.load();
+    if (step >= 2) {
+      st.keyOnly = true;
+    } else if (st.keyOnly && (p.key || !st.skippedSinceKey)) {
+      st.keyOnly = false;
+    }
+    if (p.key) st.skippedSinceKey = false;
+    if (st.keyOnly && !p.key) {
+      if (st.inDecoder > 0 || st.output) return StepAction::Wait;
+      int64_t lead = lane.decodedToUs.load() - ctx_.playheadUs();
+      if (lead < kKeyframeLeadUs) {
+        st.skippedSinceKey = true;
+        return StepAction::Skip;
+      }
+      // Re-checked at least every 100 ms: the clock may be paused or holding.
+      int64_t now = ctx_.hostClock.nowNs();
+      wakeNs_ = std::min(wakeNs_, now + std::min((lead - kKeyframeLeadUs) * 1000 + kMs, 100 * kMs));
+      return StepAction::Wait;
+    }
+    return !st.keyOnly && step >= 1 && p.disposable ? StepAction::Skip : StepAction::Decode;
+  }
+
   Context& ctx_;
   std::vector<LaneState> lanes_;
+  int64_t wakeNs_ = kNever;  // this pump: when a lane waiting on the playhead should look again
 };
 
 // ---------------------------------------------------------------------------------------
@@ -529,7 +663,10 @@ class VideoRenderStage : public Stage {
       outputRunning_ = ctx_.outputRunning;
     }
     if (failed) ctx_.fatal(Result::AudioDeviceFailed, "audio output failed to start");
-    if (started && ctx_.driver == Driver::Vsync) ctx_.wake(StageId::Composition);  // it composes only while running
+    if (started) {
+      ctx_.wake(StageId::Source);  // pending items use the running master clock for their preroll deadline
+      if (ctx_.driver == Driver::Vsync) ctx_.wake(StageId::Composition);  // it composes only while running
+    }
   }
 
   // While paused nothing new is presented, so a filter change redraws the frame on screen.
@@ -575,7 +712,7 @@ class VideoRenderStage : public Stage {
   void complete(const ComposedFrame* frame) {
     PendingSeek target = ctx_.seekTarget();
     int64_t now = ctx_.hostClock.nowNs();
-    int64_t shown = ctx_.shownPtsUs;
+    int64_t shown = target.targetUs;  // nothing to show: the playhead is still where the seek went
     if (frame) {
       present(*frame, now);
       shown = frame->ptsUs;
@@ -1025,6 +1162,13 @@ std::optional<PendingSeek> Context::takeSeek() {
 void Context::setSeekTarget(const PendingSeek& s) {
   std::lock_guard<std::mutex> lock(seekMu_);
   target_ = s;
+}
+
+int64_t Context::playheadUs() {
+  if (shownSerial != serial) return seekTarget().targetUs;
+  int64_t now = hostClock.nowNs();
+  std::lock_guard<std::mutex> lock(playMu);
+  return outputRunning ? master.nowUs(now) : shownPtsUs.load();
 }
 
 PendingSeek Context::seekTarget() const {

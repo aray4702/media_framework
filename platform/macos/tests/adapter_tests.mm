@@ -31,8 +31,10 @@ static int failures = 0;
   } while (0)
 
 // Decodes every video packet from the demuxer's current position; returns frame PTS in output
-// order. Frames that fail to decode (damaged clips) are counted in *corrupt.
-static std::vector<int64_t> decodeAllVideo(IDemuxer& demuxer, IVideoDecoder& decoder, int* packets, int* corrupt) {
+// order. Frames that fail to decode (damaged clips) are counted in *corrupt. With *skipped, packets
+// marked disposable are left out, as the decode ladder does, and counted there.
+static std::vector<int64_t> decodeAllVideo(IDemuxer& demuxer, IVideoDecoder& decoder, int* packets, int* corrupt,
+                                           int* skipped = nullptr) {
   std::vector<int64_t> pts;
   *packets = *corrupt = 0;
   bool inputDone = false;
@@ -44,6 +46,8 @@ static std::vector<int64_t> decodeAllVideo(IDemuxer& demuxer, IVideoDecoder& dec
       if (r == Result::Eos) {
         decoder.signalEos();
         inputDone = true;
+      } else if (skipped && p.disposable) {
+        ++*skipped;
       } else {
         CHECK(r == Result::Ok);
         Result q;
@@ -428,6 +432,26 @@ int main(int argc, char** argv) {
   bool video = info.video.width > 0;  // an audio-only file has no video to check
   CHECK(video || info.audio);
 
+  // The B-frame run probed from the sample table matches the packets as read, in decode order.
+  if (video) {
+    auto reader = macos::createDemuxer();
+    MediaInfo again;
+    CHECK(reader->open(macos::sourceFromPath(argv[1]), &again) == Result::Ok);
+    int64_t latest = INT64_MIN;
+    int run = 0, longest = 0;
+    Packet p;
+    while (reader->read(kVideo, &p) == Result::Ok) {
+      if (p.ptsUs < latest) {
+        longest = std::max(longest, ++run);
+      } else {
+        run = 0;
+        latest = p.ptsUs;
+      }
+    }
+    std::fprintf(stderr, "B-frames: longest run %d probed, %d read\n", info.video.maxBFrames, longest);
+    CHECK(info.video.maxBFrames == longest);
+  }
+
   // All frames come out, in strictly increasing PTS order.
   if (video) {
   auto decoder = macos::createVideoDecoder();
@@ -438,6 +462,22 @@ int main(int argc, char** argv) {
   CHECK(packets > 0);
   CHECK(int(pts.size()) + corrupt == packets);
   for (size_t i = 1; i < pts.size(); ++i) CHECK(pts[i] > pts[i - 1]);
+
+  // Skipping the disposable frames (decode ladder step 1) corrupts none of the others, and they
+  // still come out in order. Without B-frames, nothing is disposable here.
+  {
+    CHECK(demuxer->seekTo(0) == Result::Ok);
+    auto skipping = macos::createVideoDecoder();
+    CHECK(skipping->configure(info.video, [] {}) == Result::Ok);
+    int kept = 0, failed = 0, skipped = 0;
+    std::vector<int64_t> shown = decodeAllVideo(*demuxer, *skipping, &kept, &failed, &skipped);
+    std::fprintf(stderr, "skipping disposable: %d skipped, %d decoded, %zu frames, %d failed\n", skipped, kept, shown.size(),
+                 failed);
+    CHECK(failed <= corrupt);  // skipping never damages a frame; it may leave damaged ones out
+    CHECK(int(shown.size()) + failed == kept && kept + skipped == packets);
+    for (size_t i = 1; i < shown.size(); ++i) CHECK(shown[i] > shown[i - 1]);
+    if (info.video.maxBFrames == 0) CHECK(skipped == 0);
+  }
 
   // Seek lands on a keyframe at or before the target.
   int64_t target = info.durationUs / 2;

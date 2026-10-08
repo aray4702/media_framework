@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 
 namespace mf {
 
@@ -26,35 +27,50 @@ bool SceneLayout::build(const Scene& scene, std::string* error) {
     }
   }
 
-  // Greedy interval coloring: the fewest lanes such that items sharing one never overlap.
+  // Greedy interval coloring in start order. An item gets a lane that is free kPrerollUs before
+  // its start, adding one while fewer than kMaxLanes exist. Adding a lane for preroll never makes
+  // a later item run out: a lane is held only until its item ends, so when an item starts, the
+  // lanes still held belong to items playing at that moment. With at most kMaxLanes playing at
+  // once, one is free. Only when every lane is held through the preroll window does the item
+  // go without: it takes the lane that frees up first by its start, and its decoder starts once
+  // that lane's previous item has drained.
   std::vector<int> order;
   for (int i = 0; i < items(); ++i) {
     if (decodable(i)) order.push_back(i);
   }
   std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return item(a).startUs < item(b).startUs; });
-  for (int64_t margin : {kPrerollUs, int64_t{0}}) {
-    lane_.assign(items(), -1);
-    laneItems_.clear();
-    std::vector<int64_t> laneEnd;
-    for (int i : order) {
-      int64_t from = item(i).startUs - margin;
-      int lane = -1;
-      for (int l = 0; l < int(laneEnd.size()) && lane < 0; ++l) {
-        if (laneEnd[l] <= from) lane = l;
-      }
-      if (lane < 0) {
-        lane = int(laneEnd.size());
-        laneEnd.push_back(0);
-        laneItems_.emplace_back();
-      }
-      lane_[i] = lane;
-      laneEnd[lane] = item(i).endUs();
-      laneItems_[lane].push_back(i);
+  lane_.assign(items(), -1);
+  laneItems_.clear();
+  std::vector<int64_t> laneEnd;
+  for (int i : order) {
+    int64_t start = item(i).startUs, from = std::max<int64_t>(0, start - kPrerollUs);
+    int lane = -1;
+    for (int l = 0; l < int(laneEnd.size()) && lane < 0; ++l) {
+      if (laneEnd[l] <= from) lane = l;
     }
-    if (lanes() <= kMaxLanes) return true;
+    if (lane < 0 && int(laneEnd.size()) < kMaxLanes) {
+      lane = int(laneEnd.size());
+      laneEnd.push_back(0);
+      laneItems_.emplace_back();
+    }
+    if (lane < 0) {  // no full preroll: the lane that frees up first by the start
+      for (int l = 0; l < int(laneEnd.size()); ++l) {
+        if (laneEnd[l] <= start && (lane < 0 || laneEnd[l] < laneEnd[lane])) lane = l;
+      }
+    }
+    if (lane < 0) {
+      const SceneItem& failed = item(i);
+      const char* type = failed.type == ItemType::Video ? "video" : "audio";
+      std::fprintf(stderr, "[mf] warning: cannot allocate decoder lane for %s item '%s' (more than %d play at once)\n", type,
+                   failed.id.empty() ? "<unnamed>" : failed.id.c_str(), kMaxLanes);
+      if (error) *error = "more than " + std::to_string(kMaxLanes) + " video and audio items play at the same time (R11)";
+      return false;
+    }
+    lane_[i] = lane;
+    laneEnd[lane] = item(i).endUs();
+    laneItems_[lane].push_back(i);
   }
-  if (error) *error = "more than " + std::to_string(kMaxLanes) + " video and audio items play at the same time (R11)";
-  return false;
+  return true;
 }
 
 int64_t SceneLayout::mediaUs(int i, int64_t t) const {

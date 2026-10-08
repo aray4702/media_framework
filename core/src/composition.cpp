@@ -315,7 +315,7 @@ class CompositionStage : public Stage, private CompositionOutput {
  private:
   std::unique_ptr<CompositionDriver> makeDriver() {
     switch (ctx_.driver) {
-      case Driver::LeadingClip: return std::make_unique<LeadingClipDriver>();
+      case Driver::LeadingClip: return std::make_unique<LeadingClipDriver>(ctx_);
       case Driver::Vsync: return std::make_unique<VsyncDriver>(ctx_);
       case Driver::Export: return std::make_unique<ExportDriver>(ctx_.fpsNum, ctx_.fpsDen);
     }
@@ -397,7 +397,11 @@ class CompositionStage : public Stage, private CompositionOutput {
     bool missingVideo = false;
     for (int i : s.videoAt(at)) missingVideo |= !s.frameOf(i);
     if (missingVideo && out.layers.empty()) {
-      if (!s.done()) return Progress::idle();  // nothing decoded yet, even when scrubbing
+      // Wait only for the missing videos' own lanes, not every lane: T1 doesn't read a lane whose
+      // next item's preroll is after the target until playback reaches it, so it may never end.
+      for (int i : s.videoAt(at)) {
+        if (!s.frameOf(i) && s.mayDeliver(i)) return Progress::idle();  // nothing decoded yet, even when scrubbing
+      }
       setSeeking(false);
       finish();  // nothing to show: the seek completes without a frame (A5)
       return Progress::did();

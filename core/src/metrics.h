@@ -33,6 +33,10 @@ class Metrics {
   void countDecodeOnly();
   void countCorrupt();
   void countLateLayer();
+  void countDecodeSkip();
+  void countDecodeStep(bool down);
+  void addDecodeReduced(int64_t us);
+  void countHoldExpiry();
   void seekLatency(int64_t ns);
 
   // A playback frame was handed to the display with this vsync slot.

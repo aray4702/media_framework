@@ -10,6 +10,9 @@ constexpr int64_t kMs = 1000000;  // ns
 void VsyncDriver::restart() {
   nextSlotNs_ = gridNs_ = 0;
   last_.reset();
+  hold_.assign(size_t(ctx_.layout.items()), Hold::None);
+  holdSinceUs_.assign(size_t(ctx_.layout.items()), 0);
+  control_.restart();
 }
 
 Progress VsyncDriver::step(FrameSampler& s, CompositionOutput& out) {
@@ -39,10 +42,42 @@ Progress VsyncDriver::step(FrameSampler& s, CompositionOutput& out) {
     return Progress::did();
   }
   s.advanceAll(t);
+  bool holdComposition = false, holdExpired = false;
+  std::vector<int> visible(size_t(s.lanes()), -1);  // per lane: its visible video item
+  std::vector<bool> behind(size_t(s.lanes()), false);
   for (int i : s.videoAt(t)) {
     const VideoFrame* f = s.frameOf(i);
-    if (!s.exactAt(i, t) && f && s.timeOf(*f) + ctx_.items[i].info.video.frameDurationUs <= t) ctx_.metrics.countLateLayer();
+    bool exact = s.exactAt(i, t);
+    size_t li = size_t(ctx_.layout.laneOf(i));
+    visible[li] = i;
+    behind[li] = behind[li] || !exact;
+    // A frame arriving after its item's deadline may be much older than the playhead.  Once an
+    // item has missed its first visible frame, wait until the sampler has consumed all frames
+    // through t (its next frame is after t) before replacing the previous complete picture.
+    // An item that is exact without a frame will never get one for t (its first frame is later,
+    // or none decodes): it never holds the other layers.  Nor does one held for kMaxHoldUs: its
+    // late frames are shown until it catches up.
+    Hold& h = hold_[size_t(i)];
+    if (exact) {
+      h = Hold::None;
+    } else if (h == Hold::None && !f) {
+      h = Hold::Holding;
+      holdSinceUs_[size_t(i)] = t;
+    }
+    if (h == Hold::Holding) {
+      if (t - holdSinceUs_[size_t(i)] < kMaxHoldUs) {
+        holdComposition = true;
+      } else {
+        h = Hold::Expired;
+        holdExpired = true;
+        ctx_.metrics.countHoldExpiry();
+      }
+    }
+    if (!exact && f && s.timeOf(*f) + ctx_.items[i].info.video.frameDurationUs <= t) ctx_.metrics.countLateLayer();
   }
+  control_.tick(ctx_, t, visible, behind, holdExpired);
+  // A genuine gap has no visible video and still composes the output background normally.
+  if (holdComposition) return Progress::did();
   ComposedFrame frame = s.composeAt(t);
   frame.presentAtNs = slot;
   if (unchanged(frame)) return Progress::did();  // the frame on screen stays

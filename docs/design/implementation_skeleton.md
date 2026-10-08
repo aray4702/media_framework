@@ -463,7 +463,7 @@ reset(pts, serial): baseUs = pts; useAudio = hasAudio        (after each seek)
 ### Layout ([layout.cpp](../../core/src/layout.cpp))
 
 - **Items** of enabled tracks are numbered in track order, then item order.
-- **Lanes:** video and audio items are sorted by start and coloured greedily, so items sharing a lane never overlap. Each item's interval is first widened by 1 s of preroll, so its decoder can start before it plays; if that needs more than 8 lanes it retries without the margin, and fails above 8.
+- **Lanes:** video and audio items are sorted by start and coloured greedily, so items sharing a lane never overlap. Each item takes a lane free 2 s before its start (its preroll), adding a lane while fewer than 8 exist; when every lane is held through that window it takes the lane that frees up first by its start, without full preroll. It fails only when more than 8 items play at once.
 - **`visibleAt(t)`:** per enabled video track, bottom to top, the item playing at t, or both items of a transition with their offset (push, slide), clip rect (wipe) or fades (crossfade: `1 − p` and `p`, summed), eased.
 - **Groups (`composeAt`):** a track whose pair is visible, or that has effects, becomes a `ComposedGroup` (track opacity, top item's blend, track effects at scene time). Its layers carry only their own opacity, and blend `Normal` (B over A) or `Add` (crossfade). Any other track's layer carries the track opacity and its item's blend, and is drawn onto the canvas directly.
 - **`transitionGain(i, t)`:** fade in and out over the item's transitions (equal gain, equal power or cut).
@@ -612,5 +612,5 @@ These caps bound both memory and latency:
   - the decoder flush never waits for in-flight frames;
   - a new AVAssetReader starts at the sync sample;
   - scrubbing shows intermediate frames without decoding up to the target.
-- Lanes are assigned with 1 s of preroll, so an item's decoder usually starts before the item is visible.
+- Lanes are assigned with 2 s of preroll where the 8-lane limit allows, so an item's decoder usually starts before the item is visible.
 - Thread priority: T3 and T4 run at USER_INTERACTIVE QoS; T1, T2 and TC at USER_INITIATED.

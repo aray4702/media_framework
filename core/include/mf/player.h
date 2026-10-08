@@ -12,6 +12,9 @@ struct MetricsReport {
   int64_t presented = 0, lateDrops = 0, rateCapDrops = 0, hiddenDrops = 0;
   int64_t lateLayers = 0;  // Vsync driver: a layer showed an older frame because its decode was behind
   int64_t decodeOnly = 0, corruptSkips = 0;
+  // Decode rate control (Vsync driver): packets skipped on the decode ladder, its steps down and
+  // up, the timeline time with some lane above step 0, and holds of a late layer cut short.
+  int64_t decodeSkips = 0, decodeStepDowns = 0, decodeStepUps = 0, decodeReducedUs = 0, holdExpiries = 0;
   int64_t intervals = 0, janks = 0;
   double droppedRate = 0, jankRate = 0;
   int64_t avSamples = 0;

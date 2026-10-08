@@ -2,6 +2,7 @@
 
 #import <AVFoundation/AVFoundation.h>
 
+#include <algorithm>
 #include <deque>
 
 #include "mf/macos.h"
@@ -23,6 +24,60 @@ bool isSync(CMSampleBufferRef sb, CMItemCount index) {
   CFIndex i = CFArrayGetCount(attachments) > index ? index : 0;
   auto dict = static_cast<CFDictionaryRef>(CFArrayGetValueAtIndex(attachments, i));
   return !CFDictionaryContainsKey(dict, kCMSampleAttachmentKey_NotSync);
+}
+
+// No other sample references this one, so it can be skipped without corrupting any (the decode
+// ladder, rate_mismatch_buffering.md §9). From the sample's dependency attachment when the file
+// has one; otherwise from the H.264 slices: every slice with nal_ref_idc 0. `lengthSize`: the
+// size of each NAL unit's length prefix, from avcC (0: not H.264, never disposable).
+bool isDisposable(CMSampleBufferRef sb, CMItemCount index, const uint8_t* data, size_t size, int lengthSize) {
+  CFArrayRef attachments = CMSampleBufferGetSampleAttachmentsArray(sb, false);
+  if (attachments && CFArrayGetCount(attachments) > 0) {
+    CFIndex i = CFArrayGetCount(attachments) > index ? index : 0;
+    auto dict = static_cast<CFDictionaryRef>(CFArrayGetValueAtIndex(attachments, i));
+    CFTypeRef dependedOn = CFDictionaryGetValue(dict, kCMSampleAttachmentKey_IsDependedOnByOthers);
+    if (dependedOn) return dependedOn == kCFBooleanFalse;
+  }
+  if (lengthSize == 0) return false;
+  bool slice = false;
+  for (size_t at = 0; at + size_t(lengthSize) < size;) {
+    size_t length = 0;
+    for (int k = 0; k < lengthSize; ++k) length = length << 8 | data[at + size_t(k)];
+    at += size_t(lengthSize);
+    if (length == 0 || at + length > size) return false;  // malformed: keep it
+    uint8_t header = data[at];
+    int type = header & 0x1f;
+    if (type == 1 || type == 5) {  // a slice
+      if (header & 0x60) return false;  // nal_ref_idc != 0: referenced
+      slice = true;
+    }
+    at += length;
+  }
+  return slice;
+}
+
+// The longest run of B-frames: consecutive samples, in decode order, shown before a sample decoded
+// earlier. Read from the sample table without decoding; a long file is sampled from its start.
+// No picture waits for more pictures than that to be reordered, so it bounds the decoder's delay.
+constexpr int kBFrameProbeSamples = 5000;
+
+int longestBFrameRun(AVAssetTrack* track) {
+  if (!track.canProvideSampleCursors) return -1;
+  AVSampleCursor* cursor = [track makeSampleCursorAtFirstSampleInDecodeOrder];
+  if (!cursor) return -1;
+  CMTime latest = kCMTimeNegativeInfinity;
+  int run = 0, longest = 0;
+  for (int n = 0; n < kBFrameProbeSamples; ++n) {
+    CMTime pts = cursor.presentationTimeStamp;
+    if (CMTimeCompare(pts, latest) < 0) {
+      longest = std::max(longest, ++run);
+    } else {
+      run = 0;
+      latest = pts;
+    }
+    if ([cursor stepInDecodeOrderByCount:1] != 1) break;
+  }
+  return longest;
 }
 
 bool loadKeys(id<AVAsynchronousKeyValueLoading> object, NSArray<NSString*>* keys) {
@@ -114,7 +169,12 @@ class AvfDemuxer : public IDemuxer {
       v->frameDurationUs = static_cast<int64_t>(1e6 / t.nominalFrameRate);
     }
     v->rotated = !CGAffineTransformIsIdentity(t.preferredTransform);
+    v->maxBFrames = longestBFrameRun(t);
     v->format = retainCF(fd);
+    NSDictionary* atoms = (__bridge NSDictionary*)CMFormatDescriptionGetExtension(
+        fd, kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms);
+    NSData* avcC = v->supported ? atoms[@"avcC"] : nil;
+    nalLengthSize_ = avcC.length >= 5 ? (static_cast<const uint8_t*>(avcC.bytes)[4] & 3) + 1 : 0;
     return true;
   }
 
@@ -190,6 +250,7 @@ class AvfDemuxer : public IDemuxer {
       if (CMBlockBufferCopyDataBytes(data, offset, size, p.data.data()) != kCMBlockBufferNoErr) {
         return Result::MalformedMedia;
       }
+      p.disposable = track == kVideo && !p.key && isDisposable(sb, i, p.data.data(), size, nalLengthSize_);
       offset += size;
       pending_[track].push_back(std::move(p));
     }
@@ -202,6 +263,7 @@ class AvfDemuxer : public IDemuxer {
   AVAssetReaderTrackOutput* outputs_[2] = {nil, nil};
   std::deque<Packet> pending_[2];
   bool eos_[2] = {true, true};
+  int nalLengthSize_ = 0;  // H.264 NAL length prefix size, from avcC; 0 when not H.264
 };
 
 }  // namespace
