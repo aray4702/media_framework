@@ -13,6 +13,7 @@ Read them roughly in this order. Each one builds on the ones before it.
 | [implementation_skeleton.md](design/implementation_skeleton.md) | A map of the code as built: layers and components, ownership and lifetime, state transitions, startup and shutdown, concurrency, timing and ordering, and the performance-critical path. Start here before changing `core/` or `platform/macos/`. |
 | [scene_graph_spec.md](design/scene_graph_spec.md) | The scene document format (v1): tracks, items, transitions, effects, keyframes and compositing, the rules for how a frame and the audio are rendered, validation, and the mapping to OpenTimelineIO. Goes with [schema/](../schema/) and [validate_scene.py](../scripts/validate_scene.py). |
 | [rate_mismatch_buffering.md](design/rate_mismatch_buffering.md) | How stages with different, unknown rates exchange frames when there are random bursts and stalls: bounded queues, backpressure vs. dropping, consumer-clock frame selection, adaptive depth, sizing and metrics. Includes where each part lives in the code, a proposal for decode rate control in playback modeled on the camera recorder, and what isn't built yet. |
+| [browser_port.md](design/browser_port.md) | The record of porting the player and editor to the browser: the architecture and adapter mapping (WebAssembly, WebCodecs, WebGPU, AudioWorklet), the core changes, the risks, and the measured results of each of the five steps. Goes with [platform/web/README.md](../platform/web/README.md). |
 
 ## Other
 
