@@ -28,8 +28,8 @@ const waitState = async (states, ms = 8000) => {
   return (await report())?.state;
 };
 
-await page.goto('http://127.0.0.1:8000/platform/web/editor/');
-await page.waitForFunction(() => window.editor, { timeout: 15000 });
+await page.goto(process.env.EDITOR_URL || 'http://127.0.0.1:8000/platform/web/editor/');  // EDITOR_URL: elsewhere, e.g. the Pages site
+await page.waitForFunction(() => window.editor && crossOriginIsolated, { timeout: 15000 });  // not the load coi.js reloads
 
 // 1. Import two clips and an image.
 const input = await page.$('#files');
@@ -77,6 +77,47 @@ const tr = s.tracks[imageTrack].items[0].transform;
 check(tr && tr.scale === 0.3 && tr.x === 0.8 && tr.y === 0.25 && tr.rotation === 12, 'image transform set from the properties');
 await sleep(300);
 await shot('properties');
+
+// 4b. On the preview: a click selects the image, a drag moves it, a side crops it, and the
+// caption's words change in place.
+const onPreview = (what) => page.evaluate((w) => {  // a point of the selected item's box, on the page
+  const o = window.editor.overlay, b = o.selectedBox(), h = o.handles(b), s = o.stage.getBoundingClientRect();
+  const p = w === 'center' ? o.toView(b.at(0.5, 0.5)) : h.sides[['left', 'top', 'right', 'bottom'].indexOf(w)];
+  return { x: s.left + p.x, y: s.top + p.y, k: o.frame().k };
+}, what);
+const dragBy = async (from, dx, dy) => {
+  await page.mouse.move(from.x, from.y);
+  await page.mouse.down();
+  await page.mouse.move(from.x + dx / 2, from.y + dy / 2, { steps: 3 });
+  await page.mouse.move(from.x + dx, from.y + dy, { steps: 3 });
+  await page.mouse.up();
+};
+await page.evaluate((t) => window.editor.select({ track: t, item: 0 }), imageTrack);
+const imageAt = await onPreview('center');
+await page.evaluate(() => window.editor.select({}));
+await page.mouse.click(imageAt.x, imageAt.y);
+let sel = await page.evaluate(() => window.editor.sel);
+check(sel.track === imageTrack && sel.item === 0, 'clicking the image on the preview selects it');
+await dragBy(imageAt, -60, 40);
+s = await scene();
+let t2 = s.tracks[imageTrack].items[0].transform, out = s.output || { width: 1920, height: 1080 };
+check(Math.abs(t2.x - (0.8 - 60 / imageAt.k / out.width)) < 1e-3 && Math.abs(t2.y - (0.25 + 40 / imageAt.k / out.height)) < 1e-3,
+      `dragging it on the preview moved it to (${t2.x.toFixed(3)}, ${t2.y.toFixed(3)})`);
+await dragBy(await onPreview('left'), 20, 0);
+s = await scene();
+const crop = (s.tracks[imageTrack].items[0].effects || []).find((e) => e.type === 'crop');
+check(crop && crop.left > 0.02 && !crop.right, `dragging its left side cropped it (left ${crop?.left?.toFixed(3)})`);
+const captionTrack = s.tracks.findIndex((t) => t.items.some((i) => i.type === 'text'));
+await page.evaluate((t) => window.editor.select({ track: t, item: 0 }), captionTrack);
+const captionAt = await onPreview('center');
+await page.mouse.click(captionAt.x, captionAt.y, { clickCount: 2 });
+await page.waitForSelector('.stage .text-edit');
+await page.keyboard.type('Hello there');
+await page.keyboard.press('Enter');
+s = await scene();
+check(s.tracks[captionTrack].items[0].text === 'Hello there' && !(await page.$('.stage .text-edit')), 'double-clicking the caption edits its words in place');
+await sleep(300);
+await shot('preview-edit');
 
 // 5. Drag the second clip later by 100 px on the timeline: its start moves by 100 px / zoom.
 const zoom = await page.evaluate(() => window.editor.zoom);

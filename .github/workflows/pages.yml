@@ -1,0 +1,56 @@
+# Builds the web platform with Emscripten and publishes the media editor to GitHub Pages:
+# https://<owner>.github.io/<repo>/ opens platform/web/editor/. Pages can't send the cross-origin
+# isolation headers, so platform/web/coi.js adds them from a service worker.
+name: Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: mymindstorm/setup-emsdk@v16
+        with:
+          version: 6.0.10
+      - name: Build
+        run: platform/web/build.sh
+      - name: Assemble the site
+        run: |
+          mkdir -p _site/build-web _site/platform/web
+          cp build-web/mf.js build-web/mf.wasm _site/build-web/
+          cp -R platform/web/editor platform/web/coi.js _site/platform/web/
+          cp platform/web/coi.js _site/  # the service worker: its scope must cover build-web/ as well
+          touch _site/.nojekyll
+          cat > _site/index.html <<'EOF'
+          <!doctype html>
+          <meta charset="utf-8">
+          <title>Media Editor</title>
+          <meta http-equiv="refresh" content="0; url=platform/web/editor/">
+          <a href="platform/web/editor/">Media Editor</a>
+          EOF
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5
