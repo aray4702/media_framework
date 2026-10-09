@@ -3,6 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <script src="../coi.js"></script>  <!-- cross-origin isolation where the host can't send the headers -->
   <title>Media Editor</title>
   <style>
     :root {
@@ -120,7 +121,7 @@
     <div class="timeline" id="timeline" tabindex="0"></div>
   </footer>
   <div class="drop-hint"></div>
-  <script src="/build-web/mf.js"></script>
+  <script src="../../../build-web/mf.js"></script>
   <script type="module" src="editor.js"></script>
 </body>
 </html>

@@ -28,8 +28,8 @@ const waitState = async (states, ms = 8000) => {
   return (await report())?.state;
 };
 
-await page.goto('http://127.0.0.1:8000/platform/web/editor/');
-await page.waitForFunction(() => window.editor, { timeout: 15000 });
+await page.goto(process.env.EDITOR_URL || 'http://127.0.0.1:8000/platform/web/editor/');  // EDITOR_URL: elsewhere, e.g. the Pages site
+await page.waitForFunction(() => window.editor && crossOriginIsolated, { timeout: 15000 });  // not the load coi.js reloads
 
 // 1. Import two clips and an image.
 const input = await page.$('#files');

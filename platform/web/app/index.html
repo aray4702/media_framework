@@ -3,6 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <script src="../coi.js"></script>  <!-- cross-origin isolation where the host can't send the headers -->
   <title>Media Framework spike</title>
   <style>
     :root { color-scheme: light dark; --bg: #f6f6f4; --fg: #1d1d1b; --muted: #6b6b66; }
@@ -20,7 +21,7 @@
     <span id="status">Loading…</span>
   </div>
   <pre id="report"></pre>
-  <script src="/build-web/mf.js"></script>
+  <script src="../../../build-web/mf.js"></script>
   <script type="module" src="spike.js"></script>
 </body>
 </html>

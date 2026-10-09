@@ -28,6 +28,8 @@ The page needs cross-origin isolation (shared memory between the page and the Au
 python3 platform/web/tools/serve.py          # http://localhost:8000
 ```
 
+Hosts that can't send headers get them from `coi.js`, a service worker the pages register: the first visit reloads once, then the page is isolated. `.github/workflows/pages.yml` builds with Emscripten and publishes the editor to GitHub Pages on each push to `main` (Settings → Pages → Source: GitHub Actions), at `https://<owner>.github.io/<repo>/`.
+
 Open `http://localhost:8000/platform/web/app/?scene=stacked2` and press Play. Scenes: `single`, `sync` (a flash and a beep each second), `stacked2` (picture in picture), `stacked4` (four lanes in a grid, one at 60 fps), `features` (a crossfade, a wipe, an image, a caption, color adjust, crop, chroma key, blur, a blend mode), `corrupt` (a clip with damaged data). `seconds=N` sets how long they play.
 
 ## Editor
