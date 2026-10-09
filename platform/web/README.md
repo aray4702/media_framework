@@ -36,15 +36,16 @@ Open `http://localhost:8000/platform/web/app/?scene=stacked2` and press Play. Sc
 
 - **Media:** MP4 (H.264, AAC) and M4A files and images, from Add media… or dropped on the page. Click one to add it at the playhead: a video on the lowest free video track, an image, text or color on a layer above what plays there, audio on an audio track.
 - **Text, emoji and colors:** the macOS editor's text presets (heading, subheading, body, caption), emoji as text, solid colors.
+- **Preview:** as the macOS editor's overlay (`editor/overlay.js`): click an item on the picture to select it (top first), drag it to move it, a corner to scale it, a side to crop it, the knob above to turn it (Shift: 15° steps); double-click text to edit its words in place (Return ends, Shift-Return adds a line, Escape undoes).
 - **Timeline:** select items, tracks and joins; drag items along their track or onto another; trim either end (the start trims into the file); click the diamond between two items for a transition; scrub in the ruler. Space plays, Delete removes the selection.
 - **Properties:** timing (start, duration, in, speed); position, scale, rotation, opacity, fit, blend; color adjust, blur, crop and chroma key; text words, font, size, color and box; sound (mute, gain, pan) and detaching a video's sound; transitions (kind, direction, duration); tracks (on, opacity or gain, order); the project (size, frame rate, background).
 - **Projects:** Save downloads the scene document; Open takes the document together with its media files, matched by file name.
 - **Export:** MP4 at the project's size, 720p or 1080p, downloaded when done.
 - **Record:** the camera (video and sound), added at the playhead where it started; or a voice-over, recorded from the microphone while the timeline plays from the playhead, added on an audio track there. Recordings join the project's media as `Camera n.mp4` and `Voice-over n.m4a`.
 
-`tools/run_editor.mjs` drives it in Chrome like a person (import, add, edit, drag, transition, play, export, save and reopen) and checks the scene and the player at each step. `tools/run_record.mjs` records with Chrome's fake camera and microphone (`--use-fake-device-for-media-stream`): a camera recording and a voice-over, each checked for length, place and dropped frames, then played.
+`tools/run_editor.mjs` drives it in Chrome like a person (import, add, edit in the properties and on the preview, drag, transition, play, export, save and reopen) and checks the scene and the player at each step. `tools/run_record.mjs` records with Chrome's fake camera and microphone (`--use-fake-device-for-media-stream`): a camera recording and a voice-over, each checked for length, place and dropped frames, then played.
 
-Not yet, compared with the macOS editor: stickers, editing in the preview (drag and resize on the picture), dragging from the sidebar onto the timeline, waveforms, effect plugins, export formats and framing (MOV, HEVC, fill, several outputs), resizable panes, and keeping media between sessions (projects reopen with their files picked again).
+Not yet, compared with the macOS editor: stickers, dragging from the sidebar onto the timeline, waveforms, effect plugins, export formats and framing (MOV, HEVC, fill, several outputs), resizable panes, and keeping media between sessions (projects reopen with their files picked again).
 
 ## Measure
 

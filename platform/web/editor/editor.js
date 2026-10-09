@@ -4,6 +4,7 @@
 // changed, else reopens the scene at the playhead.
 
 import { Inspector } from './inspector.js';
+import { Overlay } from './overlay.js';
 import { Recording, warmVideoEncoder } from './record.js';
 import { Timeline } from './timeline.js';
 
@@ -63,25 +64,30 @@ app.durationUs = () => {
 };
 app.item = (t, k) => app.scene.tracks[t]?.items[k];
 
-let applyTimer = 0;
-// After an edit: the views follow, and the player a moment after the last of a burst of edits.
+let applyTimer = 0, applyFrame = 0;
+// After an edit: the views follow, and the player a moment after the last of a burst of edits, or
+// with the next frame when only the look changed (lookOnly), which it redraws without reopening.
 const preview = document.getElementById('preview');
-app.commit = () => {
+app.commit = (lookOnly = false) => {
   readScene();
   const o = app.scene.output || {};
   preview.style.aspectRatio = `${o.width || 1920} / ${o.height || 1080}`;  // the canvas's pixels are the player's
   if (app.sel.track >= app.scene.tracks.length) app.sel = { track: -1, item: -1, transition: false };
   timeline.render();
   inspector.render();
+  overlay.render();
   updateTime();
+  const apply = () => { applyFrame = 0; withStr(app.sceneJson, (p) => M._mf_apply(app.session, p, app.playheadUs)); };
   clearTimeout(applyTimer);
-  applyTimer = setTimeout(() => withStr(app.sceneJson, (p) => M._mf_apply(app.session, p, app.playheadUs)), 60);
+  if (lookOnly) applyFrame ||= requestAnimationFrame(apply);
+  else applyTimer = setTimeout(apply, 60);
 };
 
 app.select = (sel) => {
   app.sel = { track: -1, item: -1, transition: false, ...sel };
   timeline.render();
   inspector.render();
+  overlay.render();
 };
 
 // --- Media ---
@@ -199,6 +205,7 @@ app.seek = (atUs) => {
   if (app.state === 'PLAY') M._mf_pause(app.session);
   if (app.state === 'PLAY' || app.state === 'READY') M._mf_seek(app.session, app.playheadUs);
   timeline.setPlayhead();
+  overlay.render();
   updateTime();
 };
 
@@ -226,6 +233,7 @@ setInterval(() => {
   if (r.state === 'PLAY' && r.positionUs >= 0) {
     app.playheadUs = r.positionUs;
     timeline.setPlayhead();
+    overlay.render();
   }
   for (const e of r.events.slice(seenEvents)) {
     if (e === 'error') say(r.error, true);
@@ -481,8 +489,10 @@ function recordPanel(body, hint) {
 
 const timeline = new Timeline(document.getElementById('timeline'), app);
 const inspector = new Inspector(document.getElementById('props'), app);
+const overlay = new Overlay(document.querySelector('.stage'), preview, app);
 app.timeline = timeline;
 app.inspector = inspector;
+app.overlay = overlay;
 
 const picker = document.getElementById('files');
 document.getElementById('add-media').onclick = () => { picker.accept = 'video/mp4,audio/mp4,audio/x-m4a,.m4a,image/*'; picker.click(); };
