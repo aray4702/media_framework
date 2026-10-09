@@ -158,6 +158,22 @@ The editor records the camera and voice-overs: 3 s of Chrome's fake camera came 
 - **Voice-over timing:** the item starts where playback started. How long the player takes to start, about one or two refreshes, is not subtracted.
 - **Not done:** recording in a worker (the only option for Safari, untested), the macOS editor's camera window layouts, and picking a device.
 
+## After step 5: editing on the preview
+
+Step 4 left out editing on the preview. The editor now has the macOS editor's overlay (`apps/macos-editor/preview_overlay.mm`), ported to `platform/web/editor/overlay.js`: a click on the picture selects the item under it, top first; the selected item's box has handles to move, scale, crop and turn it (Shift: 15° steps); a double-click on text edits its words in place. As on macOS, values set there are constants. Each change replaces the item's look through the Document.
+
+| Check (headless Chrome) | Result |
+| --- | --- |
+| Clicking the image on the preview | Selects it |
+| Dragging it 60 px left and 40 px down | Moves it exactly that far in output pixels |
+| Dragging its left side 20 px | Crops 0.076 from the left, other sides untouched |
+| Double-clicking the caption, typing, Return | The caption's words change; the field closes |
+| Step 4 editor test | Still passes; no late frames or jank in 2 of 2 runs (21 checks) |
+
+- **Faster redraws:** an edit that changes only the look now goes to the player with the next frame. Before, it waited for a 60 ms pause in edits, so a drag would have lagged behind the pointer.
+- **Found: a stretched preview.** With `height: 100%` and `max-width`, the canvas ignored its aspect ratio and stretched to its pane (about 1.6:1 for a 16:9 project). The overlay's box sat about 20 px off the picture. The canvas now scales down to fit without stretching.
+- **Found: jank from the overlay.** A transparent 2D canvas kept over the player's canvas caused 3 to 6 janks across the crossfade, where the unchanged editor had none. The overlay canvas now hides when nothing is selected and the stage takes the pointer. The case of an item selected during playback is not measured.
+
 ## Sources
 
 Browser support facts come from these search results, read as summaries rather than page by page; confirm a version before relying on it.
