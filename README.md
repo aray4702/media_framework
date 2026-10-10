@@ -44,26 +44,26 @@ The core never calls a platform API directly. To port the player, you write the 
 ### Supported features (MVP)
 
 
-| Area         | Supported                                                                                                                                                                    |
-| ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Platform     | macOS 13 Ventura or later, Apple silicon                                                                                                                                     |
-| Source       | Local files                                                                                                                                                                  |
-| Container    | MP4                                                                                                                                                                          |
-| Video        | H.264, constant frame rate, hardware decode through VideoToolbox, zero-copy to Metal                                                                                         |
-| Audio        | AAC-LC or MP3, optional. S16 PCM output through a CoreAudio AudioUnit                                                                                                               |
-| API          | `open` (one file or a `Scene`), `play`, `pause`, `seek`, `setFilter`, `shutdown`, plus `durationUs`, `positionUs` and `metrics` queries                                 |
-| Composition  | Clips joined by push, slide, wipe, crossfade or cut, with an audio crossfade. Text items for captions. Items with duration 0 play to the end of their file. Brightness and contrast, live |
+| Area         | Supported                                                                                                                                                                                               |
+| ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Platform     | macOS 13 Ventura or later, Apple silicon                                                                                                                                                                |
+| Source       | Local files                                                                                                                                                                                             |
+| Container    | MP4                                                                                                                                                                                                     |
+| Video        | H.264, constant frame rate, hardware decode through VideoToolbox, zero-copy to Metal                                                                                                                    |
+| Audio        | AAC-LC or MP3, optional. S16 PCM output through a CoreAudio AudioUnit                                                                                                                                   |
+| API          | `open` (one file or a `Scene`), `play`, `pause`, `seek`, `setFilter`, `shutdown`, plus `durationUs`, `positionUs` and `metrics` queries                                                                 |
+| Composition  | Clips joined by push, slide, wipe, crossfade or cut, with an audio crossfade. Text items for captions. Items with duration 0 play to the end of their file. Brightness and contrast, live               |
 | Scene graph  | Up to 16 tracks and 8 overlapping video/audio items. Video, image, text, color and audio items; keyframes with easing; fit, transform, opacity, blend; effects; audio gain, pan, resampling and `speed` |
-| Drivers      | Leading-clip or vsync while playing (`Auto` picks leading-clip when the only visual item is one video, else vsync). Export to MP4 (H.264 + AAC) on a fixed frame grid                             |
-| States       | `Start`, `Ready`, `Play`, `Error`, `Shutdown`                                                                                                                                |
-| A/V sync     | Audio master clock that includes output latency. Falls back to the system clock when there is no audio track or the audio ends first                                         |
-| Frame pacing | Frame rate capped to the display refresh rate on a vsync grid. Handles refresh-rate changes when the window moves to another display                                         |
-| Seek         | Seeks to the exact timestamp, not just the nearest keyframe                                                                                                                  |
-| Scrub        | Coalesces rapid seeks (latest wins) and shows keyframes during the scrub                                                                                                     |
-| Errors       | Fatal errors go to `Error` with `onError`. Corrupt frames are skipped: video holds the last good frame, audio plays silence. Invalidated VideoToolbox sessions are recovered |
-| Threading    | Non-blocking stages driven by a per-platform scheduler. The real-time audio path is lock-free and does not allocate                                                          |
-| Memory       | Every queue is capped by count, bytes and duration                                                                                                                           |
-| Metrics      | Dropped-frame rate, jank rate, A/V offset, TTFF, seek latency, all measured from actual present times                                                                        |
+| Drivers      | Leading-clip or vsync while playing (`Auto` picks leading-clip when the only visual item is one video, else vsync). Export to MP4 (H.264 + AAC) on a fixed frame grid                                   |
+| States       | `Start`, `Ready`, `Play`, `Error`, `Shutdown`                                                                                                                                                           |
+| A/V sync     | Audio master clock that includes output latency. Falls back to the system clock when there is no audio track or the audio ends first                                                                    |
+| Frame pacing | Frame rate capped to the display refresh rate on a vsync grid. Handles refresh-rate changes when the window moves to another display                                                                    |
+| Seek         | Seeks to the exact timestamp, not just the nearest keyframe                                                                                                                                             |
+| Scrub        | Coalesces rapid seeks (latest wins) and shows keyframes during the scrub                                                                                                                                |
+| Errors       | Fatal errors go to `Error` with `onError`. Corrupt frames are skipped: video holds the last good frame, audio plays silence. Invalidated VideoToolbox sessions are recovered                            |
+| Threading    | Non-blocking stages driven by a per-platform scheduler. The real-time audio path is lock-free and does not allocate                                                                                     |
+| Memory       | Every queue is capped by count, bytes and duration                                                                                                                                                      |
+| Metrics      | Dropped-frame rate, jank rate, A/V offset, TTFF, seek latency, all measured from actual present times                                                                                                   |
 
 
 **Not supported yet:** other transitions and effects, resampling clips whose audio format differs from the first (they play silent), variable frame rate, edit lists, AAC priming trim, track rotation matrix, seeking while in `Play`, streaming sources, DRM, and codecs other than H.264 and AAC.
@@ -245,18 +245,18 @@ Every API call returns without doing I/O or decoding. Only `shutdown` blocks, wh
 ### Repository layout
 
 
-| Path                                           | Contents                                                                                                                                                                                                                               |
-| ---------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| [core/include/mf/](core/include/mf/)           | Public API: [player.h](core/include/mf/player.h), [adapters.h](core/include/mf/adapters.h), [types.h](core/include/mf/types.h), [audio_ring.h](core/include/mf/audio_ring.h), [thread_scheduler.h](core/include/mf/thread_scheduler.h) |
-| [core/src/](core/src/)                         | State machine and stages ([pipeline.cpp](core/src/pipeline.cpp), [composition.cpp](core/src/composition.cpp) and the drivers), [player.cpp](core/src/player.cpp), [exporter.cpp](core/src/exporter.cpp), [scene.cpp](core/src/scene.cpp), [layout.cpp](core/src/layout.cpp), clock, A/V sync, metrics, bounded queue |
-| [core/tests/](core/tests/)                     | Host tests with fake adapters and a deterministic single-threaded scheduler                                                                                                                                                            |
-| [platform/macos/](platform/macos/)             | macOS adapters and the platform factory                                                                                                                                                                                                |
-| [apps/macos-demo/](apps/macos-demo/)           | The demo app                                                                                                                                                                                                                           |
-| [apps/macos-editor/](apps/macos-editor/)       | The editor app                                                                                                                                                                                                                           |
-| [plugins/beauty/](plugins/beauty/)             | The beauty effect plugin (built into `build/plugins/beauty.dylib`)                                                                                                                                                                       |
-| [scripts/make_clips.sh](scripts/make_clips.sh) | Generates the test clips                                                                                                                                                                                                               |
-| [scene_graph_spec.md](docs/design/scene_graph_spec.md), [schema/](schema/) | Scene-graph format (v1): tracks, transitions, effects, keyframes; JSON Schema, example, and the OTIO mapping. [scripts/validate_scene.py](scripts/validate_scene.py) validates a document |
-| [docs/design/](docs/design/) | Design docs: [requirements](docs/design/reqs.md), [MVP spec](docs/design/mvp_spec.md), [implementation skeleton](docs/design/implementation_skeleton.md), [scene-graph format](docs/design/scene_graph_spec.md), [producer/consumer rate mismatch](docs/design/rate_mismatch_buffering.md) |
+| Path                                                                       | Contents                                                                                                                                                                                                                                                                                                             |
+| -------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [core/include/mf/](core/include/mf/)                                       | Public API: [player.h](core/include/mf/player.h), [adapters.h](core/include/mf/adapters.h), [types.h](core/include/mf/types.h), [audio_ring.h](core/include/mf/audio_ring.h), [thread_scheduler.h](core/include/mf/thread_scheduler.h)                                                                               |
+| [core/src/](core/src/)                                                     | State machine and stages ([pipeline.cpp](core/src/pipeline.cpp), [composition.cpp](core/src/composition.cpp) and the drivers), [player.cpp](core/src/player.cpp), [exporter.cpp](core/src/exporter.cpp), [scene.cpp](core/src/scene.cpp), [layout.cpp](core/src/layout.cpp), clock, A/V sync, metrics, bounded queue |
+| [core/tests/](core/tests/)                                                 | Host tests with fake adapters and a deterministic single-threaded scheduler                                                                                                                                                                                                                                          |
+| [platform/macos/](platform/macos/)                                         | macOS adapters and the platform factory                                                                                                                                                                                                                                                                              |
+| [apps/macos-demo/](apps/macos-demo/)                                       | The demo app                                                                                                                                                                                                                                                                                                         |
+| [apps/macos-editor/](apps/macos-editor/)                                   | The editor app                                                                                                                                                                                                                                                                                                       |
+| [plugins/beauty/](plugins/beauty/)                                         | The beauty effect plugin (built into `build/plugins/beauty.dylib`)                                                                                                                                                                                                                                                   |
+| [scripts/make_clips.sh](scripts/make_clips.sh)                             | Generates the test clips                                                                                                                                                                                                                                                                                             |
+| [scene_graph_spec.md](docs/design/scene_graph_spec.md), [schema/](schema/) | Scene-graph format (v1): tracks, transitions, effects, keyframes; JSON Schema, example, and the OTIO mapping. [scripts/validate_scene.py](scripts/validate_scene.py) validates a document                                                                                                                            |
+| [docs/design/](docs/design/)                                               | Design docs: [requirements](docs/design/reqs.md), [MVP spec](docs/design/mvp_spec.md), [implementation skeleton](docs/design/implementation_skeleton.md), [scene-graph format](docs/design/scene_graph_spec.md), [producer/consumer rate mismatch](docs/design/rate_mismatch_buffering.md)                           |
 
 
 ---
@@ -405,37 +405,39 @@ flowchart LR
 
 
 
-| Component             | File                                                            | Role                                                                         |
-| --------------------- | --------------------------------------------------------------- | ---------------------------------------------------------------------------- |
-| Player / Impl         | [player.cpp](core/src/player.cpp)                               | Public API, owner-thread check, state machine, pipeline events               |
-| Context               | [pipeline.h](core/src/pipeline.h)                               | Owns adapters, queues, ring, clock and metrics; seek slot; serials           |
-| SourceStage (T1)      | [pipeline.cpp](core/src/pipeline.cpp)                           | Probe every item, start seeks, move lanes to their next item, demux from the track with the lowest timeline DTS |
-| VideoDecodeStage (T2) | [pipeline.cpp](core/src/pipeline.cpp)                           | Per lane: packets → decoder → frames in PTS order; reconfigure for the next clip |
-| CompositionStage (TC) | [composition.cpp](core/src/composition.cpp)                     | Hand composed frames to T3; the exact seek; then delegate to the driver       |
-| FrameSampler          | [composition.cpp](core/src/composition.cpp)                     | Each lane's next and latest frame; advance to `t`; `composeAt(t)`             |
-| LeadingClipDriver     | [leading_clip_driver.cpp](core/src/leading_clip_driver.cpp)     | One output per frame of the highest-fps active clip, in timeline order       |
-| VsyncDriver           | [vsync_driver.cpp](core/src/vsync_driver.cpp)                   | One output per display refresh; late layers hold; unchanged refreshes skipped |
-| ExportDriver          | [export_driver.cpp](core/src/export_driver.cpp)                 | Fixed `n / fps` grid; waits for every layer's exact frame                    |
-| VideoRenderStage (T3) | [pipeline.cpp](core/src/pipeline.cpp)                           | Complete seeks, A/V sync, present or drop, start and stop output, detect end, redraw on a filter change |
-| AudioStage (T4)       | [pipeline.cpp](core/src/pipeline.cpp)                           | Decode each lane's AAC, mix on the timeline with gains and fades, write to the ring |
-| Scene parser          | [scene.cpp](core/src/scene.cpp), [json.cpp](core/src/json.cpp)   | JSON, the schema's checks and rules R1–R8, R12; keyframes and easing         |
-| SceneLayout           | [layout.cpp](core/src/layout.cpp)                               | Lanes by interval coloring; what's visible at `t` with transition offsets, clips and fades; audio fades |
-| Exporter              | [exporter.cpp](core/src/exporter.cpp)                           | The same pipeline with the export driver, writing to an `IExportSink`        |
-| AvSync                | [av_sync.cpp](core/src/av_sync.cpp)                             | Per-frame present, drop or wait decision on the vsync grid                   |
-| MasterClock           | [master_clock.cpp](core/src/master_clock.cpp)                   | Audio clock, or steady clock when there's no audio or it has ended           |
-| AudioRing             | [audio_ring.cpp](core/src/audio_ring.cpp)                       | Lock-free SPSC PCM ring that also publishes the audio clock                  |
-| BoundedQueue          | [bounded_queue.h](core/src/bounded_queue.h)                     | Non-blocking queue capped by count, bytes and duration, with wake hooks      |
-| ThreadScheduler       | [thread_scheduler.cpp](core/src/thread_scheduler.cpp)           | One thread per stage; runs `pump()` and waits on a condition variable        |
-| Metrics               | [metrics.cpp](core/src/metrics.cpp)                             | Drops, jank, A/V offset, TTFF, seek latency                                  |
-| AvfDemuxer            | [avf_demuxer.mm](platform/macos/src/avf_demuxer.mm)             | `AVAssetReader` with one passthrough output per track                        |
-| VtVideoDecoder        | [vt_video_decoder.mm](platform/macos/src/vt_video_decoder.mm)   | Async `VTDecompressionSession` plus PTS reorder                              |
-| AtAudioDecoder        | [at_audio_decoder.cpp](platform/macos/src/at_audio_decoder.cpp) | `AudioConverter`, AAC → S16                                                  |
-| AuSpeaker             | [au_speaker.cpp](platform/macos/src/au_speaker.cpp)             | Default-output AudioUnit; the render callback pulls from the ring            |
-| MetalDisplay          | [metal_display.mm](platform/macos/src/metal_display.mm)         | Pending-frame queue drained on each vsync; draws with MetalCompositor        |
-| MetalCompositor       | [metal_compositor.mm](platform/macos/src/metal_compositor.mm)   | One-pass draw of a composed frame: layers (NV12 → RGB, filter), Core Text caption; plugin effects and blur in offscreen textures |
-| Effect plugins        | [effects.cpp](core/src/effects.cpp), [effect_plugins.mm](platform/macos/src/effect_plugins.mm) | Registry of plugin effect types (core); `dlopen` loader and ABI check (macOS) |
-| ImageIoLoader         | [image_loader.mm](platform/macos/src/image_loader.mm)           | Image items: ImageIO into a BGRA `CVPixelBuffer`                             |
-| AvfExportSink         | [avf_export_sink.mm](platform/macos/src/avf_export_sink.mm)     | MetalCompositor into `AVAssetWriter` buffers → H.264; mixed PCM → AAC        |
+| Component             | File                                                                                           | Role                                                                                                                             |
+| --------------------- | ---------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| Player / Impl         | [player.cpp](core/src/player.cpp)                                                              | Public API, owner-thread check, state machine, pipeline events                                                                   |
+| Context               | [pipeline.h](core/src/pipeline.h)                                                              | Owns adapters, queues, ring, clock and metrics; seek slot; serials                                                               |
+| SourceStage (T1)      | [pipeline.cpp](core/src/pipeline.cpp)                                                          | Probe every item, start seeks, move lanes to their next item, demux from the track with the lowest timeline DTS                  |
+| VideoDecodeStage (T2) | [pipeline.cpp](core/src/pipeline.cpp)                                                          | Per lane: packets → decoder → frames in PTS order; reconfigure for the next clip                                                 |
+| CompositionStage (TC) | [composition.cpp](core/src/composition.cpp)                                                    | Hand composed frames to T3; the exact seek; then delegate to the driver                                                          |
+| FrameSampler          | [composition.cpp](core/src/composition.cpp)                                                    | Each lane's next and latest frame; advance to `t`; `composeAt(t)`                                                                |
+| LeadingClipDriver     | [leading_clip_driver.cpp](core/src/leading_clip_driver.cpp)                                    | One output per frame of the highest-fps active clip, in timeline order                                                           |
+| VsyncDriver           | [vsync_driver.cpp](core/src/vsync_driver.cpp)                                                  | One output per display refresh; late layers hold; unchanged refreshes skipped                                                    |
+| ExportDriver          | [export_driver.cpp](core/src/export_driver.cpp)                                                | Fixed `n / fps` grid; waits for every layer's exact frame                                                                        |
+| VideoRenderStage (T3) | [pipeline.cpp](core/src/pipeline.cpp)                                                          | Complete seeks, A/V sync, present or drop, start and stop output, detect end, redraw on a filter change                          |
+| AudioStage (T4)       | [pipeline.cpp](core/src/pipeline.cpp)                                                          | Decode each lane's AAC, mix on the timeline with gains and fades, write to the ring                                              |
+| Scene parser          | [scene.cpp](core/src/scene.cpp), [json.cpp](core/src/json.cpp)                                 | JSON, the schema's checks and rules R1–R8, R12; keyframes and easing                                                             |
+| SceneLayout           | [layout.cpp](core/src/layout.cpp)                                                              | Lanes by interval coloring; what's visible at `t` with transition offsets, clips and fades; audio fades                          |
+| Exporter              | [exporter.cpp](core/src/exporter.cpp)                                                          | The same pipeline with the export driver, writing to an `IExportSink`                                                            |
+| AvSync                | [av_sync.cpp](core/src/av_sync.cpp)                                                            | Per-frame present, drop or wait decision on the vsync grid                                                                       |
+| MasterClock           | [master_clock.cpp](core/src/master_clock.cpp)                                                  | Audio clock, or steady clock when there's no audio or it has ended                                                               |
+| AudioRing             | [audio_ring.cpp](core/src/audio_ring.cpp)                                                      | Lock-free SPSC PCM ring that also publishes the audio clock                                                                      |
+| BoundedQueue          | [bounded_queue.h](core/src/bounded_queue.h)                                                    | Non-blocking queue capped by count, bytes and duration, with wake hooks                                                          |
+| ThreadScheduler       | [thread_scheduler.cpp](core/src/thread_scheduler.cpp)                                          | One thread per stage; runs `pump()` and waits on a condition variable                                                            |
+| Metrics               | [metrics.cpp](core/src/metrics.cpp)                                                            | Drops, jank, A/V offset, TTFF, seek latency                                                                                      |
+| AvfDemuxer            | [avf_demuxer.mm](platform/macos/src/avf_demuxer.mm)                                            | `AVAssetReader` with one passthrough output per track                                                                            |
+| VtVideoDecoder        | [vt_video_decoder.mm](platform/macos/src/vt_video_decoder.mm)                                  | Async `VTDecompressionSession` plus PTS reorder                                                                                  |
+| AtAudioDecoder        | [at_audio_decoder.cpp](platform/macos/src/at_audio_decoder.cpp)                                | `AudioConverter`, AAC → S16                                                                                                      |
+| AuSpeaker             | [au_speaker.cpp](platform/macos/src/au_speaker.cpp)                                            | Default-output AudioUnit; the render callback pulls from the ring                                                                |
+| MetalDisplay          | [metal_display.mm](platform/macos/src/metal_display.mm)                                        | Pending-frame queue drained on each vsync; draws with MetalCompositor                                                            |
+| MetalCompositor       | [metal_compositor.mm](platform/macos/src/metal_compositor.mm)                                  | One-pass draw of a composed frame: layers (NV12 → RGB, filter), Core Text caption; plugin effects and blur in offscreen textures |
+| Effect plugins        | [effects.cpp](core/src/effects.cpp), [effect_plugins.mm](platform/macos/src/effect_plugins.mm) | Registry of plugin effect types (core); `dlopen` loader and ABI check (macOS)                                                    |
+| ImageIoLoader         | [image_loader.mm](platform/macos/src/image_loader.mm)                                          | Image items: ImageIO into a BGRA `CVPixelBuffer`                                                                                 |
+| AvfExportSink         | [avf_export_sink.mm](platform/macos/src/avf_export_sink.mm)                                    | MetalCompositor into `AVAssetWriter` buffers → H.264; mixed PCM → AAC                                                            |
+
+
 
 
 **Why C++17.** It is the newest standard that every target toolchain supports fully: Apple Clang, the Android NDK, Emscripten, MSVC and GCC. That lets the core build unchanged on every platform. It also covers what the core needs: `std::optional`, nested namespaces, and `shared_ptr<void>` for opaque platform handles. And the public headers don't force a newer standard on apps that embed the player. C++20 features such as `span`, `jthread` and concepts would be nice but wouldn't change the design. See [mvp_spec.md §2.1](docs/design/mvp_spec.md#21-core-portable-c17-no-platform-headers).
@@ -616,8 +618,6 @@ Histograms use fixed 1 ms bins (2001 bins), and a 16-entry ring stores the plann
 
 
 ## 5. License
-
-Copyright 2026 David Xu
 
 Licensed under the Apache License, Version 2.0 (the "License"); you may not use this project except in compliance with the License. You may obtain a copy of the License in [LICENSE](LICENSE) or at [http://www.apache.org/licenses/LICENSE-2.0](http://www.apache.org/licenses/LICENSE-2.0).
 
